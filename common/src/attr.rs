@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Encapsulates the set of supported attribute value types.
 ///
 /// `Null` is included so callers can distinguish between “missing key” and
 /// “explicit null” when the data model requires it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AttributeValue {
     Null,
     String(String),

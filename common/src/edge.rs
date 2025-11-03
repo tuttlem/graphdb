@@ -1,10 +1,13 @@
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
 use crate::attr::{AttributeContainer, AttributeValue};
 use crate::node::NodeId;
-use std::collections::HashMap;
 
 pub type EdgeId = uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
     id: EdgeId,
     source: NodeId,

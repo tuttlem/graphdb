@@ -1,12 +1,15 @@
-use crate::attr::{AttributeContainer, AttributeValue};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::attr::{AttributeContainer, AttributeValue};
 
 pub type NodeId = uuid::Uuid;
 
 /// Alias representing a node label
 pub type Label = String;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     id: NodeId,
     labels: Vec<Label>,
