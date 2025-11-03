@@ -1,5 +1,3 @@
-pub mod node;
-pub mod edge;
 pub mod attr;
-
-
+pub mod edge;
+pub mod node;

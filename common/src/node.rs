@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::attr::{AttributeContainer, AttributeValue};
+use std::collections::HashMap;
 
 pub type NodeId = uuid::Uuid;
 
@@ -14,8 +14,16 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(id: NodeId, labels: Vec<Label>, attributes: HashMap<String, AttributeValue>) -> Self {
-        Self { id, labels, attributes }
+    pub fn new(
+        id: NodeId,
+        labels: Vec<Label>,
+        attributes: HashMap<String, AttributeValue>,
+    ) -> Self {
+        Self {
+            id,
+            labels,
+            attributes,
+        }
     }
 
     pub fn id(&self) -> NodeId {

@@ -1,3 +1,3 @@
 [workspace]
-members = [ "common","daemon"]
+members = [ "common", "core","daemon"]
 resolver = "1"

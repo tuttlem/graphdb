@@ -1,9 +1,8 @@
-use std::collections::HashMap;
 use crate::attr::{AttributeContainer, AttributeValue};
 use crate::node::NodeId;
+use std::collections::HashMap;
 
 pub type EdgeId = uuid::Uuid;
-
 
 #[derive(Debug, Clone)]
 pub struct Edge {
@@ -14,8 +13,18 @@ pub struct Edge {
 }
 
 impl Edge {
-    pub fn new(id: EdgeId, source: NodeId, target: NodeId, attributes: HashMap<String, AttributeValue>) -> Self {
-        Self { id, source, target, attributes }
+    pub fn new(
+        id: EdgeId,
+        source: NodeId,
+        target: NodeId,
+        attributes: HashMap<String, AttributeValue>,
+    ) -> Self {
+        Self {
+            id,
+            source,
+            target,
+            attributes,
+        }
     }
 
     pub fn id(&self) -> EdgeId {
