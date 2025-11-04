@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::edge::{Edge, EdgeId};
 use common::node::{Node, NodeId};
 
-use crate::storage::{StorageBackend, StorageError, StorageResult};
+use crate::storage::{StorageBackend, StorageError, StorageOp, StorageResult};
 
 struct Cache {
     nodes: HashMap<NodeId, Arc<Node>>,
@@ -78,10 +78,7 @@ impl<B: StorageBackend> Database<B> {
 
     pub fn remove_edge(&self, id: EdgeId) -> StorageResult<Option<Arc<Edge>>> {
         let edge = {
-            let mut cache = self
-                .cache
-                .write()
-                .map_err(|_| StorageError::LockPoisoned(Self::POISONED_WRITE))?;
+            let mut cache = self.cache_write_guard("remove edge")?;
             let edge = match cache.edges.remove(&id) {
                 Some(edge) => edge,
                 None => return Ok(None),
@@ -100,10 +97,7 @@ impl<B: StorageBackend> Database<B> {
 
     pub fn remove_node(&self, id: NodeId) -> StorageResult<Option<Arc<Node>>> {
         let (node, incident_edges) = {
-            let mut cache = self
-                .cache
-                .write()
-                .map_err(|_| StorageError::LockPoisoned(Self::POISONED_WRITE))?;
+            let mut cache = self.cache_write_guard("remove node")?;
             let node = match cache.nodes.remove(&id) {
                 Some(node) => node,
                 None => return Ok(None),
@@ -133,42 +127,37 @@ impl<B: StorageBackend> Database<B> {
     }
 
     pub fn contains_node(&self, id: NodeId) -> StorageResult<bool> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_READ))?;
+        let cache = self.cache_read_guard("contains node")?;
         Ok(cache.nodes.contains_key(&id))
     }
 
     pub fn contains_edge(&self, id: EdgeId) -> StorageResult<bool> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_READ))?;
+        let cache = self.cache_read_guard("contains edge")?;
         Ok(cache.edges.contains_key(&id))
     }
 
+    pub fn evict_node(&self, id: NodeId) -> StorageResult<bool> {
+        let mut cache = self.cache_write_guard("evict node")?;
+        Ok(cache.nodes.remove(&id).is_some())
+    }
+
+    pub fn evict_edge(&self, id: EdgeId) -> StorageResult<bool> {
+        let mut cache = self.cache_write_guard("evict edge")?;
+        Ok(cache.edges.remove(&id).is_some())
+    }
+
     pub fn node_ids(&self) -> StorageResult<Vec<NodeId>> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_READ))?;
+        let cache = self.cache_read_guard("node ids")?;
         Ok(cache.nodes.keys().copied().collect())
     }
 
     pub fn edge_ids(&self) -> StorageResult<Vec<EdgeId>> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_READ))?;
+        let cache = self.cache_read_guard("edge ids")?;
         Ok(cache.edges.keys().copied().collect())
     }
 
     pub fn edges_for_node(&self, node_id: NodeId) -> StorageResult<Vec<Arc<Edge>>> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_READ))?;
+        let cache = self.cache_read_guard("edges for node")?;
         let edges = cache
             .adjacency
             .get(&node_id)
@@ -180,10 +169,7 @@ impl<B: StorageBackend> Database<B> {
     }
 
     pub fn neighbor_ids(&self, node_id: NodeId) -> StorageResult<Vec<NodeId>> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_READ))?;
+        let cache = self.cache_read_guard("neighbor ids")?;
         let mut neighbors = HashSet::new();
         if let Some(edge_ids) = cache.adjacency.get(&node_id) {
             for edge_id in edge_ids {
@@ -202,18 +188,12 @@ impl<B: StorageBackend> Database<B> {
     }
 
     fn lookup_node(&self, id: NodeId) -> StorageResult<Option<Arc<Node>>> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_READ))?;
+        let cache = self.cache_read_guard("lookup node")?;
         Ok(cache.nodes.get(&id).cloned())
     }
 
     fn lookup_edge(&self, id: EdgeId) -> StorageResult<Option<Arc<Edge>>> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_READ))?;
+        let cache = self.cache_read_guard("lookup edge")?;
         Ok(cache.edges.get(&id).cloned())
     }
 
@@ -223,10 +203,7 @@ impl<B: StorageBackend> Database<B> {
             return Ok(existing);
         }
 
-        let mut cache = self
-            .cache
-            .write()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_WRITE))?;
+        let mut cache = self.cache_write_guard("cache node")?;
         if let Some(existing) = cache.nodes.get(&id) {
             return Ok(existing.clone());
         }
@@ -243,10 +220,7 @@ impl<B: StorageBackend> Database<B> {
             return Ok(existing);
         }
 
-        let mut cache = self
-            .cache
-            .write()
-            .map_err(|_| StorageError::LockPoisoned(Self::POISONED_WRITE))?;
+        let mut cache = self.cache_write_guard("cache edge")?;
         if let Some(existing) = cache.edges.get(&id) {
             return Ok(existing.clone());
         }
@@ -275,6 +249,20 @@ impl<B: StorageBackend> Database<B> {
             }
         }
     }
+
+    fn cache_read_guard(&self, label: &'static str) -> StorageResult<RwLockReadGuard<'_, Cache>> {
+        self.cache.read().map_err(|_| StorageError::LockPoisoned {
+            op: StorageOp::Cache(label),
+            lock: Self::POISONED_READ,
+        })
+    }
+
+    fn cache_write_guard(&self, label: &'static str) -> StorageResult<RwLockWriteGuard<'_, Cache>> {
+        self.cache.write().map_err(|_| StorageError::LockPoisoned {
+            op: StorageOp::Cache(label),
+            lock: Self::POISONED_WRITE,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -282,9 +270,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
-    use crate::storage::InMemoryBackend;
+    use crate::storage::memory::InMemoryBackend;
 
     fn make_node(id: u128, labels: &[&str]) -> Node {
         let node_id = NodeId::from_u128(id);
@@ -297,6 +286,55 @@ mod tests {
         let source_id = NodeId::from_u128(source);
         let target_id = NodeId::from_u128(target);
         Edge::new(edge_id, source_id, target_id, HashMap::new())
+    }
+
+    #[derive(Default)]
+    struct CountingBackend {
+        inner: InMemoryBackend,
+        node_loads: AtomicUsize,
+        edge_loads: AtomicUsize,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn node_loads(&self) -> usize {
+            self.node_loads.load(Ordering::SeqCst)
+        }
+
+        fn edge_loads(&self) -> usize {
+            self.edge_loads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StorageBackend for CountingBackend {
+        fn load_node(&self, id: NodeId) -> StorageResult<Option<Node>> {
+            self.node_loads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load_node(id)
+        }
+
+        fn store_node(&self, node: &Node) -> StorageResult<()> {
+            self.inner.store_node(node)
+        }
+
+        fn delete_node(&self, id: NodeId) -> StorageResult<()> {
+            self.inner.delete_node(id)
+        }
+
+        fn load_edge(&self, id: EdgeId) -> StorageResult<Option<Edge>> {
+            self.edge_loads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load_edge(id)
+        }
+
+        fn store_edge(&self, edge: &Edge) -> StorageResult<()> {
+            self.inner.store_edge(edge)
+        }
+
+        fn delete_edge(&self, id: EdgeId) -> StorageResult<()> {
+            self.inner.delete_edge(id)
+        }
     }
 
     #[test]
@@ -399,6 +437,48 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn evict_node_triggers_reload_from_storage() {
+        let backend = CountingBackend::new();
+        let db = Database::new(backend);
+        let node = make_node(50, &["Person"]);
+        let node_id = node.id();
+
+        db.insert_node(node).unwrap();
+        assert_eq!(db.storage().node_loads(), 0);
+
+        db.evict_node(node_id).unwrap();
+        assert!(!db.contains_node(node_id).unwrap());
+
+        let reloaded = db.get_node(node_id).unwrap().expect("node reload");
+        assert_eq!(reloaded.id(), node_id);
+        assert_eq!(db.storage().node_loads(), 1);
+    }
+
+    #[test]
+    fn evict_edge_triggers_reload_from_storage() {
+        let backend = CountingBackend::new();
+        let db = Database::new(backend);
+
+        db.insert_node(make_node(60, &["Person"])).unwrap();
+        db.insert_node(make_node(61, &["Person"])).unwrap();
+        let edge = make_edge(70, 60, 61);
+        let edge_id = edge.id();
+
+        db.insert_edge(edge).unwrap();
+        assert_eq!(db.storage().edge_loads(), 0);
+
+        db.evict_edge(edge_id).unwrap();
+        assert!(!db.contains_edge(edge_id).unwrap());
+
+        let reloaded = db.get_edge(edge_id).unwrap().expect("edge reload");
+        assert_eq!(reloaded.id(), edge_id);
+        assert_eq!(db.storage().edge_loads(), 1);
+
+        let edge_ids = db.edges_for_node(NodeId::from_u128(60)).unwrap();
+        assert_eq!(edge_ids.len(), 1);
     }
 
     #[test]
