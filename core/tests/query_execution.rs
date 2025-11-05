@@ -80,6 +80,7 @@ fn execute_query(
             ctx.last_nodes = nodes;
             Ok(())
         }
+        Query::Create { .. } => Err("CREATE not supported in executor test".into()),
         Query::UpdateNode { .. } | Query::UpdateEdge { .. } => {
             Err("UPDATE not supported in executor test".into())
         }

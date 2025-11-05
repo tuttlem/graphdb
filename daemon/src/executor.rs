@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use common::attr::{AttributeContainer, AttributeValue};
-use graphdb_core::query::{ComparisonOperator, Query, Value, parse_queries};
+use graphdb_core::query::{
+    ComparisonOperator, CreatePattern, CreateRelationship, Query, Value, parse_queries,
+};
 use graphdb_core::{
     Database, Edge, EdgeId, InMemoryBackend, Node, NodeId, SimpleStorage, StorageBackend,
 };
@@ -83,6 +85,7 @@ fn execute_query<B: StorageBackend>(
             ctx.messages.push("select completed".into());
             Ok(())
         }
+        Query::Create { pattern } => execute_create(db, pattern, ctx),
         Query::UpdateNode { .. } | Query::UpdateEdge { .. } => {
             Err(DaemonError::Query("UPDATE not yet supported".into()))
         }
@@ -93,36 +96,8 @@ fn insert_node<B: StorageBackend>(
     db: &Database<B>,
     pattern: graphdb_core::query::NodePattern,
 ) -> Result<NodeId, DaemonError> {
-    let graphdb_core::query::NodePattern {
-        alias: _,
-        label,
-        properties,
-    } = pattern;
-
-    let properties = properties.0;
-    let node_id = if let Some(value) = properties.get("id") {
-        parse_node_id(value)?
-    } else {
-        NodeId::new_v4()
-    };
-
-    let labels = label
-        .into_iter()
-        .map(|label| label.to_string())
-        .collect::<Vec<_>>();
-
-    let mut attributes = HashMap::new();
-    for (key, value) in properties.iter() {
-        attributes.insert(key.clone(), value_to_attribute(value));
-    }
-    if !properties.contains_key("id") {
-        attributes.insert(
-            "id".to_string(),
-            AttributeValue::String(node_id.to_string()),
-        );
-    }
-
-    let node = Node::new(node_id, labels, attributes);
+    let node = materialize_node(pattern)?;
+    let node_id = node.id();
     db.insert_node(node)?;
     Ok(node_id)
 }
@@ -133,55 +108,11 @@ fn insert_edge<B: StorageBackend>(
     edge_pattern: graphdb_core::query::EdgePattern,
     target_pattern: graphdb_core::query::NodePattern,
 ) -> Result<EdgeId, DaemonError> {
-    let graphdb_core::query::NodePattern {
-        alias: _,
-        label: _,
-        properties: source_properties,
-    } = source_pattern;
-    let graphdb_core::query::EdgePattern {
-        alias: _,
-        label: _,
-        properties: edge_properties,
-    } = edge_pattern;
-    let graphdb_core::query::NodePattern {
-        alias: _,
-        label: _,
-        properties: target_properties,
-    } = target_pattern;
+    let source_id = extract_node_id(source_pattern, "source id missing")?;
+    let target_id = extract_node_id(target_pattern, "target id missing")?;
 
-    let source_props = source_properties.0;
-    let target_props = target_properties.0;
-    let edge_props = edge_properties.0;
-
-    let source_id = parse_node_id(
-        source_props
-            .get("id")
-            .ok_or_else(|| DaemonError::Query("source id missing".into()))?,
-    )?;
-    let target_id = parse_node_id(
-        target_props
-            .get("id")
-            .ok_or_else(|| DaemonError::Query("target id missing".into()))?,
-    )?;
-
-    let edge_id = if let Some(value) = edge_props.get("id") {
-        parse_edge_id(value)?
-    } else {
-        EdgeId::new_v4()
-    };
-
-    let mut attributes = HashMap::new();
-    for (key, value) in edge_props.iter() {
-        attributes.insert(key.clone(), value_to_attribute(value));
-    }
-    if !edge_props.contains_key("id") {
-        attributes.insert(
-            "id".to_string(),
-            AttributeValue::String(edge_id.to_string()),
-        );
-    }
-
-    let edge = Edge::new(edge_id, source_id, target_id, attributes);
+    let edge = materialize_edge(edge_pattern, source_id, target_id)?;
+    let edge_id = edge.id();
     db.insert_edge(edge)?;
     Ok(edge_id)
 }
@@ -259,6 +190,105 @@ fn value_equals_attribute(value: &Value, attribute: &AttributeValue) -> bool {
         (Value::Null, AttributeValue::Null) => true,
         _ => false,
     }
+}
+
+fn execute_create<B: StorageBackend>(
+    db: &Database<B>,
+    pattern: CreatePattern,
+    ctx: &mut ExecutionReport,
+) -> Result<(), DaemonError> {
+    let left_node = materialize_node(pattern.left)?;
+    let left_id = left_node.id();
+    db.insert_node(left_node)?;
+    ctx.messages.push(format!("created node {}", left_id));
+
+    if let Some(CreateRelationship { edge, right }) = pattern.relationship {
+        let right_node = materialize_node(right)?;
+        let right_id = right_node.id();
+        db.insert_node(right_node)?;
+        ctx.messages.push(format!("created node {}", right_id));
+
+        let relationship = materialize_edge(edge, left_id, right_id)?;
+        let edge_id = relationship.id();
+        db.insert_edge(relationship)?;
+        ctx.messages.push(format!("created edge {}", edge_id));
+    }
+
+    Ok(())
+}
+
+fn materialize_node(pattern: graphdb_core::query::NodePattern) -> Result<Node, DaemonError> {
+    let graphdb_core::query::NodePattern {
+        alias: _,
+        label,
+        properties,
+    } = pattern;
+
+    let properties = properties.0;
+    let node_id = if let Some(value) = properties.get("id") {
+        parse_node_id(value)?
+    } else {
+        NodeId::new_v4()
+    };
+
+    let labels = label.into_iter().collect::<Vec<_>>();
+
+    let mut attributes = HashMap::new();
+    for (key, value) in properties.into_iter() {
+        attributes.insert(key, value_to_attribute(&value));
+    }
+    if !attributes.contains_key("id") {
+        attributes.insert(
+            "id".to_string(),
+            AttributeValue::String(node_id.to_string()),
+        );
+    }
+
+    Ok(Node::new(node_id, labels, attributes))
+}
+
+fn materialize_edge(
+    pattern: graphdb_core::query::EdgePattern,
+    source: NodeId,
+    target: NodeId,
+) -> Result<Edge, DaemonError> {
+    let graphdb_core::query::EdgePattern {
+        alias: _,
+        label: _,
+        properties,
+    } = pattern;
+
+    let properties = properties.0;
+    let edge_id = if let Some(value) = properties.get("id") {
+        parse_edge_id(value)?
+    } else {
+        EdgeId::new_v4()
+    };
+
+    let mut attributes = HashMap::new();
+    for (key, value) in properties.into_iter() {
+        attributes.insert(key, value_to_attribute(&value));
+    }
+    if !attributes.contains_key("id") {
+        attributes.insert(
+            "id".to_string(),
+            AttributeValue::String(edge_id.to_string()),
+        );
+    }
+
+    Ok(Edge::new(edge_id, source, target, attributes))
+}
+
+fn extract_node_id(
+    pattern: graphdb_core::query::NodePattern,
+    missing_msg: &str,
+) -> Result<NodeId, DaemonError> {
+    let graphdb_core::query::NodePattern { properties, .. } = pattern;
+    let props = properties.0;
+    let value = props
+        .get("id")
+        .ok_or_else(|| DaemonError::Query(missing_msg.into()))?;
+    parse_node_id(value)
 }
 
 fn parse_node_id(value: &Value) -> Result<NodeId, DaemonError> {

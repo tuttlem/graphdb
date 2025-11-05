@@ -77,3 +77,28 @@ fn parse_select_where() {
         other => panic!("unexpected {other:?}"),
     }
 }
+
+#[test]
+fn parse_create_patterns() {
+    let node_input = "CREATE (:Person {name: \"Ada\"});";
+    let node_queries = parse_queries(node_input).unwrap();
+    match &node_queries[0] {
+        Query::Create { pattern } => {
+            assert!(pattern.relationship.is_none());
+            assert_eq!(pattern.left.label.as_deref(), Some("Person"));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    let rel_input =
+        "CREATE (a:Person {name: \"Ada\"})-[:KNOWS {since: 2020}]->(:Person {name: \"Bob\"});";
+    let rel_queries = parse_queries(rel_input).unwrap();
+    match &rel_queries[0] {
+        Query::Create { pattern } => {
+            let relationship = pattern.relationship.as_ref().expect("relationship pattern");
+            assert_eq!(pattern.left.alias.as_deref(), Some("a"));
+            assert_eq!(relationship.edge.label.as_deref(), Some("KNOWS"));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}

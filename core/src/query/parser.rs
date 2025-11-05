@@ -30,6 +30,9 @@ fn parse_statement(input: &str) -> Result<Query, ParseError> {
     if let Some(rest) = strip_prefix_ci(stmt, "INSERT EDGE") {
         return parse_insert_edge(rest);
     }
+    if let Some(rest) = strip_prefix_ci(stmt, "CREATE") {
+        return parse_create(rest);
+    }
     if let Some(rest) = strip_prefix_ci(stmt, "DELETE NODE") {
         return parse_delete_node(rest);
     }
@@ -86,6 +89,57 @@ fn parse_insert_edge(rest: &str) -> Result<Query, ParseError> {
         source,
         edge,
         target,
+    })
+}
+
+fn parse_create(rest: &str) -> Result<Query, ParseError> {
+    let remaining = rest.trim_start();
+    if !remaining.starts_with('(') {
+        return Err(ParseError::Message("expected node pattern".into()));
+    }
+
+    let (left_str, after_left) = extract_group(remaining, '(', ')')?;
+    let left = parse_node_pattern_str(&left_str)?;
+
+    let after_left = after_left.trim_start();
+    if after_left.is_empty() {
+        return Ok(Query::Create {
+            pattern: CreatePattern {
+                left,
+                relationship: None,
+            },
+        });
+    }
+
+    if !after_left.starts_with('-') {
+        return Err(ParseError::Message("expected relationship pattern".into()));
+    }
+
+    let mut remaining = after_left[1..].trim_start();
+    let (edge_str, after_edge) = extract_group(remaining, '[', ']')?;
+    let edge = parse_edge_detail_str(&edge_str)?;
+    remaining = after_edge.trim_start();
+
+    if !remaining.starts_with("->") {
+        return Err(ParseError::Message(
+            "expected '->' in relationship pattern".into(),
+        ));
+    }
+
+    let (right_str, trailing) = extract_group(&remaining[2..], '(', ')')?;
+    if !trailing.trim().is_empty() {
+        return Err(ParseError::Message(
+            "unexpected tokens after create pattern".into(),
+        ));
+    }
+
+    let right = parse_node_pattern_str(&right_str)?;
+
+    Ok(Query::Create {
+        pattern: CreatePattern {
+            left,
+            relationship: Some(CreateRelationship { edge, right }),
+        },
     })
 }
 

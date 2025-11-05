@@ -33,6 +33,18 @@ pub struct EdgePattern {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CreatePattern {
+    pub left: NodePattern,
+    pub relationship: Option<CreateRelationship>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateRelationship {
+    pub edge: EdgePattern,
+    pub right: NodePattern,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Query {
     InsertNode {
         pattern: NodePattern,
@@ -60,6 +72,9 @@ pub enum Query {
         pattern: NodePattern,
         conditions: Vec<Condition>,
         returns: Vec<String>,
+    },
+    Create {
+        pattern: CreatePattern,
     },
 }
 
