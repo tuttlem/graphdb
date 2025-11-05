@@ -15,3 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 signal-hook = "0.3"
 thiserror = "1.0"
 toml = "0.8"
+serde_json = "1.0"
+graphdb-core = { path = "../core" }
+common = { path = "../common" }
+uuid = { version = "1.18.1", features = ["v4"] }

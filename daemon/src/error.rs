@@ -14,6 +14,16 @@ pub enum DaemonError {
     Config(String),
     #[error("failed to parse configuration: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("request serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("query parse error: {0}")]
+    QueryParse(#[from] graphdb_core::query::ParseError),
+    #[error("database error: {0}")]
+    Database(#[from] graphdb_core::DatabaseError),
+    #[error("storage error: {0}")]
+    Storage(#[from] graphdb_core::StorageError),
+    #[error("query execution error: {0}")]
+    Query(String),
 }
 
 pub type Result<T> = std::result::Result<T, DaemonError>;

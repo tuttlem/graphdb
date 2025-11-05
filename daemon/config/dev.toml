@@ -4,3 +4,11 @@ stdout = "/home/michael/src/db/graphdb/target/graphdb.log"
 stderr = "/home/michael/src/db/graphdb/target/graphdb.err"
 umask = 18         # 0o022 written in decimal
 log_level = "debug"
+
+[storage]
+backend = "simple"
+directory = "/home/michael/src/db/graphdb/target/data"
+
+[server]
+bind_address = "127.0.0.1"
+port = 8080

@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -17,6 +18,8 @@ pub struct DaemonConfig {
     pub stderr: Option<PathBuf>,
     pub umask: Option<u32>,
     pub log_level: Option<String>,
+    pub storage: StorageSettings,
+    pub server: ServerSettings,
 }
 
 impl Default for DaemonConfig {
@@ -29,6 +32,8 @@ impl Default for DaemonConfig {
             stderr: None,
             umask: Some(0o027),
             log_level: Some(String::from("info")),
+            storage: StorageSettings::default(),
+            server: ServerSettings::default(),
         }
     }
 }
@@ -60,6 +65,14 @@ impl DaemonConfig {
             return Err(DaemonError::Config(
                 "working_directory must not be empty".into(),
             ));
+        }
+
+        if let StorageBackendKind::Simple = config.storage.backend {
+            if config.storage.directory.is_none() {
+                return Err(DaemonError::Config(
+                    "storage.directory must be set when using simple backend".into(),
+                ));
+            }
         }
 
         Ok(config)
@@ -99,6 +112,19 @@ impl DaemonConfig {
         self.stdin.as_deref()
     }
 
+    pub fn storage(&self) -> &StorageSettings {
+        &self.storage
+    }
+
+    pub fn socket_addr(&self) -> Result<SocketAddr> {
+        let addr: IpAddr = self
+            .server
+            .bind_address
+            .parse()
+            .map_err(|err| DaemonError::Config(format!("invalid bind_address: {err}")))?;
+        Ok(SocketAddr::new(addr, self.server.port))
+    }
+
     fn normalize_paths(&mut self, base: &Path) {
         if self.working_directory.is_relative() {
             self.working_directory = base.join(&self.working_directory);
@@ -108,6 +134,7 @@ impl DaemonConfig {
         normalize_optional_path(&mut self.stdin, base);
         normalize_optional_path(&mut self.stdout, base);
         normalize_optional_path(&mut self.stderr, base);
+        self.storage.normalize(base);
     }
 }
 
@@ -115,6 +142,51 @@ fn normalize_optional_path(target: &mut Option<PathBuf>, base: &Path) {
     if let Some(path) = target {
         if path.is_relative() {
             *path = base.join(&*path);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackendKind {
+    Memory,
+    Simple,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StorageSettings {
+    pub backend: StorageBackendKind,
+    pub directory: Option<PathBuf>,
+}
+
+impl Default for StorageSettings {
+    fn default() -> Self {
+        Self {
+            backend: StorageBackendKind::Memory,
+            directory: None,
+        }
+    }
+}
+
+impl StorageSettings {
+    fn normalize(&mut self, base: &Path) {
+        normalize_optional_path(&mut self.directory, base);
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ServerSettings {
+    pub bind_address: String,
+    pub port: u16,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            bind_address: "127.0.0.1".into(),
+            port: 8080,
         }
     }
 }
