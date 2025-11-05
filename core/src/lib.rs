@@ -1,4 +1,5 @@
 pub mod db;
+pub mod query;
 pub mod storage;
 
 pub use db::database::{Database, DatabaseError, DatabaseResult};
