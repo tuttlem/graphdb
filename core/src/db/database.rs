@@ -1,15 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::edge::{Edge, EdgeId};
 use common::node::{Node, NodeId};
 
 use crate::storage::{StorageBackend, StorageError, StorageOp, StorageResult};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum DatabaseError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+pub type DatabaseResult<T> = Result<T, DatabaseError>;
 
 struct Cache {
     nodes: HashMap<NodeId, Arc<Node>>,
     edges: HashMap<EdgeId, Arc<Edge>>,
     adjacency: HashMap<NodeId, Vec<EdgeId>>,
+    node_order: VecDeque<NodeId>,
+    edge_order: VecDeque<EdgeId>,
 }
 
 impl Default for Cache {
@@ -18,6 +29,8 @@ impl Default for Cache {
             nodes: HashMap::new(),
             edges: HashMap::new(),
             adjacency: HashMap::new(),
+            node_order: VecDeque::new(),
+            edge_order: VecDeque::new(),
         }
     }
 }
@@ -25,6 +38,8 @@ impl Default for Cache {
 pub struct Database<B: StorageBackend> {
     storage: B,
     cache: RwLock<Cache>,
+    node_capacity: Option<usize>,
+    edge_capacity: Option<usize>,
 }
 
 impl<B: StorageBackend> Database<B> {
@@ -32,9 +47,19 @@ impl<B: StorageBackend> Database<B> {
     const POISONED_WRITE: &'static str = "cache write";
 
     pub fn new(storage: B) -> Self {
+        Self::with_capacity(storage, None, None)
+    }
+
+    pub fn with_capacity(
+        storage: B,
+        node_capacity: Option<usize>,
+        edge_capacity: Option<usize>,
+    ) -> Self {
         Self {
             storage,
             cache: RwLock::new(Cache::default()),
+            node_capacity,
+            edge_capacity,
         }
     }
 
@@ -42,18 +67,19 @@ impl<B: StorageBackend> Database<B> {
         &self.storage
     }
 
-    pub fn insert_node(&self, node: Node) -> StorageResult<Arc<Node>> {
+    pub fn insert_node(&self, node: Node) -> DatabaseResult<Arc<Node>> {
         self.storage.store_node(&node)?;
-        self.cache_node(node)
+        Ok(self.cache_node(node)?)
     }
 
-    pub fn insert_edge(&self, edge: Edge) -> StorageResult<Arc<Edge>> {
+    pub fn insert_edge(&self, edge: Edge) -> DatabaseResult<Arc<Edge>> {
         self.storage.store_edge(&edge)?;
-        self.cache_edge(edge)
+        Ok(self.cache_edge(edge)?)
     }
 
-    pub fn get_node(&self, id: NodeId) -> StorageResult<Option<Arc<Node>>> {
+    pub fn get_node(&self, id: NodeId) -> DatabaseResult<Option<Arc<Node>>> {
         if let Some(node) = self.lookup_node(id)? {
+            self.touch_node(id)?;
             return Ok(Some(node));
         }
 
@@ -61,11 +87,12 @@ impl<B: StorageBackend> Database<B> {
             return Ok(None);
         };
 
-        self.cache_node(node).map(Some)
+        Ok(Some(self.cache_node(node)?))
     }
 
-    pub fn get_edge(&self, id: EdgeId) -> StorageResult<Option<Arc<Edge>>> {
+    pub fn get_edge(&self, id: EdgeId) -> DatabaseResult<Option<Arc<Edge>>> {
         if let Some(edge) = self.lookup_edge(id)? {
+            self.touch_edge(id)?;
             return Ok(Some(edge));
         }
 
@@ -73,10 +100,10 @@ impl<B: StorageBackend> Database<B> {
             return Ok(None);
         };
 
-        self.cache_edge(edge).map(Some)
+        Ok(Some(self.cache_edge(edge)?))
     }
 
-    pub fn remove_edge(&self, id: EdgeId) -> StorageResult<Option<Arc<Edge>>> {
+    pub fn remove_edge(&self, id: EdgeId) -> DatabaseResult<Option<Arc<Edge>>> {
         let edge = {
             let mut cache = self.cache_write_guard("remove edge")?;
             let edge = match cache.edges.remove(&id) {
@@ -88,6 +115,7 @@ impl<B: StorageBackend> Database<B> {
             let target = edge.target();
             Self::unlink_edge(&mut cache.adjacency, source, id);
             Self::unlink_edge(&mut cache.adjacency, target, id);
+            Self::remove_edge_from_order(&mut cache.edge_order, id);
             edge
         };
 
@@ -95,13 +123,15 @@ impl<B: StorageBackend> Database<B> {
         Ok(Some(edge))
     }
 
-    pub fn remove_node(&self, id: NodeId) -> StorageResult<Option<Arc<Node>>> {
+    pub fn remove_node(&self, id: NodeId) -> DatabaseResult<Option<Arc<Node>>> {
         let (node, incident_edges) = {
             let mut cache = self.cache_write_guard("remove node")?;
             let node = match cache.nodes.remove(&id) {
                 Some(node) => node,
                 None => return Ok(None),
             };
+
+            Self::remove_node_from_order(&mut cache.node_order, id);
 
             let incident_edges = cache.adjacency.remove(&id).unwrap_or_default();
             for edge_id in &incident_edges {
@@ -112,6 +142,7 @@ impl<B: StorageBackend> Database<B> {
                         edge.source()
                     };
                     Self::unlink_edge(&mut cache.adjacency, other, *edge_id);
+                    Self::remove_edge_from_order(&mut cache.edge_order, *edge_id);
                 }
             }
 
@@ -126,60 +157,67 @@ impl<B: StorageBackend> Database<B> {
         Ok(Some(node))
     }
 
-    pub fn contains_node(&self, id: NodeId) -> StorageResult<bool> {
+    pub fn contains_node(&self, id: NodeId) -> DatabaseResult<bool> {
         let cache = self.cache_read_guard("contains node")?;
         Ok(cache.nodes.contains_key(&id))
     }
 
-    pub fn contains_edge(&self, id: EdgeId) -> StorageResult<bool> {
+    pub fn contains_edge(&self, id: EdgeId) -> DatabaseResult<bool> {
         let cache = self.cache_read_guard("contains edge")?;
         Ok(cache.edges.contains_key(&id))
     }
 
-    pub fn evict_node(&self, id: NodeId) -> StorageResult<bool> {
+    pub fn evict_node(&self, id: NodeId) -> DatabaseResult<bool> {
         let mut cache = self.cache_write_guard("evict node")?;
-        Ok(cache.nodes.remove(&id).is_some())
+        let existed = cache.nodes.remove(&id).is_some();
+        if existed {
+            Self::remove_node_from_order(&mut cache.node_order, id);
+        }
+        Ok(existed)
     }
 
-    pub fn evict_edge(&self, id: EdgeId) -> StorageResult<bool> {
+    pub fn evict_edge(&self, id: EdgeId) -> DatabaseResult<bool> {
         let mut cache = self.cache_write_guard("evict edge")?;
-        Ok(cache.edges.remove(&id).is_some())
+        let existed = cache.edges.remove(&id).is_some();
+        if existed {
+            Self::remove_edge_from_order(&mut cache.edge_order, id);
+        }
+        Ok(existed)
     }
 
-    pub fn node_ids(&self) -> StorageResult<Vec<NodeId>> {
+    pub fn node_ids(&self) -> DatabaseResult<Vec<NodeId>> {
         let cache = self.cache_read_guard("node ids")?;
         Ok(cache.nodes.keys().copied().collect())
     }
 
-    pub fn edge_ids(&self) -> StorageResult<Vec<EdgeId>> {
+    pub fn edge_ids(&self) -> DatabaseResult<Vec<EdgeId>> {
         let cache = self.cache_read_guard("edge ids")?;
         Ok(cache.edges.keys().copied().collect())
     }
 
-    pub fn edges_for_node(&self, node_id: NodeId) -> StorageResult<Vec<Arc<Edge>>> {
-        let cache = self.cache_read_guard("edges for node")?;
-        let edges = cache
-            .adjacency
-            .get(&node_id)
-            .into_iter()
-            .flat_map(|ids| ids.iter())
-            .filter_map(|edge_id| cache.edges.get(edge_id).cloned())
-            .collect();
+    pub fn edges_for_node(&self, node_id: NodeId) -> DatabaseResult<Vec<Arc<Edge>>> {
+        let edge_ids = {
+            let cache = self.cache_read_guard("edges for node")?;
+            cache.adjacency.get(&node_id).cloned().unwrap_or_default()
+        };
+
+        let mut edges = Vec::with_capacity(edge_ids.len());
+        for edge_id in edge_ids {
+            if let Some(edge) = self.get_edge(edge_id)? {
+                edges.push(edge);
+            }
+        }
+
         Ok(edges)
     }
 
-    pub fn neighbor_ids(&self, node_id: NodeId) -> StorageResult<Vec<NodeId>> {
-        let cache = self.cache_read_guard("neighbor ids")?;
+    pub fn neighbor_ids(&self, node_id: NodeId) -> DatabaseResult<Vec<NodeId>> {
         let mut neighbors = HashSet::new();
-        if let Some(edge_ids) = cache.adjacency.get(&node_id) {
-            for edge_id in edge_ids {
-                if let Some(edge) = cache.edges.get(edge_id) {
-                    if edge.source() == node_id {
-                        neighbors.insert(edge.target());
-                    } else {
-                        neighbors.insert(edge.source());
-                    }
-                }
+        for edge in self.edges_for_node(node_id)? {
+            if edge.source() == node_id {
+                neighbors.insert(edge.target());
+            } else {
+                neighbors.insert(edge.source());
             }
         }
         let mut result: Vec<NodeId> = neighbors.into_iter().collect();
@@ -200,29 +238,37 @@ impl<B: StorageBackend> Database<B> {
     fn cache_node(&self, node: Node) -> StorageResult<Arc<Node>> {
         let id = node.id();
         if let Some(existing) = self.lookup_node(id)? {
+            self.touch_node(id)?;
             return Ok(existing);
         }
 
         let mut cache = self.cache_write_guard("cache node")?;
         if let Some(existing) = cache.nodes.get(&id) {
-            return Ok(existing.clone());
+            let existing_arc = existing.clone();
+            Self::move_node_to_back(&mut cache.node_order, id);
+            return Ok(existing_arc);
         }
 
         let node = Arc::new(node);
         cache.nodes.insert(id, node.clone());
         cache.adjacency.entry(id).or_insert_with(Vec::new);
+        Self::move_node_to_back(&mut cache.node_order, id);
+        self.enforce_node_capacity(&mut cache);
         Ok(node)
     }
 
     fn cache_edge(&self, edge: Edge) -> StorageResult<Arc<Edge>> {
         let id = edge.id();
         if let Some(existing) = self.lookup_edge(id)? {
+            self.touch_edge(id)?;
             return Ok(existing);
         }
 
         let mut cache = self.cache_write_guard("cache edge")?;
         if let Some(existing) = cache.edges.get(&id) {
-            return Ok(existing.clone());
+            let existing_arc = existing.clone();
+            Self::move_edge_to_back(&mut cache.edge_order, id);
+            return Ok(existing_arc);
         }
 
         let source = edge.source();
@@ -231,6 +277,8 @@ impl<B: StorageBackend> Database<B> {
         cache.edges.insert(id, edge.clone());
         Self::link_edge(&mut cache.adjacency, source, id);
         Self::link_edge(&mut cache.adjacency, target, id);
+        Self::move_edge_to_back(&mut cache.edge_order, id);
+        self.enforce_edge_capacity(&mut cache);
         Ok(edge)
     }
 
@@ -246,6 +294,64 @@ impl<B: StorageBackend> Database<B> {
             entry.retain(|candidate| *candidate != edge_id);
             if entry.is_empty() {
                 adjacency.remove(&node_id);
+            }
+        }
+    }
+
+    fn touch_node(&self, id: NodeId) -> StorageResult<()> {
+        let mut cache = self.cache_write_guard("touch node")?;
+        Self::move_node_to_back(&mut cache.node_order, id);
+        Ok(())
+    }
+
+    fn touch_edge(&self, id: EdgeId) -> StorageResult<()> {
+        let mut cache = self.cache_write_guard("touch edge")?;
+        Self::move_edge_to_back(&mut cache.edge_order, id);
+        Ok(())
+    }
+
+    fn move_node_to_back(order: &mut VecDeque<NodeId>, id: NodeId) {
+        if let Some(pos) = order.iter().position(|&item| item == id) {
+            order.remove(pos);
+        }
+        order.push_back(id);
+    }
+
+    fn move_edge_to_back(order: &mut VecDeque<EdgeId>, id: EdgeId) {
+        if let Some(pos) = order.iter().position(|&item| item == id) {
+            order.remove(pos);
+        }
+        order.push_back(id);
+    }
+
+    fn remove_node_from_order(order: &mut VecDeque<NodeId>, id: NodeId) {
+        order.retain(|&candidate| candidate != id);
+    }
+
+    fn remove_edge_from_order(order: &mut VecDeque<EdgeId>, id: EdgeId) {
+        order.retain(|&candidate| candidate != id);
+    }
+
+    fn enforce_node_capacity(&self, cache: &mut Cache) {
+        if let Some(capacity) = self.node_capacity {
+            while cache.nodes.len() > capacity {
+                if let Some(evicted_id) = cache.node_order.pop_front() {
+                    cache.nodes.remove(&evicted_id);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn enforce_edge_capacity(&self, cache: &mut Cache) {
+        if let Some(capacity) = self.edge_capacity {
+            while cache.edges.len() > capacity {
+                if let Some(evicted_id) = cache.edge_order.pop_front() {
+                    cache.edges.remove(&evicted_id);
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -273,7 +379,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
-    use crate::storage::memory::InMemoryBackend;
+    use crate::storage::{InMemoryBackend, StorageBackend};
 
     fn make_node(id: u128, labels: &[&str]) -> Node {
         let node_id = NodeId::from_u128(id);
@@ -442,7 +548,7 @@ mod tests {
     #[test]
     fn evict_node_triggers_reload_from_storage() {
         let backend = CountingBackend::new();
-        let db = Database::new(backend);
+        let db = Database::with_capacity(backend, None, None);
         let node = make_node(50, &["Person"]);
         let node_id = node.id();
 
@@ -460,7 +566,7 @@ mod tests {
     #[test]
     fn evict_edge_triggers_reload_from_storage() {
         let backend = CountingBackend::new();
-        let db = Database::new(backend);
+        let db = Database::with_capacity(backend, None, None);
 
         db.insert_node(make_node(60, &["Person"])).unwrap();
         db.insert_node(make_node(61, &["Person"])).unwrap();
@@ -479,6 +585,48 @@ mod tests {
 
         let edge_ids = db.edges_for_node(NodeId::from_u128(60)).unwrap();
         assert_eq!(edge_ids.len(), 1);
+    }
+
+    #[test]
+    fn node_capacity_evicts_least_recently_used() {
+        let backend = CountingBackend::new();
+        let db = Database::with_capacity(backend, Some(1), None);
+
+        db.insert_node(make_node(100, &["Person"])).unwrap();
+        db.insert_node(make_node(101, &["Person"])).unwrap();
+
+        assert!(!db.contains_node(NodeId::from_u128(100)).unwrap());
+
+        let before = db.storage().node_loads();
+        let reloaded = db
+            .get_node(NodeId::from_u128(100))
+            .unwrap()
+            .expect("node reloaded");
+        assert_eq!(reloaded.id(), NodeId::from_u128(100));
+        assert!(db.storage().node_loads() > before);
+    }
+
+    #[test]
+    fn edge_capacity_evicts_least_recently_used() {
+        let backend = CountingBackend::new();
+        let db = Database::with_capacity(backend, None, Some(1));
+
+        db.insert_node(make_node(200, &["Person"])).unwrap();
+        db.insert_node(make_node(201, &["Person"])).unwrap();
+        db.insert_node(make_node(202, &["Person"])).unwrap();
+
+        db.insert_edge(make_edge(210, 200, 201)).unwrap();
+        db.insert_edge(make_edge(211, 200, 202)).unwrap();
+
+        assert!(!db.contains_edge(EdgeId::from_u128(210)).unwrap());
+
+        let before = db.storage().edge_loads();
+        let edge = db
+            .get_edge(EdgeId::from_u128(210))
+            .unwrap()
+            .expect("edge reload");
+        assert_eq!(edge.id(), EdgeId::from_u128(210));
+        assert!(db.storage().edge_loads() > before);
     }
 
     #[test]
