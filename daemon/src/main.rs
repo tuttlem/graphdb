@@ -13,6 +13,8 @@ use crate::database::shared_database;
 use crate::error::Result;
 use crate::logging::init_logging;
 use crate::signals::SignalManager;
+use std::thread;
+use tokio::runtime::Builder;
 
 fn main() -> Result<()> {
     let cli_config = std::env::args().nth(1);
@@ -28,6 +30,18 @@ fn main() -> Result<()> {
 
     log::info!("graphdb daemon running with pid {}", nix::unistd::getpid());
 
-    server::run(&config, database)?;
+    let worker_threads = config
+        .server()
+        .worker_threads()
+        .or_else(|| thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1);
+
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .thread_name("graphdb-rt")
+        .build()?;
+
+    runtime.block_on(server::run(&config, database))?;
     Ok(())
 }

@@ -75,6 +75,30 @@ impl DaemonConfig {
             }
         }
 
+        if let Some(limit) = config.server.concurrency_limit {
+            if limit == 0 {
+                return Err(DaemonError::Config(
+                    "server.concurrency_limit must be greater than zero".into(),
+                ));
+            }
+        }
+
+        if let Some(limit) = config.server.body_limit {
+            if limit == 0 {
+                return Err(DaemonError::Config(
+                    "server.body_limit must be greater than zero".into(),
+                ));
+            }
+        }
+
+        if let Some(worker_threads) = config.server.worker_threads {
+            if worker_threads == 0 {
+                return Err(DaemonError::Config(
+                    "server.worker_threads must be greater than zero".into(),
+                ));
+            }
+        }
+
         Ok(config)
     }
 
@@ -123,6 +147,10 @@ impl DaemonConfig {
             .parse()
             .map_err(|err| DaemonError::Config(format!("invalid bind_address: {err}")))?;
         Ok(SocketAddr::new(addr, self.server.port))
+    }
+
+    pub fn server(&self) -> &ServerSettings {
+        &self.server
     }
 
     fn normalize_paths(&mut self, base: &Path) {
@@ -180,6 +208,11 @@ impl StorageSettings {
 pub struct ServerSettings {
     pub bind_address: String,
     pub port: u16,
+    pub http2_only: bool,
+    pub tcp_nodelay: bool,
+    pub worker_threads: Option<usize>,
+    pub concurrency_limit: Option<usize>,
+    pub body_limit: Option<usize>,
 }
 
 impl Default for ServerSettings {
@@ -187,6 +220,17 @@ impl Default for ServerSettings {
         Self {
             bind_address: "127.0.0.1".into(),
             port: 8080,
+            http2_only: false,
+            tcp_nodelay: true,
+            worker_threads: None,
+            concurrency_limit: None,
+            body_limit: None,
         }
+    }
+}
+
+impl ServerSettings {
+    pub fn worker_threads(&self) -> Option<usize> {
+        self.worker_threads
     }
 }

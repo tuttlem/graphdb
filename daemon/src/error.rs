@@ -24,6 +24,8 @@ pub enum DaemonError {
     Storage(#[from] graphdb_core::StorageError),
     #[error("query execution error: {0}")]
     Query(String),
+    #[error("http server error: {0}")]
+    Http(#[from] hyper::Error),
 }
 
 pub type Result<T> = std::result::Result<T, DaemonError>;

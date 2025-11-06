@@ -12,3 +12,8 @@ directory = "/home/michael/src/db/graphdb/target/data"
 [server]
 bind_address = "127.0.0.1"
 port = 8080
+http2_only = false
+tcp_nodelay = true
+# worker_threads = 4
+# concurrency_limit = 128
+# body_limit = 1048576

@@ -18,4 +18,8 @@ toml = "0.8"
 serde_json = "1.0"
 graphdb-core = { path = "../core" }
 common = { path = "../common" }
+axum = { version = "0.6", features = ["json"] }
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.4", features = ["limit"] }
+hyper = { version = "0.14", features = ["full"] }
 uuid = { version = "1.18.1", features = ["v4"] }
