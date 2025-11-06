@@ -23,3 +23,8 @@ tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "signal", "
 tower = { version = "0.4", features = ["limit"] }
 hyper = { version = "0.14", features = ["full"] }
 uuid = { version = "1.18.1", features = ["v4"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-rustls = "0.24"
+rustls = "0.21"
+rustls-pemfile = "1"
+futures-util = "0.3"

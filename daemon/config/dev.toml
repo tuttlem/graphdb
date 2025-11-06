@@ -17,3 +17,7 @@ tcp_nodelay = true
 # worker_threads = 4
 # concurrency_limit = 128
 # body_limit = 1048576
+#
+# [server.tls]
+# cert_path = "/path/to/cert.pem"
+# key_path = "/path/to/key.pem"

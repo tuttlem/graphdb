@@ -99,6 +99,19 @@ impl DaemonConfig {
             }
         }
 
+        if let Some(tls) = config.server.tls.as_ref() {
+            if tls.cert_path.as_os_str().is_empty() {
+                return Err(DaemonError::Config(
+                    "server.tls.cert_path must not be empty".into(),
+                ));
+            }
+            if tls.key_path.as_os_str().is_empty() {
+                return Err(DaemonError::Config(
+                    "server.tls.key_path must not be empty".into(),
+                ));
+            }
+        }
+
         Ok(config)
     }
 
@@ -163,6 +176,7 @@ impl DaemonConfig {
         normalize_optional_path(&mut self.stdout, base);
         normalize_optional_path(&mut self.stderr, base);
         self.storage.normalize(base);
+        self.server.normalize(base);
     }
 }
 
@@ -213,6 +227,7 @@ pub struct ServerSettings {
     pub worker_threads: Option<usize>,
     pub concurrency_limit: Option<usize>,
     pub body_limit: Option<usize>,
+    pub tls: Option<TlsSettings>,
 }
 
 impl Default for ServerSettings {
@@ -225,6 +240,7 @@ impl Default for ServerSettings {
             worker_threads: None,
             concurrency_limit: None,
             body_limit: None,
+            tls: None,
         }
     }
 }
@@ -232,5 +248,32 @@ impl Default for ServerSettings {
 impl ServerSettings {
     pub fn worker_threads(&self) -> Option<usize> {
         self.worker_threads
+    }
+
+    pub fn tls(&self) -> Option<&TlsSettings> {
+        self.tls.as_ref()
+    }
+
+    fn normalize(&mut self, base: &Path) {
+        if let Some(tls) = &mut self.tls {
+            tls.normalize(base);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsSettings {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+impl TlsSettings {
+    fn normalize(&mut self, base: &Path) {
+        if self.cert_path.is_relative() {
+            self.cert_path = base.join(&self.cert_path);
+        }
+        if self.key_path.is_relative() {
+            self.key_path = base.join(&self.key_path);
+        }
     }
 }

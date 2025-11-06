@@ -24,7 +24,12 @@ fn main() -> Result<()> {
     init_logging(&config)?;
 
     let pid_file = context.pid_file_path_owned();
-    let _signal_manager = SignalManager::install(pid_file)?;
+    if let Some(path) = pid_file.as_ref() {
+        log::info!("writing pid file to {}", path.display());
+    }
+
+    let (signal_manager, shutdown) = SignalManager::install(pid_file.clone())?;
+    let _signal_manager = signal_manager;
 
     let database = shared_database(&config)?;
 
@@ -42,6 +47,6 @@ fn main() -> Result<()> {
         .thread_name("graphdb-rt")
         .build()?;
 
-    runtime.block_on(server::run(&config, database))?;
+    runtime.block_on(server::run(&config, database, shutdown))?;
     Ok(())
 }
