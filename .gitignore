@@ -1,2 +1,4 @@
 .idea
 /target
+client/node_modules
+client/dist

@@ -93,6 +93,34 @@ metadata mutation (new labels, roles, users, grants, processes, etc.) rewrites
 that snapshot so a cold restart fully restores system schemas and privileges
 before graph data is hydrated.
 
+## Web Client
+
+The repository now includes a lightweight React client under `client/`. It can
+run in dev mode (`npm run dev`) or be bundled (`npm run build`). Point the build
+output (`client/dist`) at the daemon by setting `server.client_dir` in the
+configuration and the HTTP API will also serve the SPA from the same binary.
+
+To develop locally:
+
+```sh
+cd client
+npm install
+npm run dev                # proxies /query to http://127.0.0.1:8080
+```
+
+For production builds served by the daemon:
+
+```sh
+cd client
+npm run build
+# update daemon config:
+# [server]
+# client_dir = "../client/dist"
+```
+
+The UI lets you issue arbitrary statements, view returned nodes, inspect
+procedure results (for catalog calls), and replay recent queries.
+
 The catalog keeps a per-table epoch counter along with a global epoch. The
 `CatalogCache` (`Database::catalog_cache()`) provides a read-through cache: when
 an epoch advances, cached entries are invalidated and repopulated on demand.
@@ -200,6 +228,7 @@ tcp_nodelay = true
 worker_threads = 4             # optional
 concurrency_limit = 128        # optional
 body_limit = 1048576           # optional bytes
+client_dir = "../client/dist"   # optional SPA bundle served by the daemon
 
 # Uncomment to enable TLS termination
 #[server.tls]

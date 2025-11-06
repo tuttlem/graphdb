@@ -228,6 +228,7 @@ pub struct ServerSettings {
     pub concurrency_limit: Option<usize>,
     pub body_limit: Option<usize>,
     pub tls: Option<TlsSettings>,
+    pub client_dir: Option<PathBuf>,
 }
 
 impl Default for ServerSettings {
@@ -241,6 +242,7 @@ impl Default for ServerSettings {
             concurrency_limit: None,
             body_limit: None,
             tls: None,
+            client_dir: None,
         }
     }
 }
@@ -254,10 +256,15 @@ impl ServerSettings {
         self.tls.as_ref()
     }
 
+    pub fn client_dir(&self) -> Option<&Path> {
+        self.client_dir.as_deref()
+    }
+
     fn normalize(&mut self, base: &Path) {
         if let Some(tls) = &mut self.tls {
             tls.normalize(base);
         }
+        normalize_optional_path(&mut self.client_dir, base);
     }
 }
 

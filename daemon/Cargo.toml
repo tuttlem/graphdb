@@ -21,6 +21,7 @@ common = { path = "../common" }
 axum = { version = "0.6", features = ["json"] }
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.4", features = ["limit"] }
+tower-http = { version = "0.4", features = ["fs"] }
 hyper = { version = "0.14", features = ["full"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 tokio-stream = { version = "0.1", features = ["net"] }

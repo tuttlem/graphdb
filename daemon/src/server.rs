@@ -3,8 +3,9 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -16,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_stream::wrappers::TcpListenerStream;
+use tower::ServiceExt;
 use tower::limit::ConcurrencyLimitLayer;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::{DaemonConfig, TlsSettings};
 use crate::database::DatabaseHandle;
@@ -42,6 +45,27 @@ pub async fn run(
 
     if let Some(limit) = config.server().concurrency_limit {
         app = app.layer(ConcurrencyLimitLayer::new(limit));
+    }
+
+    if let Some(client_dir) = config.server().client_dir() {
+        let client_dir = client_dir.to_path_buf();
+        let spa = ServeDir::new(client_dir.clone())
+            .not_found_service(ServeFile::new(client_dir.join("index.html")));
+        let static_router = Router::new().fallback({
+            let spa = spa.clone();
+            move |req: Request<Body>| {
+                let service = spa.clone();
+                async move {
+                    service.oneshot(req).await.map_err(|error| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("static file error: {error}"),
+                        )
+                    })
+                }
+            }
+        });
+        app = app.merge(static_router);
     }
 
     log::info!("listening on {addr}");
