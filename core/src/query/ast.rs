@@ -76,6 +76,51 @@ pub enum Query {
     Create {
         pattern: CreatePattern,
     },
+    CallProcedure {
+        procedure: Procedure,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Procedure {
+    GraphDb(GraphDbProcedure),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphDbProcedure {
+    NodeClasses,
+    EdgeClasses,
+    Users,
+    Roles,
+}
+
+impl Procedure {
+    pub fn canonical_name(&self) -> &'static str {
+        match self {
+            Procedure::GraphDb(proc) => proc.canonical_name(),
+        }
+    }
+}
+
+impl GraphDbProcedure {
+    pub fn canonical_name(&self) -> &'static str {
+        match self {
+            GraphDbProcedure::NodeClasses => "graphdb.nodeClasses",
+            GraphDbProcedure::EdgeClasses => "graphdb.edgeClasses",
+            GraphDbProcedure::Users => "graphdb.users",
+            GraphDbProcedure::Roles => "graphdb.roles",
+        }
+    }
+
+    pub fn from_identifier(ident: &str) -> Option<Self> {
+        match ident.to_ascii_lowercase().as_str() {
+            "nodeclasses" | "nodeclass" => Some(GraphDbProcedure::NodeClasses),
+            "edgeclasses" | "edgeclass" => Some(GraphDbProcedure::EdgeClasses),
+            "users" | "user" => Some(GraphDbProcedure::Users),
+            "roles" | "role" => Some(GraphDbProcedure::Roles),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

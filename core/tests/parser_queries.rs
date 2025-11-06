@@ -1,4 +1,6 @@
-use graphdb_core::query::{ComparisonOperator, Query, Value, parse_queries};
+use graphdb_core::query::{
+    ComparisonOperator, GraphDbProcedure, Procedure, Query, Value, parse_queries,
+};
 
 #[test]
 fn parse_insert_node() {
@@ -100,5 +102,29 @@ fn parse_create_patterns() {
             assert_eq!(relationship.edge.label.as_deref(), Some("KNOWS"));
         }
         other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn parse_call_procedure() {
+    let input = "CALL graphdb.nodeClasses(); CALL graphdb.users();";
+    let queries = parse_queries(input).expect("call queries");
+    assert_eq!(queries.len(), 2);
+
+    match &queries[0] {
+        Query::CallProcedure { procedure } => {
+            assert_eq!(
+                procedure,
+                &Procedure::GraphDb(GraphDbProcedure::NodeClasses)
+            );
+        }
+        other => panic!("unexpected query {other:?}"),
+    }
+
+    match &queries[1] {
+        Query::CallProcedure { procedure } => {
+            assert_eq!(procedure.canonical_name(), "graphdb.users");
+        }
+        other => panic!("unexpected query {other:?}"),
     }
 }

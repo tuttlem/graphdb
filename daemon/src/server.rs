@@ -68,6 +68,7 @@ struct SuccessResponse {
     status: &'static str,
     messages: Vec<String>,
     selected_nodes: Vec<graphdb_core::Node>,
+    procedures: Vec<crate::executor::ProcedureResult>,
 }
 
 #[derive(Serialize)]
@@ -89,6 +90,7 @@ async fn handle_query(
         status: "ok",
         messages: report.messages,
         selected_nodes: report.selected_nodes,
+        procedures: report.procedures,
     }))
 }
 

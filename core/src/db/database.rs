@@ -1,9 +1,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 
+use common::attr::AttributeContainer;
 use common::edge::{Edge, EdgeId};
 use common::node::{Node, NodeId};
 
+use crate::db::catalog::{
+    CatalogCache, CatalogError, CatalogObject, EdgeClassId, NodeClassId, Privilege, ProcessId,
+    ProcessWatch, RoleId, SchemaId, SystemCatalog, UserId,
+};
 use crate::storage::{StorageBackend, StorageError, StorageOp, StorageResult};
 use thiserror::Error;
 
@@ -11,6 +17,14 @@ use thiserror::Error;
 pub enum DatabaseError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+    #[error("role {role} lacks {privilege} on {object}")]
+    Unauthorized {
+        role: RoleId,
+        privilege: Privilege,
+        object: CatalogObject,
+    },
 }
 
 pub type DatabaseResult<T> = Result<T, DatabaseError>;
@@ -35,8 +49,17 @@ impl Default for Cache {
     }
 }
 
+struct EndpointClassInfo {
+    class_name: String,
+    class_id: Option<NodeClassId>,
+}
+
 pub struct Database<B: StorageBackend> {
     storage: B,
+    catalog: Arc<SystemCatalog>,
+    catalog_cache: CatalogCache,
+    default_schema: SchemaId,
+    default_owner_role: RoleId,
     cache: RwLock<Cache>,
     node_capacity: Option<usize>,
     edge_capacity: Option<usize>,
@@ -45,6 +68,8 @@ pub struct Database<B: StorageBackend> {
 impl<B: StorageBackend> Database<B> {
     const POISONED_READ: &'static str = "cache read";
     const POISONED_WRITE: &'static str = "cache write";
+    const DEFAULT_NODE_CLASS: &'static str = "__default__";
+    const DEFAULT_EDGE_CLASS: &'static str = "__link__";
 
     pub fn new(storage: B) -> Self {
         Self::with_capacity(storage, None, None)
@@ -55,8 +80,34 @@ impl<B: StorageBackend> Database<B> {
         node_capacity: Option<usize>,
         edge_capacity: Option<usize>,
     ) -> Self {
+        Self::with_catalog_and_capacity(
+            storage,
+            SystemCatalog::bootstrap(),
+            node_capacity,
+            edge_capacity,
+        )
+    }
+
+    pub fn with_catalog(storage: B, catalog: Arc<SystemCatalog>) -> Self {
+        Self::with_catalog_and_capacity(storage, catalog, None, None)
+    }
+
+    pub fn with_catalog_and_capacity(
+        storage: B,
+        catalog: Arc<SystemCatalog>,
+        node_capacity: Option<usize>,
+        edge_capacity: Option<usize>,
+    ) -> Self {
+        let catalog_cache = catalog.cache_handle();
+        let default_schema = catalog.default_schema_id();
+        let default_owner_role = catalog.system_role_id();
+
         Self {
             storage,
+            catalog,
+            catalog_cache,
+            default_schema,
+            default_owner_role,
             cache: RwLock::new(Cache::default()),
             node_capacity,
             edge_capacity,
@@ -67,14 +118,179 @@ impl<B: StorageBackend> Database<B> {
         &self.storage
     }
 
+    pub fn catalog(&self) -> Arc<SystemCatalog> {
+        self.catalog.clone()
+    }
+
+    pub fn catalog_cache(&self) -> &CatalogCache {
+        &self.catalog_cache
+    }
+
+    pub fn process_watch(&self, timeout: Duration) -> ProcessWatch<'_> {
+        ProcessWatch::new(self.catalog.as_ref(), timeout)
+    }
+
+    pub fn register_process(
+        &self,
+        user: UserId,
+        active_role: RoleId,
+        description: &str,
+    ) -> DatabaseResult<ProcessId> {
+        Ok(self
+            .catalog
+            .register_process(user, active_role, description)?)
+    }
+
+    pub fn heartbeat_process(&self, process_id: ProcessId) -> DatabaseResult<bool> {
+        Ok(self.catalog.heartbeat_process(process_id)?)
+    }
+
+    pub fn complete_process(&self, process_id: ProcessId) -> DatabaseResult<bool> {
+        Ok(self.catalog.complete_process(process_id)?)
+    }
+
     pub fn insert_node(&self, node: Node) -> DatabaseResult<Arc<Node>> {
+        let labels = Self::labels_or_default(node.labels());
+        let properties = Self::node_property_keys(&node);
+        let class_ids = self.ensure_node_classes_internal(&labels, &properties)?;
+        self.ensure_privileges_for_classes(self.default_owner_role, &class_ids, Privilege::INSERT)?;
+
         self.storage.store_node(&node)?;
         Ok(self.cache_node(node)?)
     }
 
     pub fn insert_edge(&self, edge: Edge) -> DatabaseResult<Arc<Edge>> {
+        let edge_class_id = self.ensure_edge_catalog(&edge)?;
+        self.ensure_privilege(
+            self.default_owner_role,
+            CatalogObject::EdgeClass(edge_class_id),
+            Privilege::INSERT,
+        )?;
+
         self.storage.store_edge(&edge)?;
         Ok(self.cache_edge(edge)?)
+    }
+
+    fn ensure_node_classes_internal(
+        &self,
+        labels: &[String],
+        properties: &[String],
+    ) -> DatabaseResult<Vec<NodeClassId>> {
+        let mut ids = Vec::with_capacity(labels.len().max(1));
+        for label in labels {
+            let id = self.catalog.ensure_node_class(
+                self.default_schema,
+                label,
+                self.default_owner_role,
+                properties,
+            )?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    fn ensure_privileges_for_classes(
+        &self,
+        role: RoleId,
+        class_ids: &[NodeClassId],
+        privilege: Privilege,
+    ) -> DatabaseResult<()> {
+        for class_id in class_ids {
+            self.ensure_privilege(role, CatalogObject::NodeClass(*class_id), privilege)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_privilege(
+        &self,
+        role: RoleId,
+        object: CatalogObject,
+        privilege: Privilege,
+    ) -> DatabaseResult<()> {
+        if role == self.default_owner_role {
+            return Ok(());
+        }
+
+        let privileges = self.catalog_cache.privileges_for_role(role)?;
+        if privileges.contains(privilege) {
+            return Ok(());
+        }
+
+        Err(DatabaseError::Unauthorized {
+            role,
+            privilege,
+            object,
+        })
+    }
+
+    fn ensure_edge_catalog(&self, edge: &Edge) -> DatabaseResult<EdgeClassId> {
+        let properties = Self::edge_property_keys(edge);
+        let source = self.get_node(edge.source())?;
+        let target = self.get_node(edge.target())?;
+        let source_info = self.endpoint_class_info(source)?;
+        let target_info = self.endpoint_class_info(target)?;
+
+        let class_name = Self::edge_class_name(&source_info.class_name, &target_info.class_name);
+
+        Ok(self.catalog.ensure_edge_class(
+            self.default_schema,
+            &class_name,
+            self.default_owner_role,
+            &properties,
+            source_info.class_id,
+            target_info.class_id,
+        )?)
+    }
+
+    fn endpoint_class_info(&self, node: Option<Arc<Node>>) -> DatabaseResult<EndpointClassInfo> {
+        let labels = if let Some(node_ref) = node.as_ref() {
+            Self::labels_or_default(node_ref.labels())
+        } else {
+            vec![Self::DEFAULT_NODE_CLASS.to_string()]
+        };
+
+        let properties = if let Some(node_ref) = node.as_ref() {
+            Self::node_property_keys(node_ref.as_ref())
+        } else {
+            Vec::new()
+        };
+
+        let primary_name = labels
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Self::DEFAULT_NODE_CLASS.to_string());
+
+        let class_ids = self.ensure_node_classes_internal(&labels, &properties)?;
+        let primary_id = class_ids.first().copied();
+
+        Ok(EndpointClassInfo {
+            class_name: primary_name,
+            class_id: primary_id,
+        })
+    }
+
+    fn labels_or_default(labels: &[String]) -> Vec<String> {
+        if labels.is_empty() {
+            vec![Self::DEFAULT_NODE_CLASS.to_string()]
+        } else {
+            labels.iter().cloned().collect()
+        }
+    }
+
+    fn edge_class_name(source: &str, target: &str) -> String {
+        if source == Self::DEFAULT_NODE_CLASS && target == Self::DEFAULT_NODE_CLASS {
+            Self::DEFAULT_EDGE_CLASS.to_string()
+        } else {
+            format!("{}->{}", source, target)
+        }
+    }
+
+    fn node_property_keys(node: &Node) -> Vec<String> {
+        node.attributes().keys().cloned().collect()
+    }
+
+    fn edge_property_keys(edge: &Edge) -> Vec<String> {
+        edge.attributes().keys().cloned().collect()
     }
 
     pub fn get_node(&self, id: NodeId) -> DatabaseResult<Option<Arc<Node>>> {

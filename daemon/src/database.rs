@@ -1,8 +1,13 @@
 use std::fs;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use graphdb_core::{Database, EdgeId, InMemoryBackend, NodeId, SimpleStorage};
+use graphdb_core::{
+    CatalogError, CatalogResult, CatalogSnapshot, CatalogSnapshotSink, Database, EdgeId,
+    InMemoryBackend, NodeId, SimpleStorage, SystemCatalog,
+};
+use serde_json;
 
 use crate::config::{DaemonConfig, StorageBackendKind};
 use crate::error::{DaemonError, Result};
@@ -42,7 +47,9 @@ impl GraphDatabase {
                     directory.display()
                 );
                 let backend = SimpleStorage::new(directory.clone())?;
-                let database = Database::new(backend);
+                let catalog_path = catalog_file_path(&directory);
+                let catalog = load_or_bootstrap_catalog(&catalog_path)?;
+                let database = Database::with_catalog(backend, catalog);
                 hydrate_simple_backend(&database, &directory)?;
                 GraphDatabaseInner::Simple(database)
             }
@@ -68,6 +75,53 @@ fn hydrate_simple_backend(database: &Database<SimpleStorage>, root: &Path) -> Re
     preload_nodes(database, &root.join("nodes"))?;
     preload_edges(database, &root.join("edges"))?;
     Ok(())
+}
+
+fn catalog_file_path(root: &Path) -> PathBuf {
+    root.join("catalog.json")
+}
+
+fn load_or_bootstrap_catalog(path: &Path) -> Result<Arc<SystemCatalog>> {
+    let store = Arc::new(FileCatalogStore {
+        path: path.to_path_buf(),
+    });
+
+    match read_catalog_snapshot(path)? {
+        Some(snapshot) => SystemCatalog::from_snapshot(snapshot, Some(store))
+            .map_err(|err| DaemonError::Config(format!("failed to load catalog: {err}"))),
+        None => Ok(SystemCatalog::bootstrap_with_persistence(Some(store))),
+    }
+}
+
+fn read_catalog_snapshot(path: &Path) -> Result<Option<CatalogSnapshot>> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let snapshot = serde_json::from_slice(&bytes).map_err(DaemonError::Json)?;
+            Ok(Some(snapshot))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(DaemonError::Io(err)),
+    }
+}
+
+struct FileCatalogStore {
+    path: PathBuf,
+}
+
+impl CatalogSnapshotSink for FileCatalogStore {
+    fn save(&self, snapshot: &CatalogSnapshot) -> CatalogResult<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|err| CatalogError::Persistence(err.to_string()))?;
+        }
+
+        let tmp_path = self.path.with_extension("tmp");
+        let data = serde_json::to_vec_pretty(snapshot)
+            .map_err(|err| CatalogError::Persistence(err.to_string()))?;
+        fs::write(&tmp_path, data).map_err(|err| CatalogError::Persistence(err.to_string()))?;
+        fs::rename(&tmp_path, &self.path)
+            .map_err(|err| CatalogError::Persistence(err.to_string()))?;
+        Ok(())
+    }
 }
 
 fn preload_nodes(database: &Database<SimpleStorage>, dir: &Path) -> Result<()> {

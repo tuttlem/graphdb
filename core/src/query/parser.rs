@@ -318,8 +318,30 @@ fn select_stmt(input: &str) -> IResult<Query> {
     ))
 }
 
+fn call_stmt(input: &str) -> IResult<Query> {
+    let (input, _) = ws(tag_no_case("CALL"))(input)?;
+    let (input, _) = ws(tag_no_case("GRAPHDB"))(input)?;
+    let (input, _) = ws(char('.'))(input)?;
+    let (input, proc_ident) = ws(identifier)(input)?;
+    let procedure = GraphDbProcedure::from_identifier(proc_ident).ok_or_else(|| {
+        nom::Err::Failure(VerboseError {
+            errors: vec![(proc_ident, VerboseErrorKind::Context("unknown procedure"))],
+        })
+    })?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+
+    Ok((
+        input,
+        Query::CallProcedure {
+            procedure: Procedure::GraphDb(procedure),
+        },
+    ))
+}
+
 fn statement(input: &str) -> IResult<Query> {
     alt((
+        call_stmt,
         create_stmt,
         insert_node_stmt,
         insert_edge_stmt,

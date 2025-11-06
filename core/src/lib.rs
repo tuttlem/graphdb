@@ -2,6 +2,12 @@ pub mod db;
 pub mod query;
 pub mod storage;
 
+pub use db::catalog::{
+    AuthMethod, CatalogCache, CatalogError, CatalogObject, CatalogResult, CatalogSnapshot,
+    CatalogSnapshotSink, EdgeClassEntry, EdgeClassId, GrantEntry, IndexDefinition, IndexEntry,
+    IndexId, IndexTarget, NodeClassEntry, NodeClassId, Privilege, ProcessEntry, ProcessId,
+    ProcessWatch, RoleEntry, RoleId, SchemaEntry, SchemaId, SystemCatalog, UserEntry, UserId,
+};
 pub use db::database::{Database, DatabaseError, DatabaseResult};
 pub use storage::{
     InMemoryBackend, SimpleStorage, StorageBackend, StorageError, StorageOp, StorageResult,

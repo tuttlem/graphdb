@@ -2,12 +2,15 @@ use std::collections::HashMap;
 
 use common::attr::{AttributeContainer, AttributeValue};
 use graphdb_core::query::{
-    ComparisonOperator, CreatePattern, CreateRelationship, Query, Value, parse_queries,
+    ComparisonOperator, CreatePattern, CreateRelationship, GraphDbProcedure, Procedure, Query,
+    Value, parse_queries,
 };
 use graphdb_core::{
-    Database, Edge, EdgeId, InMemoryBackend, Node, NodeId, SimpleStorage, StorageBackend,
+    AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
+    NodeId, RoleEntry, SimpleStorage, StorageBackend, UserEntry,
 };
 use serde::Serialize;
+use serde_json::{Value as JsonValue, json};
 
 use crate::error::DaemonError;
 
@@ -15,6 +18,13 @@ use crate::error::DaemonError;
 pub struct ExecutionReport {
     pub messages: Vec<String>,
     pub selected_nodes: Vec<Node>,
+    pub procedures: Vec<ProcedureResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcedureResult {
+    pub name: String,
+    pub rows: Vec<JsonValue>,
 }
 
 pub fn execute_script_with_memory(
@@ -88,6 +98,16 @@ fn execute_query<B: StorageBackend>(
         Query::Create { pattern } => execute_create(db, pattern, ctx),
         Query::UpdateNode { .. } | Query::UpdateEdge { .. } => {
             Err(DaemonError::Query("UPDATE not yet supported".into()))
+        }
+        Query::CallProcedure { procedure } => {
+            let result = execute_procedure(db, procedure)?;
+            ctx.messages.push(format!(
+                "call {} returned {} row(s)",
+                result.name,
+                result.rows.len()
+            ));
+            ctx.procedures.push(result);
+            Ok(())
         }
     }
 }
@@ -215,6 +235,136 @@ fn execute_create<B: StorageBackend>(
     }
 
     Ok(())
+}
+
+fn execute_procedure<B: StorageBackend>(
+    db: &Database<B>,
+    procedure: Procedure,
+) -> Result<ProcedureResult, DaemonError> {
+    let name = procedure.canonical_name().to_string();
+    let rows = match procedure {
+        Procedure::GraphDb(graph_proc) => match graph_proc {
+            GraphDbProcedure::NodeClasses => {
+                let entries = db
+                    .catalog()
+                    .list_node_classes()
+                    .map_err(graphdb_core::DatabaseError::from)?;
+                node_class_rows(entries)
+            }
+            GraphDbProcedure::EdgeClasses => {
+                let entries = db
+                    .catalog()
+                    .list_edge_classes()
+                    .map_err(graphdb_core::DatabaseError::from)?;
+                edge_class_rows(entries)
+            }
+            GraphDbProcedure::Users => {
+                let entries = db
+                    .catalog()
+                    .list_users()
+                    .map_err(graphdb_core::DatabaseError::from)?;
+                user_rows(entries)
+            }
+            GraphDbProcedure::Roles => {
+                let entries = db
+                    .catalog()
+                    .list_roles()
+                    .map_err(graphdb_core::DatabaseError::from)?;
+                role_rows(entries)
+            }
+        },
+    };
+
+    Ok(ProcedureResult { name, rows })
+}
+
+fn node_class_rows(entries: Vec<NodeClassEntry>) -> Vec<JsonValue> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut properties: Vec<_> = entry.properties.into_iter().collect();
+            properties.sort();
+            json!({
+                "id": entry.id,
+                "schema_id": entry.schema_id,
+                "name": entry.name,
+                "owner_role": entry.owner_role,
+                "properties": properties,
+                "version": entry.version,
+                "created_at_seconds": seconds_since_epoch(entry.created_at),
+            })
+        })
+        .collect()
+}
+
+fn edge_class_rows(entries: Vec<EdgeClassEntry>) -> Vec<JsonValue> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut properties: Vec<_> = entry.properties.into_iter().collect();
+            properties.sort();
+            json!({
+                "id": entry.id,
+                "schema_id": entry.schema_id,
+                "name": entry.name,
+                "owner_role": entry.owner_role,
+                "properties": properties,
+                "source_class": entry.source_class,
+                "target_class": entry.target_class,
+                "version": entry.version,
+                "created_at_seconds": seconds_since_epoch(entry.created_at),
+            })
+        })
+        .collect()
+}
+
+fn role_rows(entries: Vec<RoleEntry>) -> Vec<JsonValue> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut inherits: Vec<_> = entry
+                .inherits
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect();
+            inherits.sort();
+            json!({
+                "id": entry.id,
+                "name": entry.name,
+                "inherits": inherits,
+                "created_at_seconds": seconds_since_epoch(entry.created_at),
+            })
+        })
+        .collect()
+}
+
+fn user_rows(entries: Vec<UserEntry>) -> Vec<JsonValue> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "username": entry.username,
+                "login_role": entry.login_role,
+                "default_role": entry.default_role,
+                "auth_method": auth_method_label(&entry.auth_method),
+                "created_at_seconds": seconds_since_epoch(entry.created_at),
+            })
+        })
+        .collect()
+}
+
+fn auth_method_label(method: &AuthMethod) -> &'static str {
+    match method {
+        AuthMethod::InternalPassword => "internal_password",
+        AuthMethod::External => "external",
+    }
+}
+
+fn seconds_since_epoch(ts: std::time::SystemTime) -> u64 {
+    ts.duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn materialize_node(pattern: graphdb_core::query::NodePattern) -> Result<Node, DaemonError> {
