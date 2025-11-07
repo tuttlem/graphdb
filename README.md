@@ -1,7 +1,7 @@
 ![Logo](img/logo.png)
 
 ## Overview
-<hr>
+
 
 GraphDB is an experimental graph database implemented in Rust. The repository is
 organised as a Cargo workspace made up of three primary crates:
@@ -17,7 +17,7 @@ daemonisation (double fork, `setsid`, stdio redirection, PID file handling) and
 builds on top of [Axum](https://github.com/tokio-rs/axum) for the HTTP surface.
 
 ## Quick Start
-<hr>
+
 
 ```sh
 # Run all checks
@@ -66,7 +66,7 @@ Errors return HTTP 4xx/5xx responses with a JSON body of `{ "status": "error",
 "error": "…" }`.
 
 ## System Catalog
-<hr>
+
 
 GraphDB now maintains a native system catalog that mirrors the pattern used by
 Postgres (`pg_catalog`) and SQL Server (`sys`). The catalog is bootstrapped
@@ -99,7 +99,7 @@ that snapshot so a cold restart fully restores system schemas and privileges
 before graph data is hydrated.
 
 ## Web Client
-<hr>
+
 
 The repository now includes a lightweight React client under `client/`. It can
 run in dev mode (`npm run dev`) or be bundled (`npm run build`). Point the build
@@ -132,7 +132,7 @@ The catalog keeps a per-table epoch counter along with a global epoch. The
 an epoch advances, cached entries are invalidated and repopulated on demand.
 
 ### Calling Catalog Procedures
-<hr>
+
 
 You can introspect the catalog over HTTP using Neo4j-style `CALL` statements.
 The parser understands `CALL graphdb.<procedure>()` and returns the rows in the
@@ -205,7 +205,7 @@ Any role without the required privilege triggers a `DatabaseError::Unauthorized`
 when it attempts to write.
 
 ## Configuration
-<hr>
+
 
 The daemon reads configuration from three sources (highest precedence first):
 
@@ -276,7 +276,7 @@ Multiple statements can be separated with semicolons. New features should extend
 `SIGHUP` is currently ignored.
 
 ## Development Notes
-<hr>
+
 
 - Formatting: `cargo fmt`
 - Linting: `cargo check --workspace`
