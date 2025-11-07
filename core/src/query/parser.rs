@@ -351,8 +351,434 @@ fn call_stmt(input: &str) -> IResult<Query> {
     ))
 }
 
+fn path_match_stmt(origin: &str) -> IResult<Query> {
+    let (input, _) = ws(tag_no_case("MATCH"))(origin)?;
+
+    let mut rest = input;
+    let mut node_bindings: HashMap<String, NodePattern> = HashMap::new();
+    let mut path_binding: Option<PathBinding> = None;
+
+    let (next, clause) = match_clause(rest)?;
+    rest = next;
+    apply_clause(clause, &mut node_bindings, &mut path_binding, rest)?;
+
+    loop {
+        let (next_input, _) = multispace0(rest)?;
+        if let Ok((after_match, _)) = ws(tag_no_case("MATCH"))(next_input) {
+            let (after_clause, clause) = match_clause(after_match)?;
+            rest = after_clause;
+            apply_clause(clause, &mut node_bindings, &mut path_binding, rest)?;
+        } else {
+            rest = next_input;
+            break;
+        }
+    }
+
+    let mut filter = None;
+    if let Ok((after_where, _)) = ws(tag_no_case("WHERE"))(rest) {
+        let (after_filter, parsed_filter) = where_clause(after_where)?;
+        rest = after_filter;
+        filter = Some(parsed_filter);
+    }
+
+    let (rest, return_items) = return_clause(rest)?;
+
+    let binding = path_binding.ok_or_else(|| {
+        nom::Err::Failure(VerboseError {
+            errors: vec![(origin, VerboseErrorKind::Context("missing path binding"))],
+        })
+    })?;
+
+    let start_pattern = resolve_node_pattern(binding.start.clone(), &node_bindings, origin)?;
+    let end_pattern = resolve_node_pattern(binding.end.clone(), &node_bindings, origin)?;
+
+    let start_alias = start_pattern.alias.clone().ok_or_else(|| {
+        nom::Err::Failure(VerboseError {
+            errors: vec![(
+                input,
+                VerboseErrorKind::Context("start node must have an alias"),
+            )],
+        })
+    })?;
+    let end_alias = end_pattern.alias.clone().ok_or_else(|| {
+        nom::Err::Failure(VerboseError {
+            errors: vec![(
+                input,
+                VerboseErrorKind::Context("end node must have an alias"),
+            )],
+        })
+    })?;
+
+    // ensure bindings reflect potentially resolved patterns
+    node_bindings.insert(start_alias.clone(), start_pattern.clone());
+    node_bindings.insert(end_alias.clone(), end_pattern.clone());
+
+    let path_alias_value = binding.alias.clone();
+    let start_alias_value = start_alias.clone();
+    let end_alias_value = end_alias.clone();
+    let returns = build_return_clause(
+        return_items,
+        path_alias_value,
+        start_alias_value,
+        end_alias_value,
+        origin,
+    )?;
+
+    let query = PathMatchQuery {
+        path_alias: binding.alias,
+        start_alias,
+        end_alias,
+        start: start_pattern,
+        end: end_pattern,
+        relationship: binding.relationship,
+        mode: binding.mode,
+        filter,
+        returns,
+    };
+
+    Ok((rest, Query::PathMatch(query)))
+}
+
+#[derive(Debug, Clone)]
+struct PathBinding {
+    alias: String,
+    start: NodePattern,
+    end: NodePattern,
+    relationship: RelationshipPattern,
+    mode: PathQueryMode,
+}
+
+#[derive(Debug, Clone)]
+enum MatchClause {
+    NodeList(Vec<NodePattern>),
+    Path(PathBinding),
+}
+
+#[derive(Debug, Clone)]
+enum ReturnItemAst {
+    Identifier(String),
+    Length(String),
+}
+
+fn apply_clause<'a>(
+    clause: MatchClause,
+    bindings: &mut HashMap<String, NodePattern>,
+    path_binding: &mut Option<PathBinding>,
+    ctx: &'a str,
+) -> Result<(), nom::Err<VerboseError<&'a str>>> {
+    match clause {
+        MatchClause::NodeList(nodes) => {
+            for node in nodes {
+                if let Some(alias) = node.alias.clone() {
+                    bindings.insert(alias, node);
+                } else {
+                    return Err(nom::Err::Failure(VerboseError {
+                        errors: vec![(
+                            ctx,
+                            VerboseErrorKind::Context("node in MATCH must have alias"),
+                        )],
+                    }));
+                }
+            }
+        }
+        MatchClause::Path(binding) => {
+            if path_binding.is_some() {
+                return Err(nom::Err::Failure(VerboseError {
+                    errors: vec![(
+                        ctx,
+                        VerboseErrorKind::Context("multiple path patterns not supported"),
+                    )],
+                }));
+            }
+            *path_binding = Some(binding);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_node_pattern<'a>(
+    pattern: NodePattern,
+    bindings: &HashMap<String, NodePattern>,
+    _ctx: &'a str,
+) -> Result<NodePattern, nom::Err<VerboseError<&'a str>>> {
+    if let Some(alias) = &pattern.alias {
+        if pattern.label.is_none() && pattern.properties.0.is_empty() {
+            if let Some(existing) = bindings.get(alias) {
+                return Ok(existing.clone());
+            }
+        }
+    }
+    Ok(pattern)
+}
+
+fn match_clause(input: &str) -> IResult<MatchClause> {
+    if looks_like_path_clause(input) {
+        path_binding_clause(input)
+    } else {
+        node_list_clause(input).map(|(rest, nodes)| (rest, MatchClause::NodeList(nodes)))
+    }
+}
+
+fn looks_like_path_clause(input: &str) -> bool {
+    let mut depth = 0i32;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                        chars.next();
+                    }
+                    return matches!(chars.peek(), Some('-') | Some('<'));
+                }
+            }
+            '=' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn node_list_clause(input: &str) -> IResult<Vec<NodePattern>> {
+    separated_list1(ws(char(',')), ws(node_pattern))(input)
+}
+
+fn path_binding_clause(input: &str) -> IResult<MatchClause> {
+    alt((
+        map(path_binding_with_alias, |binding| {
+            MatchClause::Path(binding)
+        }),
+        map(path_binding_without_alias, |binding| {
+            MatchClause::Path(binding)
+        }),
+    ))(input)
+}
+
+fn path_binding_with_alias(input: &str) -> IResult<PathBinding> {
+    let (input, alias) = ws(identifier)(input)?;
+    let (input, _) = ws(char('='))(input)?;
+    parse_path_expression(input, alias.to_string())
+}
+
+fn path_binding_without_alias(input: &str) -> IResult<PathBinding> {
+    parse_path_expression(input, "path".to_string())
+}
+
+fn parse_path_expression(input: &str, alias: String) -> IResult<PathBinding> {
+    if let Ok((input, _)) = ws(tag_no_case("shortestpath"))(input) {
+        let (input, _) = ws(char('('))(input)?;
+        let (input, start) = ws(node_pattern)(input)?;
+        let (input, relationship) = ws(parse_relationship_pattern)(input)?;
+        let (input, end) = ws(node_pattern)(input)?;
+        let (input, _) = ws(char(')'))(input)?;
+        Ok((
+            input,
+            PathBinding {
+                alias,
+                start,
+                end,
+                relationship,
+                mode: PathQueryMode::Shortest,
+            },
+        ))
+    } else {
+        let (input, start) = ws(node_pattern)(input)?;
+        let (input, relationship) = ws(parse_relationship_pattern)(input)?;
+        let (input, end) = ws(node_pattern)(input)?;
+        Ok((
+            input,
+            PathBinding {
+                alias,
+                start,
+                end,
+                relationship,
+                mode: PathQueryMode::All,
+            },
+        ))
+    }
+}
+
+fn parse_relationship_pattern(input: &str) -> IResult<RelationshipPattern> {
+    alt((
+        parse_outbound_relationship,
+        parse_inbound_relationship,
+        parse_undirected_relationship,
+    ))(input)
+}
+
+fn parse_outbound_relationship(input: &str) -> IResult<RelationshipPattern> {
+    let (input, _) = ws(char('-'))(input)?;
+    let (input, (edge, length)) = parse_bracketed_relationship(input)?;
+    let (input, _) = ws(tag("->"))(input)?;
+    Ok((
+        input,
+        RelationshipPattern {
+            alias: edge.alias,
+            label: edge.label,
+            properties: edge.properties,
+            direction: RelationshipDirection::Outbound,
+            length,
+        },
+    ))
+}
+
+fn parse_inbound_relationship(input: &str) -> IResult<RelationshipPattern> {
+    let (input, _) = ws(tag("<-"))(input)?;
+    let (input, (edge, length)) = parse_bracketed_relationship(input)?;
+    let (input, _) = ws(char('-'))(input)?;
+    Ok((
+        input,
+        RelationshipPattern {
+            alias: edge.alias,
+            label: edge.label,
+            properties: edge.properties,
+            direction: RelationshipDirection::Inbound,
+            length,
+        },
+    ))
+}
+
+fn parse_undirected_relationship(input: &str) -> IResult<RelationshipPattern> {
+    let (input, _) = ws(char('-'))(input)?;
+    let (input, (edge, length)) = parse_bracketed_relationship(input)?;
+    let (input, _) = ws(char('-'))(input)?;
+    Ok((
+        input,
+        RelationshipPattern {
+            alias: edge.alias,
+            label: edge.label,
+            properties: edge.properties,
+            direction: RelationshipDirection::Undirected,
+            length,
+        },
+    ))
+}
+
+fn parse_bracketed_relationship(input: &str) -> IResult<(EdgePattern, PathLength)> {
+    let (input, _) = ws(char('['))(input)?;
+    let (input, (alias, label)) = alias_and_label(input)?;
+    let (input, length) = opt(path_length_modifier)(input)?;
+    let (input, properties) = opt(properties_block)(input)?;
+    let (input, _) = ws(char(']'))(input)?;
+    let props = properties.unwrap_or_default();
+    Ok((
+        input,
+        (
+            EdgePattern {
+                alias,
+                label,
+                properties: Properties::new(props),
+            },
+            length.unwrap_or(PathLength::Exact(1)),
+        ),
+    ))
+}
+
+fn path_length_modifier(input: &str) -> IResult<PathLength> {
+    let (input, _) = ws(char('*'))(input)?;
+    let (input, min_part) = opt(ws(digit1))(input)?;
+    let (input, range) = opt(ws(tag("..")))(input)?;
+    if let Some(_) = range {
+        let min = min_part
+            .map(|digits| digits.parse::<u32>().unwrap_or(0))
+            .unwrap_or(0);
+        let (input, max_part) = opt(ws(digit1))(input)?;
+        let max = max_part.map(|digits| digits.parse::<u32>().unwrap_or(min));
+        Ok((input, PathLength::Range { min, max }))
+    } else if let Some(digits) = min_part {
+        let value = digits.parse::<u32>().unwrap_or(1);
+        Ok((input, PathLength::Exact(value)))
+    } else {
+        Ok((input, PathLength::Range { min: 1, max: None }))
+    }
+}
+
+fn where_clause(input: &str) -> IResult<PathFilter> {
+    let (input, _) = ws(tag_no_case("NOT"))(input)?;
+    let (input, from_node) = ws(node_pattern)(input)?;
+    let (input, relationship) = ws(parse_relationship_pattern)(input)?;
+    let (input, to_node) = ws(node_pattern)(input)?;
+
+    let from_alias = from_node.alias.clone().ok_or_else(|| {
+        nom::Err::Failure(VerboseError {
+            errors: vec![(
+                input,
+                VerboseErrorKind::Context("WHERE clause requires alias"),
+            )],
+        })
+    })?;
+    Ok((
+        input,
+        PathFilter::ExcludeRelationship {
+            from_alias,
+            relationship,
+            to_pattern: to_node,
+        },
+    ))
+}
+
+fn return_clause(input: &str) -> IResult<Vec<ReturnItemAst>> {
+    let (input, _) = ws(tag_no_case("RETURN"))(input)?;
+    separated_list1(ws(char(',')), parse_return_item)(input)
+}
+
+fn parse_return_item(input: &str) -> IResult<ReturnItemAst> {
+    if let Ok((input, _)) = ws(tag_no_case("length"))(input) {
+        let (input, _) = ws(char('('))(input)?;
+        let (input, ident) = ws(identifier)(input)?;
+        let (input, _) = ws(char(')'))(input)?;
+        return Ok((input, ReturnItemAst::Length(ident.to_string())));
+    }
+    let (input, ident) = ws(identifier)(input)?;
+    Ok((input, ReturnItemAst::Identifier(ident.to_string())))
+}
+
+fn build_return_clause(
+    items: Vec<ReturnItemAst>,
+    path_alias: String,
+    start_alias: String,
+    end_alias: String,
+    ctx: &str,
+) -> Result<PathReturn, nom::Err<VerboseError<&str>>> {
+    match items.as_slice() {
+        [ReturnItemAst::Identifier(alias)] if alias == &path_alias => Ok(PathReturn::Path {
+            include_length: false,
+        }),
+        [
+            ReturnItemAst::Identifier(alias),
+            ReturnItemAst::Length(len_alias),
+        ] if alias == &path_alias && len_alias == &path_alias => Ok(PathReturn::Path {
+            include_length: true,
+        }),
+        [ReturnItemAst::Identifier(a), ReturnItemAst::Identifier(b)]
+            if a == &start_alias && b == &end_alias =>
+        {
+            Ok(PathReturn::Nodes {
+                start_alias,
+                end_alias,
+                include_length: false,
+            })
+        }
+        [
+            ReturnItemAst::Identifier(a),
+            ReturnItemAst::Identifier(b),
+            ReturnItemAst::Length(len),
+        ] if a == &start_alias && b == &end_alias && len == &path_alias => Ok(PathReturn::Nodes {
+            start_alias,
+            end_alias,
+            include_length: true,
+        }),
+        _ => Err(nom::Err::Failure(VerboseError {
+            errors: vec![(ctx, VerboseErrorKind::Context("unsupported RETURN clause"))],
+        })),
+    }
+}
+
 fn statement(input: &str) -> IResult<Query> {
     alt((
+        path_match_stmt,
         call_stmt,
         create_stmt,
         insert_node_stmt,

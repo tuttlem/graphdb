@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use common::attr::{AttributeContainer, AttributeValue};
 use graphdb_core::query::{
-    ComparisonOperator, CreatePattern, CreateRelationship, GraphDbProcedure, Procedure, Query,
-    Value, parse_queries,
+    ComparisonOperator, CreatePattern, CreateRelationship, GraphDbProcedure, PathFilter,
+    PathLength, PathMatchQuery, PathQueryMode, PathReturn, Procedure, Query, RelationshipDirection,
+    RelationshipPattern, Value, parse_queries,
 };
 use graphdb_core::{
     AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
@@ -19,6 +20,8 @@ pub struct ExecutionReport {
     pub messages: Vec<String>,
     pub selected_nodes: Vec<Node>,
     pub procedures: Vec<ProcedureResult>,
+    pub paths: Vec<PathResult>,
+    pub path_pairs: Vec<PathPairResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,6 +30,22 @@ pub struct ProcedureResult {
     pub rows: Vec<JsonValue>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PathResult {
+    pub alias: String,
+    pub nodes: Vec<Node>,
+    pub edge_ids: Vec<EdgeId>,
+    pub length: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PathPairResult {
+    pub start_alias: String,
+    pub end_alias: String,
+    pub start: Node,
+    pub end: Node,
+    pub length: usize,
+}
 pub fn execute_script_with_memory(
     db: &Database<InMemoryBackend>,
     script: &str,
@@ -109,6 +128,7 @@ fn execute_query<B: StorageBackend>(
             ctx.procedures.push(result);
             Ok(())
         }
+        Query::PathMatch(spec) => execute_path_query(db, spec, ctx),
     }
 }
 
@@ -411,7 +431,7 @@ fn materialize_edge(
 ) -> Result<Edge, DaemonError> {
     let graphdb_core::query::EdgePattern {
         alias: _,
-        label: _,
+        label,
         properties,
     } = pattern;
 
@@ -431,6 +451,11 @@ fn materialize_edge(
             "id".to_string(),
             AttributeValue::String(edge_id.to_string()),
         );
+    }
+    if let Some(label_value) = label {
+        attributes
+            .entry("__label".to_string())
+            .or_insert_with(|| AttributeValue::String(label_value.clone()));
     }
 
     Ok(Edge::new(edge_id, source, target, attributes))
@@ -496,5 +521,496 @@ fn value_to_attribute(value: &Value) -> AttributeValue {
         Value::List(values) => {
             AttributeValue::List(values.iter().map(value_to_attribute).collect())
         }
+    }
+}
+
+const DEFAULT_MAX_HOPS: u32 = 10;
+const MAX_RETURNED_PATHS: usize = 64;
+const EDGE_LABEL_KEY: &str = "__label";
+
+fn execute_path_query<B: StorageBackend>(
+    db: &Database<B>,
+    query: PathMatchQuery,
+    ctx: &mut ExecutionReport,
+) -> Result<(), DaemonError> {
+    let start_nodes = find_matching_nodes(db, &query.start)?;
+    let end_nodes = find_matching_nodes(db, &query.end)?;
+
+    if start_nodes.is_empty() || end_nodes.is_empty() {
+        ctx.messages.push("path match returned no nodes".into());
+        return Ok(());
+    }
+
+    let end_set: HashSet<NodeId> = end_nodes.iter().map(|node| node.id()).collect();
+    let start_ids: HashSet<NodeId> = start_nodes.iter().map(|node| node.id()).collect();
+    let length_bounds = length_bounds(&query.relationship.length);
+    let filter = query.filter.clone();
+
+    let paths = match query.mode {
+        PathQueryMode::Shortest => shortest_path(
+            db,
+            &start_nodes,
+            &start_ids,
+            &end_set,
+            &query.relationship,
+            length_bounds,
+            filter.as_ref(),
+            &query.start_alias,
+        )?,
+        PathQueryMode::All => enumerate_paths(
+            db,
+            &start_nodes,
+            &start_ids,
+            &end_set,
+            &query.relationship,
+            length_bounds,
+            filter.as_ref(),
+            &query.start_alias,
+        )?,
+    };
+
+    if paths.is_empty() {
+        ctx.messages
+            .push("path match completed with no results".into());
+        return Ok(());
+    }
+
+    match query.returns {
+        PathReturn::Path { include_length } => {
+            for path in paths {
+                let nodes = load_nodes_by_ids(db, &path.nodes)?;
+                ctx.paths.push(PathResult {
+                    alias: query.path_alias.clone(),
+                    nodes,
+                    edge_ids: path.edges.clone(),
+                    length: path.edges.len(),
+                });
+                if include_length {
+                    ctx.messages.push(format!(
+                        "path {} length {}",
+                        query.path_alias,
+                        path.edges.len()
+                    ));
+                }
+            }
+        }
+        PathReturn::Nodes {
+            start_alias,
+            end_alias,
+            include_length,
+        } => {
+            for path in paths {
+                let start_node = db
+                    .get_node(*path.nodes.first().expect("non-empty path"))?
+                    .map(|arc| (*arc).clone())
+                    .ok_or_else(|| DaemonError::Query("start node missing".into()))?;
+                let end_node = db
+                    .get_node(*path.nodes.last().expect("non-empty path"))?
+                    .map(|arc| (*arc).clone())
+                    .ok_or_else(|| DaemonError::Query("end node missing".into()))?;
+                ctx.path_pairs.push(PathPairResult {
+                    start_alias: start_alias.clone(),
+                    end_alias: end_alias.clone(),
+                    start: start_node,
+                    end: end_node,
+                    length: path.edges.len(),
+                });
+                if include_length {
+                    ctx.messages.push(format!(
+                        "path {} between {} and {} length {}",
+                        query.path_alias,
+                        start_alias,
+                        end_alias,
+                        path.edges.len()
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn find_matching_nodes<B: StorageBackend>(
+    db: &Database<B>,
+    pattern: &graphdb_core::query::NodePattern,
+) -> Result<Vec<std::sync::Arc<Node>>, DaemonError> {
+    let mut matches = Vec::new();
+    for node_id in db.node_ids()? {
+        if let Some(node) = db.get_node(node_id)? {
+            if node_matches_pattern(&node, pattern) {
+                matches.push(node);
+            }
+        }
+    }
+    Ok(matches)
+}
+
+#[derive(Clone)]
+struct PathState {
+    nodes: Vec<NodeId>,
+    edges: Vec<EdgeId>,
+}
+
+fn length_bounds(spec: &PathLength) -> (u32, u32) {
+    match spec {
+        PathLength::Exact(v) => (*v, *v),
+        PathLength::Range { min, max } => {
+            let upper = max.unwrap_or(DEFAULT_MAX_HOPS);
+            (*min, upper)
+        }
+    }
+}
+
+fn shortest_path<B: StorageBackend>(
+    db: &Database<B>,
+    starts: &[std::sync::Arc<Node>],
+    start_ids: &HashSet<NodeId>,
+    end_set: &HashSet<NodeId>,
+    relationship: &RelationshipPattern,
+    (min_hops, max_hops): (u32, u32),
+    filter: Option<&PathFilter>,
+    start_alias: &str,
+) -> Result<Vec<PathState>, DaemonError> {
+    let mut queue = VecDeque::new();
+    let mut visited: HashSet<NodeId> = HashSet::new();
+    for node in starts {
+        queue.push_back(PathState {
+            nodes: vec![node.id()],
+            edges: Vec::new(),
+        });
+        visited.insert(node.id());
+    }
+
+    while let Some(state) = queue.pop_front() {
+        let depth = state.edges.len() as u32;
+        let current = *state.nodes.last().unwrap();
+        if depth >= min_hops && end_set.contains(&current) {
+            return Ok(vec![state]);
+        }
+        if depth >= max_hops {
+            continue;
+        }
+        for (edge, next) in
+            relationship_neighbors(db, current, relationship, start_ids, filter, start_alias)?
+        {
+            if state.nodes.contains(&next) {
+                continue;
+            }
+            if !visited.insert(next) {
+                continue;
+            }
+            let mut next_state = PathState {
+                nodes: state.nodes.clone(),
+                edges: state.edges.clone(),
+            };
+            next_state.nodes.push(next);
+            next_state.edges.push(edge.id());
+            queue.push_back(next_state);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn enumerate_paths<B: StorageBackend>(
+    db: &Database<B>,
+    starts: &[std::sync::Arc<Node>],
+    start_ids: &HashSet<NodeId>,
+    end_set: &HashSet<NodeId>,
+    relationship: &RelationshipPattern,
+    (min_hops, max_hops): (u32, u32),
+    filter: Option<&PathFilter>,
+    start_alias: &str,
+) -> Result<Vec<PathState>, DaemonError> {
+    let mut results = Vec::new();
+    for node in starts {
+        let mut state = PathState {
+            nodes: vec![node.id()],
+            edges: Vec::new(),
+        };
+        dfs_paths(
+            db,
+            &mut state,
+            start_ids,
+            end_set,
+            relationship,
+            min_hops,
+            max_hops,
+            &mut results,
+            filter,
+            start_alias,
+        )?;
+        if results.len() >= MAX_RETURNED_PATHS {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+fn dfs_paths<B: StorageBackend>(
+    db: &Database<B>,
+    state: &mut PathState,
+    start_ids: &HashSet<NodeId>,
+    end_set: &HashSet<NodeId>,
+    relationship: &RelationshipPattern,
+    min_hops: u32,
+    max_hops: u32,
+    results: &mut Vec<PathState>,
+    filter: Option<&PathFilter>,
+    start_alias: &str,
+) -> Result<(), DaemonError> {
+    let depth = state.edges.len() as u32;
+    let current = *state.nodes.last().unwrap();
+    if depth >= min_hops && end_set.contains(&current) {
+        results.push(state.clone());
+    }
+    if depth >= max_hops || results.len() >= MAX_RETURNED_PATHS {
+        return Ok(());
+    }
+    for (edge, next) in
+        relationship_neighbors(db, current, relationship, start_ids, filter, start_alias)?
+    {
+        if state.nodes.contains(&next) {
+            continue;
+        }
+        state.nodes.push(next);
+        state.edges.push(edge.id());
+        dfs_paths(
+            db,
+            state,
+            start_ids,
+            end_set,
+            relationship,
+            min_hops,
+            max_hops,
+            results,
+            filter,
+            start_alias,
+        )?;
+        state.nodes.pop();
+        state.edges.pop();
+        if results.len() >= MAX_RETURNED_PATHS {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn relationship_neighbors<B: StorageBackend>(
+    db: &Database<B>,
+    node_id: NodeId,
+    pattern: &RelationshipPattern,
+    start_ids: &HashSet<NodeId>,
+    filter: Option<&PathFilter>,
+    start_alias: &str,
+) -> Result<Vec<(std::sync::Arc<Edge>, NodeId)>, DaemonError> {
+    let edges = db.edges_for_node(node_id)?;
+    let mut matches = Vec::new();
+    for edge in edges {
+        match pattern.direction {
+            RelationshipDirection::Outbound => {
+                if edge.source() != node_id {
+                    continue;
+                }
+                if !edge_matches_pattern(&edge, pattern) {
+                    continue;
+                }
+                if should_skip_edge(
+                    db,
+                    node_id,
+                    edge.target(),
+                    &edge,
+                    start_ids,
+                    filter,
+                    start_alias,
+                )? {
+                    continue;
+                }
+                matches.push((edge.clone(), edge.target()));
+            }
+            RelationshipDirection::Inbound => {
+                if edge.target() != node_id {
+                    continue;
+                }
+                if !edge_matches_pattern(&edge, pattern) {
+                    continue;
+                }
+                if should_skip_edge(
+                    db,
+                    node_id,
+                    edge.source(),
+                    &edge,
+                    start_ids,
+                    filter,
+                    start_alias,
+                )? {
+                    continue;
+                }
+                matches.push((edge.clone(), edge.source()));
+            }
+            RelationshipDirection::Undirected => {
+                if edge_matches_pattern(&edge, pattern) {
+                    let next = if edge.source() == node_id {
+                        edge.target()
+                    } else {
+                        edge.source()
+                    };
+                    if should_skip_edge(db, node_id, next, &edge, start_ids, filter, start_alias)? {
+                        continue;
+                    }
+                    matches.push((edge.clone(), next));
+                }
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn edge_matches_pattern(edge: &Edge, pattern: &RelationshipPattern) -> bool {
+    if let Some(label) = &pattern.label {
+        match edge.attributes().get(EDGE_LABEL_KEY) {
+            Some(AttributeValue::String(value)) if value == label => {}
+            Some(AttributeValue::String(_)) => return false,
+            _ => return false,
+        }
+    }
+    for (key, value) in pattern.properties.0.iter() {
+        match edge.attributes().get(key) {
+            Some(attr) if value_equals_attribute(value, attr) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn should_skip_edge<B: StorageBackend>(
+    db: &Database<B>,
+    current: NodeId,
+    next: NodeId,
+    edge: &Edge,
+    start_ids: &HashSet<NodeId>,
+    filter: Option<&PathFilter>,
+    start_alias: &str,
+) -> Result<bool, DaemonError> {
+    if let Some(PathFilter::ExcludeRelationship {
+        from_alias,
+        relationship,
+        to_pattern,
+    }) = filter
+    {
+        if from_alias == start_alias && start_ids.contains(&current) {
+            if edge_matches_pattern(edge, relationship) {
+                if let Some(neighbor) = db.get_node(next)? {
+                    if node_matches_pattern(&neighbor, to_pattern) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn load_nodes_by_ids<B: StorageBackend>(
+    db: &Database<B>,
+    ids: &[NodeId],
+) -> Result<Vec<Node>, DaemonError> {
+    let mut nodes = Vec::new();
+    for id in ids {
+        if let Some(node) = db.get_node(*id)? {
+            nodes.push((*node).clone());
+        }
+    }
+    Ok(nodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graphdb_core::query::Properties;
+    use graphdb_core::storage::memory::InMemoryBackend;
+    use std::collections::HashMap;
+
+    fn make_node_pattern(alias: &str, id: &str) -> graphdb_core::query::NodePattern {
+        let mut props = HashMap::new();
+        props.insert("id".to_string(), Value::String(id.to_string()));
+        graphdb_core::query::NodePattern {
+            alias: Some(alias.to_string()),
+            label: Some("Person".to_string()),
+            properties: Properties::new(props),
+        }
+    }
+
+    #[test]
+    fn executes_shortest_path_query() {
+        let backend = InMemoryBackend::new();
+        let db = Database::new(backend);
+
+        let mut ctx = ExecutionReport::default();
+
+        let people = [
+            ("a", "00000000-0000-0000-0000-000000000001"),
+            ("b", "00000000-0000-0000-0000-000000000002"),
+            ("c", "00000000-0000-0000-0000-000000000003"),
+        ];
+        for (alias, id) in people.iter() {
+            let mut props = HashMap::new();
+            props.insert("id".to_string(), Value::String((*id).into()));
+            let pattern = graphdb_core::query::NodePattern {
+                alias: Some((*alias).into()),
+                label: Some("Person".into()),
+                properties: Properties::new(props),
+            };
+            insert_node(&db, pattern).unwrap();
+        }
+
+        let edge_pattern = graphdb_core::query::EdgePattern {
+            alias: None,
+            label: Some("FRIEND".into()),
+            properties: Properties::new(HashMap::new()),
+        };
+        insert_edge(
+            &db,
+            make_node_pattern("a", "00000000-0000-0000-0000-000000000001"),
+            edge_pattern.clone(),
+            make_node_pattern("b", "00000000-0000-0000-0000-000000000002"),
+        )
+        .unwrap();
+        insert_edge(
+            &db,
+            make_node_pattern("b", "00000000-0000-0000-0000-000000000002"),
+            edge_pattern.clone(),
+            make_node_pattern("c", "00000000-0000-0000-0000-000000000003"),
+        )
+        .unwrap();
+
+        let relationship = RelationshipPattern {
+            alias: None,
+            label: Some("FRIEND".into()),
+            properties: Properties::new(HashMap::new()),
+            direction: RelationshipDirection::Outbound,
+            length: PathLength::Range {
+                min: 1,
+                max: Some(5),
+            },
+        };
+        let query = PathMatchQuery {
+            path_alias: "p".into(),
+            start_alias: "a".into(),
+            end_alias: "c".into(),
+            start: make_node_pattern("a", "00000000-0000-0000-0000-000000000001"),
+            end: make_node_pattern("c", "00000000-0000-0000-0000-000000000003"),
+            relationship,
+            mode: PathQueryMode::Shortest,
+            filter: None,
+            returns: PathReturn::Path {
+                include_length: true,
+            },
+        };
+
+        execute_path_query(&db, query, &mut ctx).unwrap();
+        assert_eq!(ctx.paths.len(), 1);
+        assert_eq!(ctx.paths[0].length, 2);
     }
 }

@@ -16,11 +16,28 @@ type ProcedureResult = {
   rows: ProcedureRow[];
 };
 
+type PathResult = {
+  alias: string;
+  nodes: GraphNode[];
+  edge_ids: string[];
+  length: number;
+};
+
+type PathPairResult = {
+  start_alias: string;
+  end_alias: string;
+  start: GraphNode;
+  end: GraphNode;
+  length: number;
+};
+
 type QuerySuccess = {
   status: 'ok';
   messages: string[];
   selected_nodes: GraphNode[];
   procedures: ProcedureResult[];
+  paths: PathResult[];
+  path_pairs: PathPairResult[];
 };
 
 type QueryError = {
@@ -172,6 +189,42 @@ function App() {
             ))
           ) : (
             <p className="muted">No procedure output</p>
+          )}
+        </div>
+
+        <div className="panel">
+          <div className="panel-header">
+            <h2>Paths</h2>
+          </div>
+          {result?.paths?.length ? (
+            result.paths.map((path) => (
+              <details key={`${path.alias}-${path.edge_ids.join('-')}`} className="procedure-card" open>
+                <summary>
+                  {path.alias} – length {path.length}
+                </summary>
+                <pre>{JSON.stringify(path.nodes, null, 2)}</pre>
+              </details>
+            ))
+          ) : (
+            <p className="muted">No path output</p>
+          )}
+        </div>
+
+        <div className="panel">
+          <div className="panel-header">
+            <h2>Node Pairs</h2>
+          </div>
+          {result?.path_pairs?.length ? (
+            result.path_pairs.map((pair, idx) => (
+              <details key={`${pair.start_alias}-${pair.end_alias}-${idx}`} className="procedure-card" open>
+                <summary>
+                  {pair.start_alias} → {pair.end_alias} (length {pair.length})
+                </summary>
+                <pre>{JSON.stringify({ start: pair.start, end: pair.end }, null, 2)}</pre>
+              </details>
+            ))
+          ) : (
+            <p className="muted">No node pairs</p>
           )}
         </div>
 

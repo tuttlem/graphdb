@@ -80,6 +80,7 @@ pub enum Query {
     CallProcedure {
         procedure: Procedure,
     },
+    PathMatch(PathMatchQuery),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +123,68 @@ impl GraphDbProcedure {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathMatchQuery {
+    pub path_alias: String,
+    pub start_alias: String,
+    pub end_alias: String,
+    pub start: NodePattern,
+    pub end: NodePattern,
+    pub relationship: RelationshipPattern,
+    pub mode: PathQueryMode,
+    pub filter: Option<PathFilter>,
+    pub returns: PathReturn,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathQueryMode {
+    All,
+    Shortest,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationshipPattern {
+    pub alias: Option<String>,
+    pub label: Option<String>,
+    pub properties: Properties,
+    pub direction: RelationshipDirection,
+    pub length: PathLength,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RelationshipDirection {
+    Outbound,
+    Inbound,
+    Undirected,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathLength {
+    Exact(u32),
+    Range { min: u32, max: Option<u32> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathFilter {
+    ExcludeRelationship {
+        from_alias: String,
+        relationship: RelationshipPattern,
+        to_pattern: NodePattern,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathReturn {
+    Path {
+        include_length: bool,
+    },
+    Nodes {
+        start_alias: String,
+        end_alias: String,
+        include_length: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

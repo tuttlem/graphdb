@@ -97,6 +97,8 @@ struct SuccessResponse {
     messages: Vec<String>,
     selected_nodes: Vec<graphdb_core::Node>,
     procedures: Vec<crate::executor::ProcedureResult>,
+    paths: Vec<crate::executor::PathResult>,
+    path_pairs: Vec<crate::executor::PathPairResult>,
 }
 
 #[derive(Serialize)]
@@ -119,6 +121,8 @@ async fn handle_query(
         messages: report.messages,
         selected_nodes: report.selected_nodes,
         procedures: report.procedures,
+        paths: report.paths,
+        path_pairs: report.path_pairs,
     }))
 }
 

@@ -1,5 +1,6 @@
 use graphdb_core::query::{
-    ComparisonOperator, GraphDbProcedure, Procedure, Query, Value, parse_queries,
+    ComparisonOperator, GraphDbProcedure, PathQueryMode, PathReturn, Procedure, Query,
+    RelationshipDirection, Value, parse_queries,
 };
 
 #[test]
@@ -129,6 +130,56 @@ fn parse_call_procedure() {
     match &queries[1] {
         Query::CallProcedure { procedure } => {
             assert_eq!(procedure.canonical_name(), "graphdb.users");
+        }
+        other => panic!("unexpected query {other:?}"),
+    }
+}
+
+#[test]
+fn parse_shortest_path_query() {
+    let input = r#"
+MATCH (start:Person {name: "Meg"}), (end:Person {name: "Kevin"})
+MATCH path = shortestPath((start)-[:ACTED_IN*..10]-(end))
+RETURN path, length(path);
+"#;
+    let queries = parse_queries(input).expect("path query");
+    match &queries[0] {
+        Query::PathMatch(spec) => {
+            assert_eq!(spec.path_alias, "path");
+            assert_eq!(spec.start_alias, "start");
+            assert_eq!(spec.end_alias, "end");
+            assert!(matches!(spec.mode, PathQueryMode::Shortest));
+            assert!(matches!(
+                spec.returns,
+                PathReturn::Path {
+                    include_length: true
+                }
+            ));
+            assert_eq!(
+                spec.relationship.direction,
+                RelationshipDirection::Undirected
+            );
+        }
+        other => panic!("unexpected query {other:?}"),
+    }
+}
+
+#[test]
+fn parse_path_with_where_clause() {
+    let input = r#"
+MATCH p = (a:Person {city: "Berlin"})-[:KNOWS*1..3]->(b:Person)
+WHERE NOT (a)-[:BLOCKED]->(m:Person)
+RETURN a, b;
+"#;
+    let queries = parse_queries(input).expect("path query");
+    match &queries[0] {
+        Query::PathMatch(spec) => {
+            assert_eq!(spec.path_alias, "p");
+            assert_eq!(spec.start_alias, "a");
+            assert_eq!(spec.end_alias, "b");
+            assert!(matches!(spec.mode, PathQueryMode::All));
+            assert!(matches!(spec.returns, PathReturn::Nodes { .. }));
+            assert!(spec.filter.is_some());
         }
         other => panic!("unexpected query {other:?}"),
     }

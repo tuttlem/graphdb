@@ -84,6 +84,7 @@ fn execute_query(
         Query::UpdateNode { .. } | Query::UpdateEdge { .. } => {
             Err("UPDATE not supported in executor test".into())
         }
+        Query::PathMatch { .. } => Ok(()),
         Query::CallProcedure { .. } => Ok(()),
     }
 }

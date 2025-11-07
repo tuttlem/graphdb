@@ -265,6 +265,36 @@ Cypher-inspired statements:
 Property maps accept booleans, numbers, strings, `null`, and arbitrarily nested
 arrays (e.g. `skills: ["rust", "distributed"]`).
 
+### Path Queries
+
+You can now traverse the graph with Cypher-like `MATCH` statements. Examples:
+
+```cypher
+MATCH (start:Person {name: "Meg"}), (end:Person {name: "Kevin"})
+MATCH path = shortestPath((start)-[:ACTED_IN*..10]-(end))
+RETURN path, length(path);
+
+MATCH p = (a:Person)-[:FRIEND*1..3]->(b:Person)
+WHERE NOT (a)-[:BLOCKED]->(m:Person)
+RETURN p;
+
+MATCH (s:Person {city: "Zurich"})-[:KNOWS*2]-(t:Person)
+RETURN s, t;
+```
+
+- Relationship lengths follow the `*n`, `*..n`, or `*m..n` syntax.
+- `shortestPath` uses BFS under the hood and respects the hop bounds in the
+  pattern.
+- `RETURN path, length(path)` emits the full path in the HTTP response while
+  `RETURN startAlias, endAlias` emits node pairs.
+
+API responses now include two additional arrays:
+
+- `paths`: detailed paths (nodes + edge ids + length) when you return a path
+  alias.
+- `path_pairs`: start/end node pairs when you return node aliases. Each entry
+  includes the computed path length.
+
 Multiple statements can be separated with semicolons. New features should extend
 `graphdb-core`'s parser (`core/src/query/parser.rs`).
 
