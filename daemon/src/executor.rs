@@ -208,6 +208,13 @@ fn value_equals_attribute(value: &Value, attribute: &AttributeValue) -> bool {
         (Value::Float(a), AttributeValue::Float(b)) => (*a - *b).abs() < f64::EPSILON,
         (Value::Boolean(a), AttributeValue::Boolean(b)) => *a == *b,
         (Value::Null, AttributeValue::Null) => true,
+        (Value::List(values), AttributeValue::List(attrs)) => {
+            values.len() == attrs.len()
+                && values
+                    .iter()
+                    .zip(attrs)
+                    .all(|(v, a)| value_equals_attribute(v, a))
+        }
         _ => false,
     }
 }
@@ -445,10 +452,12 @@ fn parse_node_id(value: &Value) -> Result<NodeId, DaemonError> {
     match value {
         Value::Integer(i) => Ok(NodeId::from_u128(*i as u128)),
         Value::String(s) => {
-            if let Ok(uuid) = NodeId::parse_str(s) {
+            let trimmed = s.trim();
+            let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+            if let Ok(uuid) = NodeId::parse_str(&compact) {
                 Ok(uuid)
             } else {
-                let parsed = s
+                let parsed = compact
                     .parse::<u128>()
                     .map_err(|_| DaemonError::Query("invalid node id".into()))?;
                 Ok(NodeId::from_u128(parsed))
@@ -462,10 +471,12 @@ fn parse_edge_id(value: &Value) -> Result<EdgeId, DaemonError> {
     match value {
         Value::Integer(i) => Ok(EdgeId::from_u128(*i as u128)),
         Value::String(s) => {
-            if let Ok(uuid) = EdgeId::parse_str(s) {
+            let trimmed = s.trim();
+            let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+            if let Ok(uuid) = EdgeId::parse_str(&compact) {
                 Ok(uuid)
             } else {
-                let parsed = s
+                let parsed = compact
                     .parse::<u128>()
                     .map_err(|_| DaemonError::Query("invalid edge id".into()))?;
                 Ok(EdgeId::from_u128(parsed))
@@ -482,5 +493,8 @@ fn value_to_attribute(value: &Value) -> AttributeValue {
         Value::Float(f) => AttributeValue::Float(*f),
         Value::Boolean(b) => AttributeValue::Boolean(*b),
         Value::Null => AttributeValue::Null,
+        Value::List(values) => {
+            AttributeValue::List(values.iter().map(value_to_attribute).collect())
+        }
     }
 }

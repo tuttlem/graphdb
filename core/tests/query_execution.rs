@@ -223,6 +223,13 @@ fn value_equals_attribute(value: &Value, attribute: &AttributeValue) -> bool {
         (Value::Float(a), AttributeValue::Float(b)) => (*a - *b).abs() < f64::EPSILON,
         (Value::Boolean(a), AttributeValue::Boolean(b)) => *a == *b,
         (Value::Null, AttributeValue::Null) => true,
+        (Value::List(values), AttributeValue::List(attrs)) => {
+            values.len() == attrs.len()
+                && values
+                    .iter()
+                    .zip(attrs)
+                    .all(|(v, a)| value_equals_attribute(v, a))
+        }
         _ => false,
     }
 }
@@ -230,10 +237,13 @@ fn value_equals_attribute(value: &Value, attribute: &AttributeValue) -> bool {
 fn parse_node_id(value: &Value) -> ExecResult<NodeId> {
     match value {
         Value::Integer(i) => Ok(NodeId::from_u128(*i as u128)),
-        Value::String(s) => s
-            .parse::<u128>()
-            .map(NodeId::from_u128)
-            .map_err(|_| "invalid node id".to_string()),
+        Value::String(s) => {
+            let compact: String = s.trim().chars().filter(|c| !c.is_whitespace()).collect();
+            compact
+                .parse::<u128>()
+                .map(NodeId::from_u128)
+                .map_err(|_| "invalid node id".to_string())
+        }
         _ => Err("unsupported node id value".into()),
     }
 }
@@ -241,10 +251,13 @@ fn parse_node_id(value: &Value) -> ExecResult<NodeId> {
 fn parse_edge_id(value: &Value) -> ExecResult<EdgeId> {
     match value {
         Value::Integer(i) => Ok(EdgeId::from_u128(*i as u128)),
-        Value::String(s) => s
-            .parse::<u128>()
-            .map(EdgeId::from_u128)
-            .map_err(|_| "invalid edge id".to_string()),
+        Value::String(s) => {
+            let compact: String = s.trim().chars().filter(|c| !c.is_whitespace()).collect();
+            compact
+                .parse::<u128>()
+                .map(EdgeId::from_u128)
+                .map_err(|_| "invalid edge id".to_string())
+        }
         _ => Err("unsupported edge id value".into()),
     }
 }
@@ -256,5 +269,8 @@ fn value_to_attribute(value: &Value) -> AttributeValue {
         Value::Float(f) => AttributeValue::Float(*f),
         Value::Boolean(b) => AttributeValue::Boolean(*b),
         Value::Null => AttributeValue::Null,
+        Value::List(values) => {
+            AttributeValue::List(values.iter().map(value_to_attribute).collect())
+        }
     }
 }

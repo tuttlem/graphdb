@@ -15,6 +15,7 @@ pub enum AttributeValue {
     Integer(i64),
     Float(f64),
     Boolean(bool),
+    List(Vec<AttributeValue>),
 }
 
 /// Provides read-only access to an entity's attributes.
@@ -46,6 +47,13 @@ mod tests {
         let mut attributes = HashMap::new();
         attributes.insert("name".to_string(), AttributeValue::String("Ada".into()));
         attributes.insert("active".to_string(), AttributeValue::Boolean(true));
+        attributes.insert(
+            "skills".to_string(),
+            AttributeValue::List(vec![
+                AttributeValue::String("rust".into()),
+                AttributeValue::String("graphs".into()),
+            ]),
+        );
 
         TestContainer { attributes }
     }
@@ -67,5 +75,18 @@ mod tests {
         let container = fixture_container();
 
         assert!(container.attribute("missing").is_none());
+    }
+
+    #[test]
+    fn attribute_handles_lists() {
+        let container = fixture_container();
+
+        match container.attribute("skills") {
+            Some(AttributeValue::List(items)) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(&items[0], AttributeValue::String(val) if val == "rust"));
+            }
+            other => panic!("unexpected attribute value: {:?}", other),
+        }
     }
 }

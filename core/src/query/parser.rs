@@ -108,11 +108,23 @@ fn interpret_escapes(raw: &str) -> String {
 fn value_literal(input: &str) -> IResult<Value> {
     alt((
         string_literal,
+        array_literal,
         bool_literal,
         null_literal,
         number_literal,
         map(bare_word, |s: &str| Value::String(s.to_string())),
     ))(input)
+}
+
+fn array_literal(input: &str) -> IResult<Value> {
+    map(
+        delimited(
+            ws(char('[')),
+            separated_list0(ws(char(',')), ws(value_literal)),
+            ws(char(']')),
+        ),
+        Value::List,
+    )(input)
 }
 
 fn property_key(input: &str) -> IResult<&str> {

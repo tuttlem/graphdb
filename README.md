@@ -262,6 +262,9 @@ Cypher-inspired statements:
 - `UPDATE NODE/EDGE id SET …`
 - `SELECT MATCH (…) [WHERE …] RETURN …`
 
+Property maps accept booleans, numbers, strings, `null`, and arbitrarily nested
+arrays (e.g. `skills: ["rust", "distributed"]`).
+
 Multiple statements can be separated with semicolons. New features should extend
 `graphdb-core`'s parser (`core/src/query/parser.rs`).
 

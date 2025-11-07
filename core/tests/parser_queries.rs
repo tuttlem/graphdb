@@ -4,7 +4,8 @@ use graphdb_core::query::{
 
 #[test]
 fn parse_insert_node() {
-    let input = "INSERT NODE (n:Person {name: \"Ada\", age: 36});";
+    let input =
+        "INSERT NODE (n:Person {name: \"Ada\", age: 36, skills: [\"rust\", \"distributed\"]});";
     let queries = parse_queries(input).unwrap();
     assert_eq!(queries.len(), 1);
     match &queries[0] {
@@ -14,6 +15,10 @@ fn parse_insert_node() {
             assert!(matches!(
                 pattern.properties.0.get("age"),
                 Some(Value::Integer(36))
+            ));
+            assert!(matches!(
+                pattern.properties.0.get("skills"),
+                Some(Value::List(values)) if values.len() == 2
             ));
         }
         other => panic!("unexpected query {other:?}"),

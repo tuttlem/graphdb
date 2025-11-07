@@ -7,6 +7,7 @@ pub enum Value {
     Float(f64),
     Boolean(bool),
     Null,
+    List(Vec<Value>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
