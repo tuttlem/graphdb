@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use common::attr::{AttributeContainer, AttributeValue};
 use graphdb_core::query::{
     ComparisonOperator, CreatePattern, CreateRelationship, GraphDbProcedure, PathFilter,
-    PathLength, PathMatchQuery, PathQueryMode, PathReturn, Procedure, Query, RelationshipDirection,
-    RelationshipPattern, Value, parse_queries,
+    PathLength, PathMatchQuery, PathQueryMode, PathReturn, Procedure, Properties, Query,
+    RelationshipDirection, RelationshipPattern, Value, parse_queries,
 };
 use graphdb_core::{
     AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
@@ -925,22 +925,28 @@ fn load_nodes_by_ids<B: StorageBackend>(
     Ok(nodes)
 }
 
+fn person_pattern(alias: &str, id: &str) -> graphdb_core::query::NodePattern {
+    let mut props = HashMap::new();
+    props.insert("id".to_string(), Value::String(id.to_string()));
+    graphdb_core::query::NodePattern {
+        alias: Some(alias.to_string()),
+        label: Some("Person".to_string()),
+        properties: Properties::new(props),
+    }
+}
+
+fn node_name(node: &Node) -> Option<&str> {
+    match node.attribute("name") {
+        Some(AttributeValue::String(name)) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graphdb_core::query::Properties;
     use graphdb_core::storage::memory::InMemoryBackend;
     use std::collections::HashMap;
-
-    fn make_node_pattern(alias: &str, id: &str) -> graphdb_core::query::NodePattern {
-        let mut props = HashMap::new();
-        props.insert("id".to_string(), Value::String(id.to_string()));
-        graphdb_core::query::NodePattern {
-            alias: Some(alias.to_string()),
-            label: Some("Person".to_string()),
-            properties: Properties::new(props),
-        }
-    }
 
     #[test]
     fn executes_shortest_path_query() {
@@ -972,16 +978,16 @@ mod tests {
         };
         insert_edge(
             &db,
-            make_node_pattern("a", "00000000-0000-0000-0000-000000000001"),
+            person_pattern("a", "00000000-0000-0000-0000-000000000001"),
             edge_pattern.clone(),
-            make_node_pattern("b", "00000000-0000-0000-0000-000000000002"),
+            person_pattern("b", "00000000-0000-0000-0000-000000000002"),
         )
         .unwrap();
         insert_edge(
             &db,
-            make_node_pattern("b", "00000000-0000-0000-0000-000000000002"),
+            person_pattern("b", "00000000-0000-0000-0000-000000000002"),
             edge_pattern.clone(),
-            make_node_pattern("c", "00000000-0000-0000-0000-000000000003"),
+            person_pattern("c", "00000000-0000-0000-0000-000000000003"),
         )
         .unwrap();
 
@@ -999,8 +1005,8 @@ mod tests {
             path_alias: "p".into(),
             start_alias: "a".into(),
             end_alias: "c".into(),
-            start: make_node_pattern("a", "00000000-0000-0000-0000-000000000001"),
-            end: make_node_pattern("c", "00000000-0000-0000-0000-000000000003"),
+            start: person_pattern("a", "00000000-0000-0000-0000-000000000001"),
+            end: person_pattern("c", "00000000-0000-0000-0000-000000000003"),
             relationship,
             mode: PathQueryMode::Shortest,
             filter: None,
@@ -1012,5 +1018,171 @@ mod tests {
         execute_path_query(&db, query, &mut ctx).unwrap();
         assert_eq!(ctx.paths.len(), 1);
         assert_eq!(ctx.paths[0].length, 2);
+    }
+}
+
+fn execute_script_for_test(db: &Database<InMemoryBackend>, script: &str) -> ExecutionReport {
+    execute_script(db, script).expect("execute script")
+}
+
+fn seed_basic_graph(db: &Database<InMemoryBackend>) {
+    let people = [
+        ("Meg Ryan", "00000000-0000-0000-0000-000000000001"),
+        ("Tom Hanks", "00000000-0000-0000-0000-000000000002"),
+        ("Kevin Bacon", "00000000-0000-0000-0000-000000000003"),
+        ("Carrie Fisher", "00000000-0000-0000-0000-000000000004"),
+        ("Nora Ephron", "00000000-0000-0000-0000-000000000005"),
+    ];
+    for (name, id) in people.iter() {
+        insert_node(
+            db,
+            graphdb_core::query::NodePattern {
+                alias: Some(name.split_whitespace().next().unwrap().to_lowercase()),
+                label: Some("Person".into()),
+                properties: Properties::new(HashMap::from([
+                    ("id".into(), Value::String(id.to_string())),
+                    ("name".into(), Value::String(name.to_string())),
+                ])),
+            },
+        )
+        .unwrap();
+    }
+
+    let edges = [
+        (
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+        ),
+        (
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000003",
+        ),
+        (
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000004",
+        ),
+        (
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000005",
+        ),
+    ];
+    for (idx, (src, dst)) in edges.iter().enumerate() {
+        insert_edge(
+            db,
+            person_pattern("s", src),
+            graphdb_core::query::EdgePattern {
+                alias: None,
+                label: Some("KNOWS".into()),
+                properties: Properties::new(HashMap::from([(
+                    "id".into(),
+                    Value::String(format!("20000000-0000-0000-0000-{idx:012}")),
+                )])),
+            },
+            person_pattern("t", dst),
+        )
+        .unwrap();
+    }
+
+    // blocked edge from Meg -> Carrie
+    insert_edge(
+        db,
+        person_pattern("meg", "00000000-0000-0000-0000-000000000001"),
+        graphdb_core::query::EdgePattern {
+            alias: None,
+            label: Some("BLOCKED".into()),
+            properties: Properties::new(HashMap::from([(
+                "id".into(),
+                Value::String("30000000-0000-0000-0000-000000000001".into()),
+            )])),
+        },
+        person_pattern("carrie", "00000000-0000-0000-0000-000000000004"),
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn variable_length_paths_return_results() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+
+        let report = execute_script_for_test(
+            &db,
+            r#"MATCH p = (start:Person {name: "Meg Ryan"})-[:KNOWS*1..3]->(end:Person)
+            RETURN p;"#,
+        );
+
+        assert!(report.paths.iter().any(|p| p.length >= 1));
+    }
+
+    #[test]
+    fn shortest_path_prefers_min_length() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"MATCH (start:Person {name: "Meg Ryan"}), (end:Person {name: "Kevin Bacon"})
+                MATCH path = shortestPath((start)-[:KNOWS*..5]-(end))
+                RETURN path, length(path);"#,
+        );
+        assert_eq!(report.paths.len(), 1);
+        assert_eq!(report.paths[0].length, 2);
+    }
+
+    #[test]
+    fn exact_hop_count_respected() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"MATCH p = (start:Person {name: "Meg Ryan"})-[:KNOWS*2]->(end:Person)
+                RETURN p;"#,
+        );
+        assert!(report.paths.iter().all(|path| path.length == 2));
+    }
+
+    #[test]
+    fn filtered_paths_exclude_blocked_relationships() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"MATCH p = (start:Person {name: "Meg Ryan"})-[:KNOWS*1..3]->(end:Person)
+                WHERE NOT (start)-[:BLOCKED]->(:Person)
+                RETURN start, end, length(p);"#,
+        );
+        assert!(!report.path_pairs.is_empty());
+        assert!(
+            report.path_pairs.iter().all(|pair| {
+                !(pair.length == 1 && node_name(&pair.end) == Some("Carrie Fisher"))
+            })
+        );
+    }
+
+    #[test]
+    fn undirected_paths_follow_both_directions() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"MATCH p = (start:Person {name: "Kevin Bacon"})-[:KNOWS*..2]-(end:Person {name: "Meg Ryan"})
+                RETURN p;"#,
+        );
+        assert!(report.paths.iter().any(|p| p.length == 2));
+    }
+
+    #[test]
+    fn node_pairs_include_length_metadata() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"MATCH p = (start:Person {name: "Meg Ryan"})-[:KNOWS*1..3]->(end:Person)
+                RETURN start, end, length(p);"#,
+        );
+        assert!(report.path_pairs.iter().all(|pair| pair.length >= 1));
     }
 }

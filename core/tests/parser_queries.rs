@@ -165,6 +165,22 @@ RETURN path, length(path);
 }
 
 #[test]
+fn parse_queries_with_comments() {
+    let input = r#"
+    // insert a person
+    INSERT NODE (:Person {name: "Ada", id: 1});
+    /* multi-line
+       comment */
+    MATCH p = (a:Person)-[:KNOWS*1..2]->(b:Person)
+    RETURN p;
+    "#;
+    let queries = parse_queries(input).expect("parses with comments");
+    assert_eq!(queries.len(), 2);
+    assert!(matches!(queries[0], Query::InsertNode { .. }));
+    assert!(matches!(queries[1], Query::PathMatch { .. }));
+}
+
+#[test]
 fn parse_path_with_where_clause() {
     let input = r#"
 MATCH p = (a:Person {city: "Berlin"})-[:KNOWS*1..3]->(b:Person)

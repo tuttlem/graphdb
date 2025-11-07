@@ -265,6 +265,9 @@ Cypher-inspired statements:
 Property maps accept booleans, numbers, strings, `null`, and arbitrarily nested
 arrays (e.g. `skills: ["rust", "distributed"]`).
 
+Query scripts also accept `// line comments` and `/* block comments */`, so you
+can annotate long sequences of statements without affecting execution.
+
 ### Path Queries
 
 You can now traverse the graph with Cypher-like `MATCH` statements. Examples:
