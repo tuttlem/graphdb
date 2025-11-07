@@ -19,7 +19,10 @@ use tokio_rustls::TlsAcceptor;
 use tokio_stream::wrappers::TcpListenerStream;
 use tower::ServiceExt;
 use tower::limit::ConcurrencyLimitLayer;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+};
 
 use crate::config::{DaemonConfig, TlsSettings};
 use crate::database::DatabaseHandle;
@@ -37,7 +40,8 @@ pub async fn run(
     let mut app = Router::new()
         .route("/query", post(handle_query))
         .route("/v1/query", post(handle_query))
-        .with_state(state);
+        .with_state(state)
+        .layer(CorsLayer::permissive());
 
     if let Some(limit) = config.server().body_limit {
         app = app.layer(DefaultBodyLimit::max(limit));
