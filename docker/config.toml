@@ -1,0 +1,10 @@
+working_directory = "/app"
+
+[storage]
+backend = "simple"
+directory = "/data"
+
+[server]
+bind_address = "0.0.0.0"
+port = 8080
+client_dir = "/app/client/dist"

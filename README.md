@@ -11,6 +11,9 @@ organised as a Cargo workspace made up of three primary crates:
   file-backed storage backends.
 - `daemon` – a long-running background service that exposes the database over a
   simple HTTP API.
+- `client` – a Vite/React front-end for issuing queries and visualising
+  responses; build it for production (`npm run build`) or run `npm run dev`
+  during development.
 
 The workspace currently focuses on the daemon. It performs proper UNIX
 daemonisation (double fork, `setsid`, stdio redirection, PID file handling) and
@@ -64,6 +67,26 @@ Responses follow the structure:
 
 Errors return HTTP 4xx/5xx responses with a JSON body of `{ "status": "error",
 "error": "…" }`.
+
+### Docker
+
+You can run the daemon and the built React client in a single container. Build
+the image, then start it while mounting a host directory for persistent data:
+
+```sh
+docker build -t graphdb .
+
+docker run \
+  --rm \
+  -p 8080:8080 \
+  -v $(pwd)/data:/data \
+  --name graphdb \
+  graphdb
+```
+
+The container uses the simple storage backend, persisting under `/data` (mapped
+to `$(pwd)/data` above), and serves the web client alongside the API on port
+8080.
 
 ## System Catalog
 
