@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use nom::branch::alt;
 use nom::bytes::complete::{escaped, tag, tag_no_case, take_while, take_while1};
-use nom::character::complete::{alpha1, char, digit1, multispace0};
+use nom::character::complete::{alpha1, char, digit1};
 use nom::combinator::{all_consuming, map, opt, recognize, value};
 use nom::error::{ErrorKind, VerboseError, VerboseErrorKind, convert_error};
 use nom::multi::{many0, many1, separated_list0, separated_list1};
@@ -23,11 +23,48 @@ where
     F: FnMut(&'a str) -> IResult<'a, O>,
 {
     move |input| {
-        let (input, _) = multispace0(input)?;
+        let (input, _) = skip_ws_and_comments(input)?;
         let (input, out) = inner(input)?;
-        let (input, _) = multispace0(input)?;
+        let (input, _) = skip_ws_and_comments(input)?;
         Ok((input, out))
     }
+}
+
+fn skip_ws_and_comments(input: &str) -> IResult<()> {
+    let mut rest = input;
+    loop {
+        let before_ws = rest;
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace());
+
+        if let Some(stripped) = rest.strip_prefix("//") {
+            if let Some(idx) = stripped.find('\n') {
+                rest = &stripped[idx + 1..];
+            } else {
+                rest = "";
+            }
+            continue;
+        }
+
+        if let Some(stripped) = rest.strip_prefix("/*") {
+            if let Some(idx) = stripped.find("*/") {
+                rest = &stripped[idx + 2..];
+                continue;
+            } else {
+                return Err(nom::Err::Failure(VerboseError {
+                    errors: vec![(
+                        rest,
+                        VerboseErrorKind::Context("unterminated block comment"),
+                    )],
+                }));
+            }
+        }
+
+        if rest == before_ws {
+            break;
+        }
+    }
+
+    Ok((rest, ()))
 }
 
 fn identifier(input: &str) -> IResult<&str> {
@@ -146,10 +183,10 @@ fn properties_block(input: &str) -> IResult<HashMap<String, Value>> {
 fn alias_and_label(input: &str) -> IResult<(Option<String>, Option<String>)> {
     let (input, maybe_alias) = opt(identifier)(input)?;
     let alias = maybe_alias.map(|s| s.to_string());
-    let (input, _) = multispace0(input)?;
+    let (input, _) = skip_ws_and_comments(input)?;
     let (input, colon) = opt(char(':'))(input)?;
     if colon.is_some() {
-        let (input, _) = multispace0(input)?;
+        let (input, _) = skip_ws_and_comments(input)?;
         let (input, maybe_label) = opt(identifier)(input)?;
         Ok((input, (alias, maybe_label.map(|s| s.to_string()))))
     } else {
@@ -363,7 +400,7 @@ fn path_match_stmt(origin: &str) -> IResult<Query> {
     apply_clause(clause, &mut node_bindings, &mut path_binding, rest)?;
 
     loop {
-        let (next_input, _) = multispace0(rest)?;
+        let (next_input, _) = skip_ws_and_comments(rest)?;
         if let Ok((after_match, _)) = ws(tag_no_case("MATCH"))(next_input) {
             let (after_clause, clause) = match_clause(after_match)?;
             rest = after_clause;
@@ -803,14 +840,14 @@ fn statement_with_opt_terminator(input: &str) -> IResult<Query> {
 }
 
 fn query_list(input: &str) -> IResult<Vec<Query>> {
-    let (input, _) = multispace0(input)?;
+    let (input, _) = skip_ws_and_comments(input)?;
     let (input, statements) = many0(delimited(
-        multispace0,
+        skip_ws_and_comments,
         statement_with_opt_terminator,
-        multispace0,
+        skip_ws_and_comments,
     ))(input)?;
     let (input, _) = opt(statement_terminator)(input)?;
-    let (input, _) = multispace0(input)?;
+    let (input, _) = skip_ws_and_comments(input)?;
     Ok((input, statements))
 }
 
