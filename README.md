@@ -86,7 +86,8 @@ docker run \
 
 The container uses the simple storage backend, persisting under `/data` (mapped
 to `$(pwd)/data` above), and serves the web client alongside the API on port
-8080.
+8080. The daemon runs in foreground mode (`GRAPHDB_FOREGROUND=1`) so logs stream
+to stdout/stderr.
 
 ## System Catalog
 

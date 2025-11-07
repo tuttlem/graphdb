@@ -68,6 +68,15 @@ impl Drop for PidFileGuard {
 }
 
 pub fn daemonize(config: &DaemonConfig) -> Result<DaemonContext> {
+    if env::var_os("GRAPHDB_FOREGROUND").is_some() {
+        env::set_current_dir(&config.working_directory)?;
+        let pid_file = match config.pid_file() {
+            Some(path) => Some(PidFileGuard::acquire(path.to_path_buf())?),
+            None => None,
+        };
+        return Ok(DaemonContext { pid_file });
+    }
+
     // First fork detaches from controlling terminal while allowing the parent to exit.
     unsafe {
         match fork()? {

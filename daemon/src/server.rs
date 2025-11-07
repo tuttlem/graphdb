@@ -6,6 +6,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{Request, StatusCode};
+use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -14,6 +15,7 @@ use hyper::server::accept::from_stream;
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -50,6 +52,8 @@ pub async fn run(
     if let Some(limit) = config.server().concurrency_limit {
         app = app.layer(ConcurrencyLimitLayer::new(limit));
     }
+
+    app = app.layer(from_fn(log_requests));
 
     if let Some(client_dir) = config.server().client_dir() {
         let client_dir = client_dir.to_path_buf();
@@ -111,6 +115,12 @@ async fn handle_query(
     State(state): State<AppState>,
     Json(request): Json<QueryRequest>,
 ) -> std::result::Result<Json<SuccessResponse>, ApiError> {
+    let preview: String = request.query.chars().take(200).collect();
+    log::info!(
+        "executing query: {}{}",
+        preview,
+        if request.query.len() > 200 { "…" } else { "" }
+    );
     let report = state
         .database
         .execute_script(&request.query)
@@ -124,6 +134,22 @@ async fn handle_query(
         paths: report.paths,
         path_pairs: report.path_pairs,
     }))
+}
+
+async fn log_requests<B>(req: Request<B>, next: Next<B>) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let elapsed = start.elapsed();
+    log::info!(
+        "{} {} -> {} ({}ms)",
+        method,
+        uri.path(),
+        response.status(),
+        elapsed.as_millis()
+    );
+    response
 }
 
 struct ApiError {

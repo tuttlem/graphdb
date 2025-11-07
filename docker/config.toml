@@ -1,4 +1,7 @@
 working_directory = "/app"
+pid_file = "/tmp/graphdb.pid"
+stdout = "/dev/stdout"
+stderr = "/dev/stderr"
 
 [storage]
 backend = "simple"
