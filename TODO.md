@@ -1,0 +1,34 @@
+# TODO
+
+* [ ] Convert output logs to be JSON (structured logging everywhere)
+* [ ] Add performance (latency) data to logging + overall stats endpoint
+* [ ] Improve HTTP request logging with trace IDs & correlation across client/daemon
+* [ ] Further CYPHER coverage (MATCH/WHERE/WITH/RETURN chaining, aggregates)
+* [ ] Add path algorithms: weighted shortest path, A*, Yen's k-shortest
+* [ ] Implement query planner + execution engine beyond naive scans
+* [ ] Introduce transactions + ACID semantics for storage backends
+* [ ] Dense filesystem backend + pluggable key-value storage adapters
+* [ ] Cluster mode (Raft/gossip) for multi-node deployments
+* [ ] Full authentication/authorization layer (users/roles + tokens)
+* [ ] TLS + mTLS configuration for daemon + built-in cert reloads
+* [ ] Client web UI improvements (history sidebar, path visualisation, streaming results)
+* [ ] Client CLI (cURL replacement) with script runner + REPL
+* [ ] Client SDK Rust (sync + async)
+* [ ] Client SDK TypeScript + generated JavaScript build
+* [ ] Client SDK Python (popular QA automation)
+* [ ] Expose metrics endpoint (Prometheus) for queries / storage / catalog epochs
+* [ ] Provide admin API for catalog inspection & mutation (e.g. grant revoke)
+* [ ] Config hot-reload + SIGHUP handling
+* [ ] Structured error codes for API responses
+* [ ] Binary protocol for high-throughput ingestion
+* [ ] Query cache and prepared statements
+* [ ] Built-in graph algorithms (PageRank, connected components, BFS service)
+* [ ] Tracing integration (OpenTelemetry) from web client to daemon
+* [ ] Benchmark suite and stress harness
+* [ ] Live schema inspector in client UI
+* [ ] CLI to dump/load catalog snapshots
+* [ ] Multi-tenant catalog separation & namespaces
+* [ ] Temporal queries (valid-time / transaction-time)
+* [ ] Schema validation / migration tooling
+* [ ] Streaming changefeed / CDC API
+* [ ] Notebook-style docs/examples for common Cypher patterns
