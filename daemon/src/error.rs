@@ -9,7 +9,7 @@ pub enum DaemonError {
     #[error("nix error: {0}")]
     Nix(#[from] nix::Error),
     #[error("logger initialization failed: {0}")]
-    Logger(#[from] log::SetLoggerError),
+    Logger(String),
     #[error("configuration error: {0}")]
     Config(String),
     #[error("failed to parse configuration: {0}")]

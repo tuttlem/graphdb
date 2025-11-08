@@ -55,7 +55,12 @@ impl PidFileGuard {
     fn cleanup_silently(&self) {
         if let Err(err) = fs::remove_file(&self.path) {
             if err.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("failed to remove pid file {}: {}", self.path.display(), err);
+                tracing::warn!(
+                    event = "daemon.pid_file_cleanup_failed",
+                    path = %self.path.display(),
+                    error = %err,
+                    "failed to remove pid file"
+                );
             }
         }
     }

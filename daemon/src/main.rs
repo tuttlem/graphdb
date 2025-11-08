@@ -25,7 +25,11 @@ fn main() -> Result<()> {
 
     let pid_file = context.pid_file_path_owned();
     if let Some(path) = pid_file.as_ref() {
-        log::info!("writing pid file to {}", path.display());
+        tracing::info!(
+            event = "daemon.pid_file",
+            path = %path.display(),
+            "writing pid file"
+        );
     }
 
     let (signal_manager, shutdown) = SignalManager::install(pid_file.clone())?;
@@ -33,7 +37,11 @@ fn main() -> Result<()> {
 
     let database = shared_database(&config)?;
 
-    log::info!("graphdb daemon running with pid {}", nix::unistd::getpid());
+    tracing::info!(
+        event = "daemon.started",
+        pid = nix::unistd::getpid().as_raw(),
+        "graphdb daemon initialised"
+    );
 
     let worker_threads = config
         .server()
@@ -47,6 +55,11 @@ fn main() -> Result<()> {
         .thread_name("graphdb-rt")
         .build()?;
 
-    runtime.block_on(server::run(&config, database, shutdown))?;
+    if let Err(err) = runtime.block_on(server::run(&config, database, shutdown)) {
+        fatal!(event = "daemon.runtime_exit", error = %err, "server runtime terminated");
+        return Err(err);
+    }
+
+    tracing::info!(event = "daemon.stopped", "runtime exited cleanly");
     Ok(())
 }

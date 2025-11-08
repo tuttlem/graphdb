@@ -33,14 +33,19 @@ impl SignalManager {
             for sig in signals.forever() {
                 match sig {
                     SIGTERM | SIGINT | SIGQUIT => {
-                        log::info!("received signal {sig}; initiating shutdown");
+                        tracing::info!(
+                            event = "signal.shutdown",
+                            signal = sig,
+                            "received termination signal"
+                        );
                         if let Some(path) = pid_file.as_ref() {
                             if let Err(err) = std::fs::remove_file(path) {
                                 if err.kind() != std::io::ErrorKind::NotFound {
-                                    log::warn!(
-                                        "failed to remove pid file {}: {}",
-                                        path.display(),
-                                        err
+                                    tracing::warn!(
+                                        event = "signal.pid_file_cleanup_failed",
+                                        path = %path.display(),
+                                        error = %err,
+                                        "failed to remove pid file"
                                     );
                                 }
                             }
@@ -51,7 +56,7 @@ impl SignalManager {
                         break;
                     }
                     SIGHUP => {
-                        log::info!("received SIGHUP; ignoring");
+                        tracing::info!(event = "signal.sighup", "received SIGHUP; ignoring");
                     }
                     _ => {}
                 }

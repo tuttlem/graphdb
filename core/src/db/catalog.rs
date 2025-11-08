@@ -302,7 +302,7 @@ fn bump_epoch(counter: &AtomicU64, label: &'static str) {
             Err(observed) => current = observed,
         }
     }
-    log::trace!(
+    tracing::trace!(
         "catalog epoch bump for {label}: now {}",
         counter.load(Ordering::SeqCst)
     );

@@ -28,7 +28,11 @@ impl GraphDatabase {
     pub fn from_config(config: &DaemonConfig) -> Result<Self> {
         let inner = match config.storage().backend {
             StorageBackendKind::Memory => {
-                log::info!("initialising in-memory backend");
+                tracing::info!(
+                    event = "database.init",
+                    backend = "memory",
+                    "initialising backend"
+                );
                 GraphDatabaseInner::InMemory(Database::new(InMemoryBackend::new()))
             }
             StorageBackendKind::Simple => {
@@ -42,9 +46,11 @@ impl GraphDatabase {
                         )
                     })?
                     .clone();
-                log::info!(
-                    "initialising simple storage backend at {}",
-                    directory.display()
+                tracing::info!(
+                    event = "database.init",
+                    backend = "simple",
+                    path = %directory.display(),
+                    "initialising backend"
                 );
                 let backend = SimpleStorage::new(directory.clone())?;
                 let catalog_path = catalog_file_path(&directory);
@@ -142,11 +148,21 @@ fn preload_nodes(database: &Database<SimpleStorage>, dir: &Path) -> Result<()> {
         match NodeId::parse_str(stem) {
             Ok(id) => {
                 if let Err(err) = database.get_node(id) {
-                    log::warn!("failed to hydrate node {stem}: {err}");
+                    tracing::warn!(
+                        event = "database.hydrate_node_failed",
+                        node_id = %stem,
+                        error = %err,
+                        "failed to hydrate node"
+                    );
                 }
             }
             Err(err) => {
-                log::warn!("unable to parse node file name {stem} as UUID: {err}");
+                tracing::warn!(
+                    event = "database.hydrate_node_parse_failed",
+                    file = %stem,
+                    error = %err,
+                    "unable to parse node file name as UUID"
+                );
             }
         }
     }
@@ -172,11 +188,21 @@ fn preload_edges(database: &Database<SimpleStorage>, dir: &Path) -> Result<()> {
         match EdgeId::parse_str(stem) {
             Ok(id) => {
                 if let Err(err) = database.get_edge(id) {
-                    log::warn!("failed to hydrate edge {stem}: {err}");
+                    tracing::warn!(
+                        event = "database.hydrate_edge_failed",
+                        edge_id = %stem,
+                        error = %err,
+                        "failed to hydrate edge"
+                    );
                 }
             }
             Err(err) => {
-                log::warn!("unable to parse edge file name {stem} as UUID: {err}");
+                tracing::warn!(
+                    event = "database.hydrate_edge_parse_failed",
+                    file = %stem,
+                    error = %err,
+                    "unable to parse edge file name as UUID"
+                );
             }
         }
     }

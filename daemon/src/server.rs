@@ -25,6 +25,7 @@ use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
 };
+use uuid::Uuid;
 
 use crate::config::{DaemonConfig, TlsSettings};
 use crate::database::DatabaseHandle;
@@ -76,7 +77,7 @@ pub async fn run(
         app = app.merge(static_router);
     }
 
-    log::info!("listening on {addr}");
+    tracing::info!(event = "server.listen", %addr, "listening for connections");
 
     if let Some(tls) = config.server().tls().cloned() {
         serve_with_tls(addr, app, config, tls, shutdown).await
@@ -116,24 +117,56 @@ async fn handle_query(
     Json(request): Json<QueryRequest>,
 ) -> std::result::Result<Json<SuccessResponse>, ApiError> {
     let preview: String = request.query.chars().take(200).collect();
-    log::info!(
-        "executing query: {}{}",
-        preview,
-        if request.query.len() > 200 { "…" } else { "" }
+    let query_len = request.query.len();
+    let truncated = query_len > preview.len();
+    let query_id = Uuid::new_v4();
+    tracing::info!(
+        event = "query.received",
+        query_id = %query_id,
+        query_length = query_len,
+        truncated = truncated,
+        preview = %preview,
+        "received query"
     );
-    let report = state
-        .database
-        .execute_script(&request.query)
-        .map_err(ApiError::from)?;
 
-    Ok(Json(SuccessResponse {
-        status: "ok",
-        messages: report.messages,
-        selected_nodes: report.selected_nodes,
-        procedures: report.procedures,
-        paths: report.paths,
-        path_pairs: report.path_pairs,
-    }))
+    let start = Instant::now();
+    let result = state.database.execute_script(&request.query);
+
+    match result {
+        Ok(report) => {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            tracing::info!(
+                event = "query.completed",
+                query_id = %query_id,
+                elapsed_ms,
+                messages = report.messages.len(),
+                selected_nodes = report.selected_nodes.len(),
+                procedures = report.procedures.len(),
+                paths = report.paths.len(),
+                path_pairs = report.path_pairs.len(),
+                "query executed"
+            );
+            Ok(Json(SuccessResponse {
+                status: "ok",
+                messages: report.messages,
+                selected_nodes: report.selected_nodes,
+                procedures: report.procedures,
+                paths: report.paths,
+                path_pairs: report.path_pairs,
+            }))
+        }
+        Err(err) => {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            tracing::error!(
+                event = "query.failed",
+                query_id = %query_id,
+                elapsed_ms,
+                error = %err,
+                "query execution failed"
+            );
+            Err(ApiError::from(err))
+        }
+    }
 }
 
 async fn log_requests<B>(req: Request<B>, next: Next<B>) -> Response {
@@ -142,12 +175,13 @@ async fn log_requests<B>(req: Request<B>, next: Next<B>) -> Response {
     let start = Instant::now();
     let response = next.run(req).await;
     let elapsed = start.elapsed();
-    log::info!(
-        "{} {} -> {} ({}ms)",
-        method,
-        uri.path(),
-        response.status(),
-        elapsed.as_millis()
+    tracing::info!(
+        event = "http.request",
+        method = %method,
+        path = %uri.path(),
+        status = response.status().as_u16(),
+        elapsed_ms = elapsed.as_millis() as u64,
+        "request completed"
     );
     response
 }
@@ -239,19 +273,31 @@ async fn serve_with_tls(
                     Ok(stream) => {
                         if tcp_nodelay {
                             if let Err(err) = stream.set_nodelay(true) {
-                                log::warn!("failed to set tcp_nodelay: {err}");
+                                tracing::warn!(
+                                    event = "server.tcp_nodelay_failed",
+                                    error = %err,
+                                    "failed to set tcp_nodelay"
+                                );
                             }
                         }
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => Some(Ok::<_, std::io::Error>(tls_stream)),
                             Err(err) => {
-                                log::error!("TLS handshake error: {err}");
+                                tracing::error!(
+                                    event = "server.tls_handshake_failed",
+                                    error = %err,
+                                    "TLS handshake error"
+                                );
                                 None
                             }
                         }
                     }
                     Err(err) => {
-                        log::error!("TLS listener accept error: {err}");
+                        tracing::error!(
+                            event = "server.accept_failed",
+                            error = %err,
+                            "TLS listener accept error"
+                        );
                         None
                     }
                 }
