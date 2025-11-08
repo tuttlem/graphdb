@@ -1,11 +1,12 @@
+use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{Request, StatusCode};
+use axum::extract::{DefaultBodyLimit, Extension, State};
+use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -40,11 +41,15 @@ pub async fn run(
     let addr = config.socket_addr()?;
     let state = AppState { database };
 
+    let cors = CorsLayer::permissive().expose_headers([header::HeaderName::from_static(
+        "x-request-id",
+    )]);
+
     let mut app = Router::new()
         .route("/query", post(handle_query))
         .route("/v1/query", post(handle_query))
         .with_state(state)
-        .layer(CorsLayer::permissive());
+        .layer(cors);
 
     if let Some(limit) = config.server().body_limit {
         app = app.layer(DefaultBodyLimit::max(limit));
@@ -114,6 +119,7 @@ struct ErrorResponse {
 
 async fn handle_query(
     State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
     Json(request): Json<QueryRequest>,
 ) -> std::result::Result<Json<SuccessResponse>, ApiError> {
     let preview: String = request.query.chars().take(200).collect();
@@ -122,6 +128,7 @@ async fn handle_query(
     let query_id = Uuid::new_v4();
     tracing::info!(
         event = "query.received",
+        request_id = %request_id,
         query_id = %query_id,
         query_length = query_len,
         truncated = truncated,
@@ -137,6 +144,7 @@ async fn handle_query(
             let elapsed_ms = start.elapsed().as_millis() as u64;
             tracing::info!(
                 event = "query.completed",
+                request_id = %request_id,
                 query_id = %query_id,
                 elapsed_ms,
                 messages = report.messages.len(),
@@ -159,6 +167,7 @@ async fn handle_query(
             let elapsed_ms = start.elapsed().as_millis() as u64;
             tracing::error!(
                 event = "query.failed",
+                request_id = %request_id,
                 query_id = %query_id,
                 elapsed_ms,
                 error = %err,
@@ -170,13 +179,23 @@ async fn handle_query(
 }
 
 async fn log_requests<B>(req: Request<B>, next: Next<B>) -> Response {
+    let mut req = req;
     let method = req.method().clone();
     let uri = req.uri().clone();
+    let request_id = RequestId::new();
+    req.extensions_mut().insert(request_id);
+
     let start = Instant::now();
-    let response = next.run(req).await;
+    let mut response = next.run(req).await;
     let elapsed = start.elapsed();
+
+    if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+
     tracing::info!(
         event = "http.request",
+        request_id = %request_id,
         method = %method,
         path = %uri.path(),
         status = response.status().as_u16(),
@@ -370,4 +389,18 @@ fn load_rustls_config(tls: &TlsSettings, http2_only: bool) -> Result<Arc<ServerC
     };
 
     Ok(Arc::new(config))
+}
+#[derive(Clone, Copy, Debug)]
+struct RequestId(Uuid);
+
+impl RequestId {
+    fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for RequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }

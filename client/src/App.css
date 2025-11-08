@@ -20,6 +20,13 @@ header {
   gap: 1rem;
 }
 
+.status-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
 header h1 {
   margin: 0;
 }
@@ -165,6 +172,10 @@ button[disabled] {
   opacity: 0.8;
 }
 
+.mono {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
 pre {
   background: #05060c;
   border-radius: 8px;
@@ -182,5 +193,9 @@ pre {
   header {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .status-group {
+    justify-content: flex-start;
   }
 }

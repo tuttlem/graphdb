@@ -58,6 +58,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<QuerySuccess | null>(null);
   const [history, setHistory] = useState<string[]>([]);
+  const [requestId, setRequestId] = useState<string | null>(null);
 
   const handleSubmit = async () => {
     if (!query.trim()) {
@@ -73,6 +74,9 @@ function App() {
         },
         body: JSON.stringify({ query }),
       });
+
+      const requestIdHeader = response.headers.get('x-request-id');
+      setRequestId(requestIdHeader);
 
       const payload: QuerySuccess | QueryError = await response.json();
       if (!response.ok || payload.status === 'error') {
@@ -114,8 +118,13 @@ function App() {
           <h1>GraphDB Client</h1>
           <p>Run Cypher-inspired statements against the daemon and inspect catalog procedures.</p>
         </div>
-        <div className="status-pill">
-          API target: {API_BASE || '(same origin)'}
+        <div className="status-group">
+          <div className="status-pill">
+            API target: {API_BASE || '(same origin)'}
+          </div>
+          <div className="status-pill">
+            Last request ID: <span className="mono">{requestId ?? '—'}</span>
+          </div>
         </div>
       </header>
 

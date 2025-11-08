@@ -1,8 +1,8 @@
 # TODO
 
-* [ ] Convert output logs to be JSON (structured logging everywhere)
-* [ ] Add performance (latency) data to logging + overall stats endpoint
-* [ ] Improve HTTP request logging with trace IDs & correlation across client/daemon
+* [x] Convert output logs to be JSON (structured logging everywhere)
+* [x] Add performance (latency) data to logging (local telemetry only)
+* [x] Improve HTTP request logging with trace IDs & correlation across client/daemon
 * [ ] Further CYPHER coverage (MATCH/WHERE/WITH/RETURN chaining, aggregates)
 * [ ] Add path algorithms: weighted shortest path, A*, Yen's k-shortest
 * [ ] Implement query planner + execution engine beyond naive scans
