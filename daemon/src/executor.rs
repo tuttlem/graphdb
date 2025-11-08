@@ -290,11 +290,48 @@ fn node_matches_condition(
         }
     }
 
-    if let Some(attr) = node.attribute(&condition.property) {
-        matches!(condition.operator, ComparisonOperator::Equals)
-            && value_equals_attribute(&condition.value, attr)
-    } else {
-        false
+    let attr_value = node
+        .attribute(&condition.property)
+        .map(attribute_to_query_value)
+        .unwrap_or(Value::Null);
+
+    match condition.operator {
+        ComparisonOperator::Equals => condition
+            .value
+            .as_ref()
+            .map(|expected| values_equal(expected, &attr_value))
+            .unwrap_or(false),
+        ComparisonOperator::NotEquals => condition
+            .value
+            .as_ref()
+            .map(|expected| !values_equal(expected, &attr_value))
+            .unwrap_or(false),
+        ComparisonOperator::GreaterThan
+        | ComparisonOperator::GreaterThanOrEqual
+        | ComparisonOperator::LessThan
+        | ComparisonOperator::LessThanOrEqual => {
+            if let Some(expected) = condition.value.as_ref() {
+                if let Some(ordering) = compare_query_values(&attr_value, expected) {
+                    match condition.operator {
+                        ComparisonOperator::GreaterThan => ordering == Ordering::Greater,
+                        ComparisonOperator::GreaterThanOrEqual => {
+                            ordering == Ordering::Greater || ordering == Ordering::Equal
+                        }
+                        ComparisonOperator::LessThan => ordering == Ordering::Less,
+                        ComparisonOperator::LessThanOrEqual => {
+                            ordering == Ordering::Less || ordering == Ordering::Equal
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        ComparisonOperator::IsNull => matches!(attr_value, Value::Null),
+        ComparisonOperator::IsNotNull => !matches!(attr_value, Value::Null),
     }
 }
 
@@ -313,6 +350,35 @@ fn value_equals_attribute(value: &Value, attribute: &AttributeValue) -> bool {
                     .all(|(v, a)| value_equals_attribute(v, a))
         }
         _ => false,
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => (*x - *y).abs() < f64::EPSILON,
+        (Value::Integer(x), Value::Float(y)) | (Value::Float(y), Value::Integer(x)) => {
+            ((*x as f64) - *y).abs() < f64::EPSILON
+        }
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Null, Value::Null) => true,
+        (Value::List(xs), Value::List(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(lx, ly)| values_equal(lx, ly))
+        }
+        _ => false,
+    }
+}
+
+fn compare_query_values(left: &Value, right: &Value) -> Option<Ordering> {
+    match (left, right) {
+        (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+        (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+        (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
+        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+        (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+        _ => None,
     }
 }
 

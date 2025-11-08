@@ -107,6 +107,30 @@ fn parse_select_with_aggregate() {
 }
 
 #[test]
+fn parse_where_rich_predicates() {
+    let input = "SELECT MATCH (n:Person) WHERE n.age >= 30 AND n.salary <> 0 AND n.city IS NOT NULL AND n.manager IS NULL RETURN n;";
+    let queries = parse_queries(input).unwrap();
+    match &queries[0] {
+        Query::Select(select) => {
+            assert_eq!(select.conditions.len(), 4);
+            assert_eq!(
+                select.conditions[0].operator,
+                ComparisonOperator::GreaterThanOrEqual
+            );
+            assert!(matches!(
+                select.conditions[0].value,
+                Some(Value::Integer(30))
+            ));
+            assert_eq!(select.conditions[1].operator, ComparisonOperator::NotEquals);
+            assert_eq!(select.conditions[2].operator, ComparisonOperator::IsNotNull);
+            assert!(select.conditions[2].value.is_none());
+            assert_eq!(select.conditions[3].operator, ComparisonOperator::IsNull);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn parse_create_patterns() {
     let node_input = "CREATE (:Person {name: \"Ada\"});";
     let node_queries = parse_queries(node_input).unwrap();

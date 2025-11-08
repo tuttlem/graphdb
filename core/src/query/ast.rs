@@ -241,10 +241,17 @@ pub struct Condition {
     pub alias: String,
     pub property: String,
     pub operator: ComparisonOperator,
-    pub value: Value,
+    pub value: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComparisonOperator {
     Equals,
+    NotEquals,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    IsNull,
+    IsNotNull,
 }

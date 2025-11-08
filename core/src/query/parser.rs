@@ -324,21 +324,52 @@ fn condition_expr(input: &str) -> IResult<Condition> {
     let (input, alias) = ws(identifier)(input)?;
     let (input, _) = ws(char('.'))(input)?;
     let (input, property) = ws(property_key)(input)?;
-    let (input, _) = ws(char('='))(input)?;
+
+    if let Ok((input, _)) = ws(tag_no_case("IS"))(input) {
+        let (input, not) = opt(ws(tag_no_case("NOT")))(input)?;
+        let (input, _) = ws(tag_no_case("NULL"))(input)?;
+        let operator = if not.is_some() {
+            ComparisonOperator::IsNotNull
+        } else {
+            ComparisonOperator::IsNull
+        };
+        return Ok((
+            input,
+            Condition {
+                alias: alias.to_string(),
+                property: property.to_string(),
+                operator,
+                value: None,
+            },
+        ));
+    }
+
+    let (input, operator) = comparison_operator(input)?;
     let (input, value) = ws(value_literal)(input)?;
     Ok((
         input,
         Condition {
             alias: alias.to_string(),
             property: property.to_string(),
-            operator: ComparisonOperator::Equals,
-            value,
+            operator,
+            value: Some(value),
         },
     ))
 }
 
 fn condition_list(input: &str) -> IResult<Vec<Condition>> {
     separated_list1(ws(alt((tag_no_case("AND"), tag(",")))), condition_expr)(input)
+}
+
+fn comparison_operator(input: &str) -> IResult<ComparisonOperator> {
+    ws(alt((
+        value(ComparisonOperator::GreaterThanOrEqual, tag(">=")),
+        value(ComparisonOperator::LessThanOrEqual, tag("<=")),
+        value(ComparisonOperator::NotEquals, alt((tag("<>"), tag("!=")))),
+        value(ComparisonOperator::GreaterThan, tag(">")),
+        value(ComparisonOperator::LessThan, tag("<")),
+        value(ComparisonOperator::Equals, tag("=")),
+    )))(input)
 }
 
 fn select_stmt(input: &str) -> IResult<Query> {
