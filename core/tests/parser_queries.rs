@@ -1,5 +1,5 @@
 use graphdb_core::query::{
-    ComparisonOperator, GraphDbProcedure, PathQueryMode, PathReturn, Procedure, Query,
+    ComparisonOperator, Expression, GraphDbProcedure, PathQueryMode, PathReturn, Procedure, Query,
     RelationshipDirection, Value, parse_queries,
 };
 
@@ -72,15 +72,35 @@ fn parse_select_where() {
         "SELECT MATCH (n:Person {city: \"Zurich\"}) WHERE n.age = 30 AND n.active = true RETURN n;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
-        Query::Select {
-            pattern,
-            conditions,
-            returns,
-        } => {
-            assert_eq!(pattern.label.as_deref(), Some("Person"));
-            assert_eq!(conditions.len(), 2);
-            assert!(matches!(conditions[0].operator, ComparisonOperator::Equals));
-            assert_eq!(returns, &vec!["n".to_string()]);
+        Query::Select(select) => {
+            assert_eq!(select.pattern.label.as_deref(), Some("Person"));
+            assert_eq!(select.conditions.len(), 2);
+            assert!(matches!(
+                select.conditions[0].operator,
+                ComparisonOperator::Equals
+            ));
+            assert_eq!(select.returns.len(), 1);
+            match &select.returns[0].expression {
+                Expression::Field(field) => assert_eq!(field.alias, "n"),
+                other => panic!("unexpected projection {other:?}"),
+            }
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn parse_select_with_aggregate() {
+    let input = "SELECT MATCH (n:Person) RETURN count(*) AS total;";
+    let queries = parse_queries(input).unwrap();
+    match &queries[0] {
+        Query::Select(select) => {
+            assert_eq!(select.returns.len(), 1);
+            assert_eq!(select.returns[0].alias.as_deref(), Some("total"));
+            assert!(matches!(
+                select.returns[0].expression,
+                Expression::Aggregate(_)
+            ));
         }
         other => panic!("unexpected {other:?}"),
     }

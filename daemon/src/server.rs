@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Extension, State};
-use axum::http::{header, HeaderValue, Request, StatusCode};
+use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -16,6 +16,7 @@ use hyper::server::accept::from_stream;
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -41,9 +42,8 @@ pub async fn run(
     let addr = config.socket_addr()?;
     let state = AppState { database };
 
-    let cors = CorsLayer::permissive().expose_headers([header::HeaderName::from_static(
-        "x-request-id",
-    )]);
+    let cors =
+        CorsLayer::permissive().expose_headers([header::HeaderName::from_static("x-request-id")]);
 
     let mut app = Router::new()
         .route("/query", post(handle_query))
@@ -109,6 +109,7 @@ struct SuccessResponse {
     procedures: Vec<crate::executor::ProcedureResult>,
     paths: Vec<crate::executor::PathResult>,
     path_pairs: Vec<crate::executor::PathPairResult>,
+    rows: Vec<JsonValue>,
 }
 
 #[derive(Serialize)]
@@ -154,13 +155,23 @@ async fn handle_query(
                 path_pairs = report.path_pairs.len(),
                 "query executed"
             );
+            let crate::executor::ExecutionReport {
+                messages,
+                selected_nodes,
+                procedures,
+                paths,
+                path_pairs,
+                result_rows,
+            } = report;
+
             Ok(Json(SuccessResponse {
                 status: "ok",
-                messages: report.messages,
-                selected_nodes: report.selected_nodes,
-                procedures: report.procedures,
-                paths: report.paths,
-                path_pairs: report.path_pairs,
+                messages,
+                selected_nodes,
+                procedures,
+                paths,
+                path_pairs,
+                rows: result_rows,
             }))
         }
         Err(err) => {

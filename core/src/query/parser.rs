@@ -341,12 +341,6 @@ fn condition_list(input: &str) -> IResult<Vec<Condition>> {
     separated_list1(ws(alt((tag_no_case("AND"), tag(",")))), condition_expr)(input)
 }
 
-fn return_list(input: &str) -> IResult<Vec<String>> {
-    map(separated_list1(ws(char(',')), ws(bare_word)), |items| {
-        items.into_iter().map(|s| s.to_string()).collect()
-    })(input)
-}
-
 fn select_stmt(input: &str) -> IResult<Query> {
     let (input, _) = ws(tag_no_case("SELECT"))(input)?;
     let (input, _) = ws(tag_no_case("MATCH"))(input)?;
@@ -355,16 +349,271 @@ fn select_stmt(input: &str) -> IResult<Query> {
         let (input, _) = ws(tag_no_case("WHERE"))(input)?;
         condition_list(input)
     })(input)?;
+    let (input, with_clause) = opt(with_clause)(input)?;
     let (input, _) = ws(tag_no_case("RETURN"))(input)?;
-    let (input, returns) = return_list(input)?;
+    let mut parser = projection_list(true);
+    let (input, returns) = parser(input)?;
+
     Ok((
         input,
-        Query::Select {
+        Query::Select(SelectQuery {
             pattern,
             conditions: conditions.unwrap_or_default(),
+            with: with_clause,
             returns,
+        }),
+    ))
+}
+
+fn with_clause(input: &str) -> IResult<WithClause> {
+    let (input, _) = ws(tag_no_case("WITH"))(input)?;
+    let mut parser = projection_list(false);
+    let (input, projections) = parser(input)?;
+    Ok((input, WithClause { projections }))
+}
+
+fn projection_list<'a>(
+    allow_aggregate: bool,
+) -> impl FnMut(&'a str) -> IResult<'a, Vec<Projection>> {
+    move |input| separated_list1(ws(char(',')), projection(allow_aggregate))(input)
+}
+
+fn projection<'a>(allow_aggregate: bool) -> impl FnMut(&'a str) -> IResult<'a, Projection> {
+    move |input| {
+        let (input, expression) = if allow_aggregate {
+            parse_expression(input)?
+        } else {
+            let (input, field) = field_reference(input)?;
+            (input, Expression::Field(field))
+        };
+        let (input, alias) = opt(projection_alias)(input)?;
+        Ok((input, Projection { expression, alias }))
+    }
+}
+
+fn parse_expression(input: &str) -> IResult<Expression> {
+    if let Ok((rest, agg)) = aggregate_expression(input) {
+        return Ok((rest, Expression::Aggregate(agg)));
+    }
+    let (rest, field) = field_reference(input)?;
+    Ok((rest, Expression::Field(field)))
+}
+
+fn projection_alias(input: &str) -> IResult<String> {
+    let (input, _) = ws(tag_no_case("AS"))(input)?;
+    let (input, alias) = ws(identifier)(input)?;
+    Ok((input, alias.to_string()))
+}
+
+fn field_reference(input: &str) -> IResult<FieldReference> {
+    let (input, alias) = ws(identifier)(input)?;
+    let (input, property) = opt(|input| {
+        let (input, _) = ws(char('.'))(input)?;
+        let (input, key) = ws(property_key)(input)?;
+        Ok((input, key.to_string()))
+    })(input)?;
+
+    Ok((
+        input,
+        FieldReference {
+            alias: alias.to_string(),
+            property,
         },
     ))
+}
+
+fn aggregate_expression(input: &str) -> IResult<AggregateExpression> {
+    alt((
+        avg_function,
+        collect_function,
+        count_function,
+        max_function,
+        min_function,
+        percentile_cont_function,
+        percentile_disc_function,
+        stdev_function,
+        stdevp_function,
+        sum_function,
+    ))(input)
+}
+
+fn avg_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("avg"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::Avg,
+            target: Some(field),
+            percentile: None,
+        },
+    ))
+}
+
+fn collect_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("collect"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::Collect,
+            target: Some(field),
+            percentile: None,
+        },
+    ))
+}
+
+fn count_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("count"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    if let Ok((input, _)) = ws(char('*'))(input) {
+        let (input, _) = ws(char(')'))(input)?;
+        return Ok((
+            input,
+            AggregateExpression {
+                function: AggregateFunction::CountAll,
+                target: None,
+                percentile: None,
+            },
+        ));
+    }
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::Count,
+            target: Some(field),
+            percentile: None,
+        },
+    ))
+}
+
+fn max_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("max"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::Max,
+            target: Some(field),
+            percentile: None,
+        },
+    ))
+}
+
+fn min_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("min"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::Min,
+            target: Some(field),
+            percentile: None,
+        },
+    ))
+}
+
+fn percentile_cont_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("percentilecont"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(','))(input)?;
+    let (input, percentile) = numeric_literal(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::PercentileCont,
+            target: Some(field),
+            percentile: Some(percentile),
+        },
+    ))
+}
+
+fn percentile_disc_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("percentiledisc"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(','))(input)?;
+    let (input, percentile) = numeric_literal(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::PercentileDisc,
+            target: Some(field),
+            percentile: Some(percentile),
+        },
+    ))
+}
+
+fn stdev_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("stdev"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::StDev,
+            target: Some(field),
+            percentile: None,
+        },
+    ))
+}
+
+fn stdevp_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("stdevp"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::StDevP,
+            target: Some(field),
+            percentile: None,
+        },
+    ))
+}
+
+fn sum_function(input: &str) -> IResult<AggregateExpression> {
+    let (input, _) = ws(tag_no_case("sum"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, field) = field_reference(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        AggregateExpression {
+            function: AggregateFunction::Sum,
+            target: Some(field),
+            percentile: None,
+        },
+    ))
+}
+
+fn numeric_literal(input: &str) -> IResult<f64> {
+    let (input, value) = ws(value_literal)(input)?;
+    match value {
+        Value::Float(f) => Ok((input, f)),
+        Value::Integer(i) => Ok((input, i as f64)),
+        _ => Err(nom::Err::Failure(VerboseError {
+            errors: vec![(
+                input,
+                VerboseErrorKind::Context("percentile requires numeric literal"),
+            )],
+        })),
+    }
 }
 
 fn call_stmt(input: &str) -> IResult<Query> {

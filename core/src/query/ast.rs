@@ -69,11 +69,7 @@ pub enum Query {
         id: String,
         assignments: HashMap<String, Value>,
     },
-    Select {
-        pattern: NodePattern,
-        conditions: Vec<Condition>,
-        returns: Vec<String>,
-    },
+    Select(SelectQuery),
     Create {
         pattern: CreatePattern,
     },
@@ -81,6 +77,59 @@ pub enum Query {
         procedure: Procedure,
     },
     PathMatch(PathMatchQuery),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectQuery {
+    pub pattern: NodePattern,
+    pub conditions: Vec<Condition>,
+    pub with: Option<WithClause>,
+    pub returns: Vec<Projection>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub projections: Vec<Projection>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Projection {
+    pub expression: Expression,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expression {
+    Field(FieldReference),
+    Aggregate(AggregateExpression),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldReference {
+    pub alias: String,
+    pub property: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateExpression {
+    pub function: AggregateFunction,
+    pub target: Option<FieldReference>,
+    pub percentile: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateFunction {
+    Avg,
+    Collect,
+    Count,
+    CountAll,
+    Max,
+    Min,
+    PercentileCont,
+    PercentileDisc,
+    StDev,
+    StDevP,
+    Sum,
 }
 
 #[derive(Debug, Clone, PartialEq)]

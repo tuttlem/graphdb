@@ -38,6 +38,7 @@ type QuerySuccess = {
   procedures: ProcedureResult[];
   paths: PathResult[];
   path_pairs: PathPairResult[];
+  rows: Record<string, unknown>[];
 };
 
 type QueryError = {
@@ -111,6 +112,23 @@ function App() {
     ));
   }, [result?.selected_nodes]);
 
+  const renderedRows = useMemo(() => {
+    if (!result?.rows || result.rows.length === 0) {
+      return (
+        <p className="muted">No rows returned.</p>
+      );
+    }
+    return (
+      <ul className="messages">
+        {result.rows.map((row, idx) => (
+          <li key={idx}>
+            <pre>{JSON.stringify(row, null, 2)}</pre>
+          </li>
+        ))}
+      </ul>
+    );
+  }, [result?.rows]);
+
   return (
     <div className="page">
       <header>
@@ -179,6 +197,13 @@ function App() {
             <h2>Selected Nodes</h2>
           </div>
           <div className="nodes-container">{renderedNodes}</div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-header">
+            <h2>Rows</h2>
+          </div>
+          {renderedRows}
         </div>
 
         <div className="panel">

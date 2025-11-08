@@ -71,12 +71,8 @@ fn execute_query(
             db.remove_edge(edge_id).map_err(|e| e.to_string())?;
             Ok(())
         }
-        Query::Select {
-            pattern,
-            conditions,
-            returns,
-        } => {
-            let nodes = select_nodes(db, &pattern, &conditions, &returns)?;
+        Query::Select(select) => {
+            let nodes = select_nodes(db, &select.pattern, &select.conditions)?;
             ctx.last_nodes = nodes;
             Ok(())
         }
@@ -159,7 +155,6 @@ fn select_nodes(
     db: &Database<InMemoryBackend>,
     pattern: &graphdb_core::query::NodePattern,
     conditions: &[graphdb_core::query::Condition],
-    _returns: &[String],
 ) -> ExecResult<Vec<Node>> {
     let mut matches = Vec::new();
     let node_ids = db.node_ids().map_err(|e| e.to_string())?;

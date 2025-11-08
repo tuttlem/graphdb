@@ -1,10 +1,12 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use common::attr::{AttributeContainer, AttributeValue};
 use graphdb_core::query::{
-    ComparisonOperator, CreatePattern, CreateRelationship, GraphDbProcedure, PathFilter,
-    PathLength, PathMatchQuery, PathQueryMode, PathReturn, Procedure, Properties, Query,
-    RelationshipDirection, RelationshipPattern, Value, parse_queries,
+    AggregateExpression, AggregateFunction, ComparisonOperator, CreatePattern, CreateRelationship,
+    Expression, FieldReference, GraphDbProcedure, PathFilter, PathLength, PathMatchQuery,
+    PathQueryMode, PathReturn, Procedure, Projection, Properties, Query, RelationshipDirection,
+    RelationshipPattern, SelectQuery, Value, WithClause, parse_queries,
 };
 use graphdb_core::{
     AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
@@ -22,6 +24,27 @@ pub struct ExecutionReport {
     pub procedures: Vec<ProcedureResult>,
     pub paths: Vec<PathResult>,
     pub path_pairs: Vec<PathPairResult>,
+    pub result_rows: Vec<JsonValue>,
+}
+
+#[derive(Clone, Default)]
+struct QueryRow {
+    nodes: HashMap<String, Node>,
+    scalars: HashMap<String, Value>,
+}
+
+impl QueryRow {
+    fn from_node(alias: &str, node: Node) -> Self {
+        let mut row = QueryRow::default();
+        row.nodes.insert(alias.to_string(), node);
+        row
+    }
+}
+
+#[derive(Clone)]
+enum FieldValue {
+    Node(Node),
+    Scalar(Value),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,6 +100,7 @@ fn execute_query<B: StorageBackend>(
     query: Query,
     ctx: &mut ExecutionReport,
 ) -> Result<(), DaemonError> {
+    ctx.result_rows.clear();
     match query {
         Query::InsertNode { pattern } => {
             let node_id = insert_node(db, pattern)?;
@@ -104,16 +128,7 @@ fn execute_query<B: StorageBackend>(
             ctx.messages.push("deleted edge".into());
             Ok(())
         }
-        Query::Select {
-            pattern,
-            conditions,
-            returns: _,
-        } => {
-            let nodes = select_nodes(db, &pattern, &conditions)?;
-            ctx.selected_nodes = nodes;
-            ctx.messages.push("select completed".into());
-            Ok(())
-        }
+        Query::Select(query) => execute_select(db, query, ctx),
         Query::Create { pattern } => execute_create(db, pattern, ctx),
         Query::UpdateNode { .. } | Query::UpdateEdge { .. } => {
             Err(DaemonError::Query("UPDATE not yet supported".into()))
@@ -130,6 +145,68 @@ fn execute_query<B: StorageBackend>(
         }
         Query::PathMatch(spec) => execute_path_query(db, spec, ctx),
     }
+}
+
+fn execute_select<B: StorageBackend>(
+    db: &Database<B>,
+    query: SelectQuery,
+    ctx: &mut ExecutionReport,
+) -> Result<(), DaemonError> {
+    let alias = query
+        .pattern
+        .alias
+        .clone()
+        .ok_or_else(|| DaemonError::Query("MATCH requires an alias".into()))?;
+
+    let nodes = select_nodes(db, &query.pattern, &query.conditions)?;
+    let mut rows: Vec<QueryRow> = nodes
+        .into_iter()
+        .map(|node| QueryRow::from_node(&alias, node))
+        .collect();
+
+    if let Some(with_clause) = query.with.as_ref() {
+        rows = apply_with_clause(rows, with_clause)?;
+    }
+
+    let has_aggregate = query
+        .returns
+        .iter()
+        .any(|projection| matches!(projection.expression, Expression::Aggregate(_)));
+    if has_aggregate
+        && query
+            .returns
+            .iter()
+            .any(|projection| !matches!(projection.expression, Expression::Aggregate(_)))
+    {
+        return Err(DaemonError::Query(
+            "cannot mix aggregate and non-aggregate RETURN items".into(),
+        ));
+    }
+
+    if has_aggregate {
+        let row = evaluate_aggregates(&rows, &query.returns)?;
+        ctx.result_rows = vec![row];
+        ctx.selected_nodes.clear();
+    } else {
+        let json_rows = project_rows(&rows, &query.returns)?;
+        ctx.result_rows = json_rows;
+        if query.returns.len() == 1 {
+            if let Expression::Field(field) = &query.returns[0].expression {
+                if field.property.is_none() {
+                    ctx.selected_nodes = collect_nodes(&rows, &field.alias);
+                } else {
+                    ctx.selected_nodes.clear();
+                }
+            } else {
+                ctx.selected_nodes.clear();
+            }
+        } else {
+            ctx.selected_nodes.clear();
+        }
+    }
+
+    ctx.messages.push("match completed".into());
+    Ok(())
 }
 
 fn insert_node<B: StorageBackend>(
@@ -239,6 +316,177 @@ fn value_equals_attribute(value: &Value, attribute: &AttributeValue) -> bool {
     }
 }
 
+fn collect_nodes(rows: &[QueryRow], alias: &str) -> Vec<Node> {
+    rows.iter()
+        .filter_map(|row| row.nodes.get(alias).cloned())
+        .collect()
+}
+
+fn apply_with_clause(
+    rows: Vec<QueryRow>,
+    clause: &WithClause,
+) -> Result<Vec<QueryRow>, DaemonError> {
+    let mut projected = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut next = QueryRow::default();
+        for projection in &clause.projections {
+            let value = match &projection.expression {
+                Expression::Field(field) => resolve_field(&row, field)?,
+                Expression::Aggregate(_) => {
+                    return Err(DaemonError::Query(
+                        "aggregate expressions are not supported in WITH clauses".into(),
+                    ));
+                }
+            };
+            let name = projection_label(projection);
+            match value {
+                FieldValue::Node(node) => {
+                    next.nodes.insert(name, node);
+                }
+                FieldValue::Scalar(val) => {
+                    next.scalars.insert(name, val);
+                }
+            }
+        }
+        projected.push(next);
+    }
+    Ok(projected)
+}
+
+fn project_rows(
+    rows: &[QueryRow],
+    projections: &[Projection],
+) -> Result<Vec<JsonValue>, DaemonError> {
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut map = serde_json::Map::new();
+        for projection in projections {
+            let value = match &projection.expression {
+                Expression::Field(field) => resolve_field(row, field)?,
+                Expression::Aggregate(_) => {
+                    return Err(DaemonError::Query(
+                        "unexpected aggregate in projection".into(),
+                    ));
+                }
+            };
+            let json_value = match value {
+                FieldValue::Node(node) => serde_json::to_value(node).map_err(|err| {
+                    DaemonError::Query(format!("failed to serialize node: {err}"))
+                })?,
+                FieldValue::Scalar(val) => value_to_json(&val),
+            };
+            map.insert(projection_label(projection), json_value);
+        }
+        results.push(JsonValue::Object(map));
+    }
+    Ok(results)
+}
+
+fn evaluate_aggregates(
+    rows: &[QueryRow],
+    projections: &[Projection],
+) -> Result<JsonValue, DaemonError> {
+    let mut map = serde_json::Map::new();
+    for projection in projections {
+        let agg = match &projection.expression {
+            Expression::Aggregate(expr) => expr,
+            Expression::Field(_) => {
+                return Err(DaemonError::Query(
+                    "non-aggregate projection encountered in aggregate evaluation".into(),
+                ));
+            }
+        };
+        let value = compute_aggregate(rows, agg)?;
+        map.insert(projection_label(projection), value_to_json(&value));
+    }
+    Ok(JsonValue::Object(map))
+}
+
+fn projection_label(projection: &Projection) -> String {
+    if let Some(alias) = &projection.alias {
+        return alias.clone();
+    }
+
+    match &projection.expression {
+        Expression::Field(field) => field_label(field),
+        Expression::Aggregate(agg) => aggregate_label(agg),
+    }
+}
+
+fn field_label(field: &FieldReference) -> String {
+    match &field.property {
+        Some(property) => format!("{}.{}", field.alias, property),
+        None => field.alias.clone(),
+    }
+}
+
+fn aggregate_label(expr: &AggregateExpression) -> String {
+    let func = match expr.function {
+        AggregateFunction::Avg => "avg",
+        AggregateFunction::Collect => "collect",
+        AggregateFunction::Count => "count",
+        AggregateFunction::CountAll => "count",
+        AggregateFunction::Max => "max",
+        AggregateFunction::Min => "min",
+        AggregateFunction::PercentileCont => "percentileCont",
+        AggregateFunction::PercentileDisc => "percentileDisc",
+        AggregateFunction::StDev => "stDev",
+        AggregateFunction::StDevP => "stDevP",
+        AggregateFunction::Sum => "sum",
+    };
+
+    let target = expr
+        .target
+        .as_ref()
+        .map(field_label)
+        .unwrap_or_else(|| "*".into());
+
+    if let Some(p) = expr.percentile {
+        format!("{}({}, {:.4})", func, target, p)
+    } else {
+        format!("{}({})", func, target)
+    }
+}
+
+fn resolve_field(row: &QueryRow, field: &FieldReference) -> Result<FieldValue, DaemonError> {
+    if let Some(value) = row.scalars.get(&field.alias) {
+        if field.property.is_some() {
+            return Err(DaemonError::Query(format!(
+                "alias '{}' does not support property access",
+                field.alias
+            )));
+        }
+        return Ok(FieldValue::Scalar(value.clone()));
+    }
+
+    if let Some(node) = row.nodes.get(&field.alias) {
+        if let Some(property) = &field.property {
+            let attr = node.attribute(property);
+            let value = attr.map(attribute_to_query_value).unwrap_or(Value::Null);
+            return Ok(FieldValue::Scalar(value));
+        }
+        return Ok(FieldValue::Node(node.clone()));
+    }
+
+    Err(DaemonError::Query(format!(
+        "unknown alias '{}'",
+        field.alias
+    )))
+}
+
+fn attribute_to_query_value(attr: &AttributeValue) -> Value {
+    match attr {
+        AttributeValue::String(s) => Value::String(s.clone()),
+        AttributeValue::Integer(i) => Value::Integer(*i),
+        AttributeValue::Float(f) => Value::Float(*f),
+        AttributeValue::Boolean(b) => Value::Boolean(*b),
+        AttributeValue::Null => Value::Null,
+        AttributeValue::List(items) => {
+            Value::List(items.iter().map(attribute_to_query_value).collect())
+        }
+    }
+}
+
 fn execute_create<B: StorageBackend>(
     db: &Database<B>,
     pattern: CreatePattern,
@@ -303,6 +551,322 @@ fn execute_procedure<B: StorageBackend>(
     };
 
     Ok(ProcedureResult { name, rows })
+}
+
+fn compute_aggregate(rows: &[QueryRow], expr: &AggregateExpression) -> Result<Value, DaemonError> {
+    match expr.function {
+        AggregateFunction::CountAll => Ok(Value::Integer(rows.len() as i64)),
+        AggregateFunction::Count => {
+            let field = expr
+                .target
+                .as_ref()
+                .ok_or_else(|| DaemonError::Query("count requires an argument".into()))?;
+            let mut total = 0;
+            for row in rows {
+                match resolve_field(row, field)? {
+                    FieldValue::Scalar(Value::Null) => {}
+                    FieldValue::Scalar(_) | FieldValue::Node(_) => total += 1,
+                }
+            }
+            Ok(Value::Integer(total))
+        }
+        AggregateFunction::Collect => {
+            let field = expr
+                .target
+                .as_ref()
+                .ok_or_else(|| DaemonError::Query("collect requires an argument".into()))?;
+            let mut items = Vec::new();
+            for row in rows {
+                match resolve_field(row, field)? {
+                    FieldValue::Scalar(Value::Null) => {}
+                    FieldValue::Scalar(value) => items.push(value),
+                    FieldValue::Node(node) => {
+                        let serialized = serde_json::to_string(&node).map_err(|err| {
+                            DaemonError::Query(format!(
+                                "failed to serialize node for collect: {err}"
+                            ))
+                        })?;
+                        items.push(Value::String(serialized));
+                    }
+                }
+            }
+            Ok(Value::List(items))
+        }
+        AggregateFunction::Sum => {
+            let field = expr
+                .target
+                .as_ref()
+                .ok_or_else(|| DaemonError::Query("sum requires an argument".into()))?;
+            let (values, all_int) = numeric_values(rows, field)?;
+            if values.is_empty() {
+                return Ok(Value::Integer(0));
+            }
+            let sum: f64 = values.iter().copied().sum();
+            if all_int {
+                Ok(Value::Integer(sum.round() as i64))
+            } else {
+                Ok(Value::Float(sum))
+            }
+        }
+        AggregateFunction::Avg => {
+            let field = expr
+                .target
+                .as_ref()
+                .ok_or_else(|| DaemonError::Query("avg requires an argument".into()))?;
+            let (values, _all_int) = numeric_values(rows, field)?;
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            let sum: f64 = values.iter().copied().sum();
+            Ok(Value::Float(sum / values.len() as f64))
+        }
+        AggregateFunction::Max => {
+            let field = expr
+                .target
+                .as_ref()
+                .ok_or_else(|| DaemonError::Query("max requires an argument".into()))?;
+            let values = scalar_values(rows, field)?;
+            let mut best: Option<Value> = None;
+            for value in values {
+                if value == Value::Null {
+                    continue;
+                }
+                if let Some(current) = &best {
+                    if compare_values(&value, current) == Ordering::Greater {
+                        best = Some(value);
+                    }
+                } else {
+                    best = Some(value);
+                }
+            }
+            Ok(best.unwrap_or(Value::Null))
+        }
+        AggregateFunction::Min => {
+            let field = expr
+                .target
+                .as_ref()
+                .ok_or_else(|| DaemonError::Query("min requires an argument".into()))?;
+            let values = scalar_values(rows, field)?;
+            let mut best: Option<Value> = None;
+            for value in values {
+                if value == Value::Null {
+                    continue;
+                }
+                if let Some(current) = &best {
+                    if compare_values(&value, current) == Ordering::Less {
+                        best = Some(value);
+                    }
+                } else {
+                    best = Some(value);
+                }
+            }
+            Ok(best.unwrap_or(Value::Null))
+        }
+        AggregateFunction::PercentileCont => {
+            let percentile = expr.percentile.ok_or_else(|| {
+                DaemonError::Query("percentileCont requires percentile parameter".into())
+            })?;
+            let (values, _) = percentile_values(rows, expr)?;
+            percentile_cont(values, percentile)
+        }
+        AggregateFunction::PercentileDisc => {
+            let percentile = expr.percentile.ok_or_else(|| {
+                DaemonError::Query("percentileDisc requires percentile parameter".into())
+            })?;
+            let (values, _) = percentile_values(rows, expr)?;
+            percentile_disc(values, percentile)
+        }
+        AggregateFunction::StDev => {
+            let (values, _all_int) = numeric_values(
+                rows,
+                expr.target
+                    .as_ref()
+                    .ok_or_else(|| DaemonError::Query("stDev requires an argument".into()))?,
+            )?;
+            Ok(Value::Float(sample_std_dev(&values)))
+        }
+        AggregateFunction::StDevP => {
+            let (values, _all_int) = numeric_values(
+                rows,
+                expr.target
+                    .as_ref()
+                    .ok_or_else(|| DaemonError::Query("stDevP requires an argument".into()))?,
+            )?;
+            Ok(Value::Float(population_std_dev(&values)))
+        }
+    }
+}
+
+fn percentile_values(
+    rows: &[QueryRow],
+    expr: &AggregateExpression,
+) -> Result<(Vec<f64>, bool), DaemonError> {
+    let field = expr
+        .target
+        .as_ref()
+        .ok_or_else(|| DaemonError::Query("percentile requires an argument".into()))?;
+    numeric_values(rows, field)
+}
+
+fn percentile_cont(values: Vec<f64>, percentile: f64) -> Result<Value, DaemonError> {
+    if values.is_empty() {
+        return Ok(Value::Null);
+    }
+    if !(0.0..=1.0).contains(&percentile) {
+        return Err(DaemonError::Query(
+            "percentile must be between 0.0 and 1.0".into(),
+        ));
+    }
+    let mut data = values;
+    data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    if data.len() == 1 {
+        return Ok(Value::Float(data[0]));
+    }
+    let rank = percentile * (data.len() as f64 - 1.0);
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    let fraction = rank - lower as f64;
+    let lower_value = data[lower];
+    let upper_value = data[upper];
+    Ok(Value::Float(
+        lower_value + (upper_value - lower_value) * fraction,
+    ))
+}
+
+fn percentile_disc(values: Vec<f64>, percentile: f64) -> Result<Value, DaemonError> {
+    if values.is_empty() {
+        return Ok(Value::Null);
+    }
+    if !(0.0..=1.0).contains(&percentile) {
+        return Err(DaemonError::Query(
+            "percentile must be between 0.0 and 1.0".into(),
+        ));
+    }
+    let mut data = values;
+    data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let index = (percentile * (data.len() as f64 - 1.0)).round() as usize;
+    Ok(Value::Float(data[index]))
+}
+
+fn numeric_values(
+    rows: &[QueryRow],
+    field: &FieldReference,
+) -> Result<(Vec<f64>, bool), DaemonError> {
+    let mut values = Vec::new();
+    let mut all_int = true;
+    for row in rows {
+        match resolve_field(row, field)? {
+            FieldValue::Scalar(Value::Integer(i)) => values.push(i as f64),
+            FieldValue::Scalar(Value::Float(f)) => {
+                values.push(f);
+                all_int = false;
+            }
+            FieldValue::Scalar(Value::Null) => {}
+            FieldValue::Scalar(_) => {
+                return Err(DaemonError::Query(
+                    "numeric aggregate received non-numeric value".into(),
+                ));
+            }
+            FieldValue::Node(_) => {
+                return Err(DaemonError::Query(
+                    "numeric aggregate cannot operate on nodes".into(),
+                ));
+            }
+        }
+    }
+    Ok((values, all_int))
+}
+
+fn scalar_values(rows: &[QueryRow], field: &FieldReference) -> Result<Vec<Value>, DaemonError> {
+    let mut values = Vec::new();
+    for row in rows {
+        match resolve_field(row, field)? {
+            FieldValue::Scalar(value) => values.push(value),
+            FieldValue::Node(_) => {
+                return Err(DaemonError::Query(
+                    "aggregation cannot operate on node aliases".into(),
+                ));
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn sample_std_dev(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n <= 1 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let variance = values
+        .iter()
+        .map(|v| {
+            let diff = v - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / (n as f64 - 1.0);
+    variance.sqrt()
+}
+
+fn population_std_dev(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let variance = values
+        .iter()
+        .map(|v| {
+            let diff = v - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / n as f64;
+    variance.sqrt()
+}
+
+fn compare_values(a: &Value, b: &Value) -> Ordering {
+    let rank_a = value_rank(a);
+    let rank_b = value_rank(b);
+    match rank_a.cmp(&rank_b) {
+        Ordering::Equal => match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+            (Value::Integer(x), Value::Float(y)) => {
+                (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+            }
+            (Value::Float(x), Value::Integer(y)) => {
+                x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
+            }
+            (Value::String(x), Value::String(y)) => x.cmp(y),
+            (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
+            (Value::List(xs), Value::List(ys)) => xs.len().cmp(&ys.len()),
+            _ => Ordering::Equal,
+        },
+        ordering => ordering,
+    }
+}
+
+fn value_rank(value: &Value) -> u8 {
+    match value {
+        Value::Integer(_) | Value::Float(_) => 3,
+        Value::String(_) => 2,
+        Value::Boolean(_) => 2,
+        Value::List(_) => 1,
+        Value::Null => 0,
+    }
+}
+
+fn value_to_json(value: &Value) -> JsonValue {
+    match value {
+        Value::String(s) => json!(s),
+        Value::Integer(i) => json!(i),
+        Value::Float(f) => json!(f),
+        Value::Boolean(b) => json!(b),
+        Value::Null => JsonValue::Null,
+        Value::List(values) => JsonValue::Array(values.iter().map(value_to_json).collect()),
+    }
 }
 
 fn node_class_rows(entries: Vec<NodeClassEntry>) -> Vec<JsonValue> {
