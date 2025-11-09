@@ -203,6 +203,22 @@ Snippet of the response payload:
 }
 ```
 
+### Built-in Functions
+
+The query engine includes several Cypher-style helpers:
+
+- **Predicate** – `all`, `any`, `none`, `single`, `isEmpty`, and pattern `exists(...)` all behave like their Cypher equivalents (e.g. `all([])` is vacuously `true`, `any([])` is `false`, nulls propagate when no decisive value exists).
+- **Scalar** – `coalesce`, `head`, `last`, `startNode`, `endNode`, `id`, `type`, `properties`, `randomUUID`, `size`, `length`, `timestamp`, and the conversion suite `toBoolean`, `toBooleanOrNull`, `toFloat`, `toFloatOrNull`, `toInteger`, `toIntegerOrNull`. Conversions return `null` for `null` or unsupported inputs when using the `OrNull` variants.
+
+Example:
+
+```cypher
+SELECT MATCH (p:Person)
+RETURN coalesce(p.nickname, p.name, 'unknown') AS display,
+       size(p.nicknames) AS nicknameCount,
+       toInteger(p.age) AS age;
+```
+
 ### Using the Privilege Model
 
 Node and edge inserts go through the privilege pipeline automatically. The

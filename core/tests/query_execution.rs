@@ -354,5 +354,6 @@ fn value_to_attribute(value: &Value) -> AttributeValue {
         Value::List(values) => {
             AttributeValue::List(values.iter().map(value_to_attribute).collect())
         }
+        Value::Map(_) => AttributeValue::Null,
     }
 }

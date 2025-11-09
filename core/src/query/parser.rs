@@ -557,7 +557,7 @@ fn parse_expression(input: &str) -> IResult<Expression> {
 
 fn non_aggregate_expression(input: &str) -> IResult<Expression> {
     if let Ok((rest, func)) = function_expression(input) {
-        return Ok((rest, Expression::Function(func)));
+        return Ok((rest, Expression::Function(Box::new(func))));
     }
     if let Ok((rest, literal)) = literal_expression(input) {
         return Ok((rest, literal));
@@ -606,6 +606,7 @@ fn aggregate_expression(input: &str) -> IResult<AggregateExpression> {
 
 fn function_expression(input: &str) -> IResult<FunctionExpression> {
     alt((
+        scalar_function_expression,
         list_predicate_function("all", ListPredicateKind::All),
         list_predicate_function("any", ListPredicateKind::Any),
         list_predicate_function("none", ListPredicateKind::None),
@@ -613,6 +614,182 @@ fn function_expression(input: &str) -> IResult<FunctionExpression> {
         is_empty_function,
         exists_function,
     ))(input)
+}
+
+fn scalar_function_expression(input: &str) -> IResult<FunctionExpression> {
+    map(
+        alt((
+            coalesce_function,
+            start_node_function,
+            end_node_function,
+            head_function,
+            last_function,
+            id_function,
+            properties_function,
+            random_uuid_function,
+            size_function,
+            length_function,
+            timestamp_function,
+            to_boolean_function,
+            to_boolean_or_null_function,
+            to_float_function,
+            to_float_or_null_function,
+            to_integer_function,
+            to_integer_or_null_function,
+            type_function,
+        )),
+        FunctionExpression::Scalar,
+    )(input)
+}
+
+fn coalesce_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("coalesce"))(input)?;
+    let (input, args) = delimited(
+        ws(char('(')),
+        separated_list1(ws(char(',')), non_aggregate_expression),
+        ws(char(')')),
+    )(input)?;
+    Ok((input, ScalarFunction::Coalesce(args)))
+}
+
+fn start_node_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("startNode"))(input)?;
+    let (input, field) = delimited(ws(char('(')), field_reference, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::StartNode(field)))
+}
+
+fn end_node_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("endNode"))(input)?;
+    let (input, field) = delimited(ws(char('(')), field_reference, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::EndNode(field)))
+}
+
+fn head_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("head"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Head(expr)))
+}
+
+fn last_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("last"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Last(expr)))
+}
+
+fn id_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("id"))(input)?;
+    let (input, field) = delimited(ws(char('(')), field_reference, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Id(field)))
+}
+
+fn properties_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("properties"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Properties(expr)))
+}
+
+fn random_uuid_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("randomUUID"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((input, ScalarFunction::RandomUuid))
+}
+
+fn size_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("size"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Size(expr)))
+}
+
+fn length_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("length"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Length(expr)))
+}
+
+fn timestamp_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("timestamp"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((input, ScalarFunction::Timestamp))
+}
+
+fn to_boolean_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toBoolean"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((
+        input,
+        ScalarFunction::ToBoolean {
+            expr,
+            null_on_unsupported: false,
+        },
+    ))
+}
+
+fn to_boolean_or_null_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toBooleanOrNull"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((
+        input,
+        ScalarFunction::ToBoolean {
+            expr,
+            null_on_unsupported: true,
+        },
+    ))
+}
+
+fn to_float_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toFloat"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((
+        input,
+        ScalarFunction::ToFloat {
+            expr,
+            null_on_unsupported: false,
+        },
+    ))
+}
+
+fn to_float_or_null_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toFloatOrNull"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((
+        input,
+        ScalarFunction::ToFloat {
+            expr,
+            null_on_unsupported: true,
+        },
+    ))
+}
+
+fn to_integer_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toInteger"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((
+        input,
+        ScalarFunction::ToInteger {
+            expr,
+            null_on_unsupported: false,
+        },
+    ))
+}
+
+fn to_integer_or_null_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toIntegerOrNull"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((
+        input,
+        ScalarFunction::ToInteger {
+            expr,
+            null_on_unsupported: true,
+        },
+    ))
+}
+
+fn type_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("type"))(input)?;
+    let (input, field) = delimited(ws(char('(')), field_reference, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Type(field)))
 }
 
 fn avg_function(input: &str) -> IResult<AggregateExpression> {

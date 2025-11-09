@@ -33,7 +33,7 @@
 * [ ] Streaming changefeed / CDC API
 * [ ] Notebook-style docs/examples for common Cypher patterns
 * [x] Predicate functions
-* [ ] Scalar functions
+* [x] Scalar functions
 * [ ] Aggregation functions
 * [ ] List functions
 * [ ] Math functions (numeric)

@@ -1,7 +1,7 @@
 use graphdb_core::query::{
     ComparisonOperator, Expression, FunctionExpression, GraphDbProcedure, ListPredicateKind,
-    MatchPattern, PathQueryMode, PathReturn, Procedure, Query, RelationshipDirection, Value,
-    parse_queries,
+    MatchPattern, PathQueryMode, PathReturn, Procedure, Query, RelationshipDirection,
+    ScalarFunction, Value, parse_queries,
 };
 
 #[test]
@@ -180,10 +180,13 @@ fn parse_return_list_predicate_function() {
         Query::Select(select) => {
             assert_eq!(select.returns.len(), 1);
             match &select.returns[0].expression {
-                Expression::Function(FunctionExpression::ListPredicate(spec)) => {
-                    assert_eq!(spec.kind, ListPredicateKind::All);
-                    assert_eq!(spec.variable, "x");
-                }
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::ListPredicate(spec) => {
+                        assert_eq!(spec.kind, ListPredicateKind::All);
+                        assert_eq!(spec.variable, "x");
+                    }
+                    other => panic!("unexpected projection {other:?}"),
+                },
                 other => panic!("unexpected projection {other:?}"),
             }
         }
@@ -208,6 +211,36 @@ fn parse_with_literal_projection() {
             assert!(select.returns.len() == 1);
         }
         other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn parse_scalar_functions() {
+    let input = "SELECT MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN coalesce(a.nickname, a.name) AS display, startNode(r) AS start, endNode(r) AS end, randomUUID() AS uuid;";
+    let queries = parse_queries(input).unwrap();
+    match &queries[0] {
+        Query::Select(select) => {
+            assert_eq!(select.returns.len(), 4);
+            match &select.returns[0].expression {
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::Scalar(ScalarFunction::Coalesce(args)) => {
+                        assert_eq!(args.len(), 2);
+                    }
+                    other => panic!("unexpected expression {other:?}"),
+                },
+                other => panic!("unexpected expression {other:?}"),
+            }
+            match &select.returns[1].expression {
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::Scalar(ScalarFunction::StartNode(field)) => {
+                        assert_eq!(field.alias, "r");
+                    }
+                    other => panic!("unexpected expression {other:?}"),
+                },
+                other => panic!("unexpected expression {other:?}"),
+            }
+        }
+        other => panic!("unexpected query {other:?}"),
     }
 }
 

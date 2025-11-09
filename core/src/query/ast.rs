@@ -8,6 +8,7 @@ pub enum Value {
     Boolean(bool),
     Null,
     List(Vec<Value>),
+    Map(HashMap<String, Value>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,7 +124,7 @@ pub struct Projection {
 pub enum Expression {
     Field(FieldReference),
     Aggregate(AggregateExpression),
-    Function(FunctionExpression),
+    Function(Box<FunctionExpression>),
     Literal(Value),
 }
 
@@ -145,6 +146,35 @@ pub enum FunctionExpression {
     ListPredicate(ListPredicateFunction),
     IsEmpty(ValueOperand),
     Exists(ExistsFunction),
+    Scalar(ScalarFunction),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarFunction {
+    Coalesce(Vec<Expression>),
+    StartNode(FieldReference),
+    EndNode(FieldReference),
+    Head(Expression),
+    Last(Expression),
+    Id(FieldReference),
+    Properties(Expression),
+    RandomUuid,
+    Size(Expression),
+    Length(Expression),
+    Timestamp,
+    ToBoolean {
+        expr: Expression,
+        null_on_unsupported: bool,
+    },
+    ToFloat {
+        expr: Expression,
+        null_on_unsupported: bool,
+    },
+    ToInteger {
+        expr: Expression,
+        null_on_unsupported: bool,
+    },
+    Type(FieldReference),
 }
 
 #[derive(Debug, Clone, PartialEq)]
