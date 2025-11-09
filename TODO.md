@@ -32,7 +32,7 @@
 * [ ] Schema validation / migration tooling
 * [ ] Streaming changefeed / CDC API
 * [ ] Notebook-style docs/examples for common Cypher patterns
-* [ ] Predicate functions
+* [x] Predicate functions
 * [ ] Scalar functions
 * [ ] Aggregation functions
 * [ ] List functions

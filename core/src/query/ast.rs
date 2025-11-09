@@ -83,6 +83,7 @@ pub enum Query {
 pub struct SelectQuery {
     pub match_clauses: Vec<SelectMatchClause>,
     pub conditions: Vec<Condition>,
+    pub predicates: Vec<PredicateFilter>,
     pub with: Option<WithClause>,
     pub returns: Vec<Projection>,
     pub explain: bool,
@@ -122,6 +123,8 @@ pub struct Projection {
 pub enum Expression {
     Field(FieldReference),
     Aggregate(AggregateExpression),
+    Function(FunctionExpression),
+    Literal(Value),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +138,63 @@ pub struct AggregateExpression {
     pub function: AggregateFunction,
     pub target: Option<FieldReference>,
     pub percentile: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionExpression {
+    ListPredicate(ListPredicateFunction),
+    IsEmpty(ValueOperand),
+    Exists(ExistsFunction),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PredicateFilter {
+    pub function: FunctionExpression,
+    pub negated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListPredicateFunction {
+    pub kind: ListPredicateKind,
+    pub variable: String,
+    pub list: ListExpression,
+    pub predicate: ListPredicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ListPredicateKind {
+    All,
+    Any,
+    None,
+    Single,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListExpression {
+    Field(FieldReference),
+    Literal(Value),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListPredicate {
+    Comparison {
+        operator: ComparisonOperator,
+        value: Value,
+    },
+    IsNull {
+        negated: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueOperand {
+    Field(FieldReference),
+    Literal(Value),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExistsFunction {
+    pub pattern: RelationshipMatch,
 }
 
 #[derive(Debug, Clone, PartialEq)]

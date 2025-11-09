@@ -1,6 +1,7 @@
 use graphdb_core::query::{
-    ComparisonOperator, Expression, GraphDbProcedure, MatchPattern, PathQueryMode, PathReturn,
-    Procedure, Query, RelationshipDirection, Value, parse_queries,
+    ComparisonOperator, Expression, FunctionExpression, GraphDbProcedure, ListPredicateKind,
+    MatchPattern, PathQueryMode, PathReturn, Procedure, Query, RelationshipDirection, Value,
+    parse_queries,
 };
 
 #[test]
@@ -145,6 +146,66 @@ fn parse_where_rich_predicates() {
             assert_eq!(select.conditions[2].operator, ComparisonOperator::IsNotNull);
             assert!(select.conditions[2].value.is_none());
             assert_eq!(select.conditions[3].operator, ComparisonOperator::IsNull);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn parse_where_with_predicate_functions() {
+    let input = "SELECT MATCH (p:Person) WHERE p.nicknames IS NOT NULL AND NOT isEmpty(p.nicknames) AND exists((p)-[:KNOWS]->()) RETURN p;";
+    let queries = parse_queries(input).unwrap();
+    match &queries[0] {
+        Query::Select(select) => {
+            assert_eq!(select.conditions.len(), 1);
+            assert_eq!(select.predicates.len(), 2);
+            match &select.predicates[0].function {
+                FunctionExpression::IsEmpty(_) => {}
+                other => panic!("unexpected predicate {other:?}"),
+            }
+            match &select.predicates[1].function {
+                FunctionExpression::Exists(_) => {}
+                other => panic!("unexpected predicate {other:?}"),
+            }
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn parse_return_list_predicate_function() {
+    let input = "SELECT MATCH (n:Item) RETURN all(x IN n.values WHERE x > 0) AS ok;";
+    let queries = parse_queries(input).unwrap();
+    match &queries[0] {
+        Query::Select(select) => {
+            assert_eq!(select.returns.len(), 1);
+            match &select.returns[0].expression {
+                Expression::Function(FunctionExpression::ListPredicate(spec)) => {
+                    assert_eq!(spec.kind, ListPredicateKind::All);
+                    assert_eq!(spec.variable, "x");
+                }
+                other => panic!("unexpected projection {other:?}"),
+            }
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn parse_with_literal_projection() {
+    let input = "SELECT MATCH (n:Person) WITH [] AS xs RETURN xs;";
+    let queries = parse_queries(input).unwrap();
+    match &queries[0] {
+        Query::Select(select) => {
+            let with_clause = select.with.as_ref().expect("WITH clause");
+            assert_eq!(with_clause.projections.len(), 1);
+            match &with_clause.projections[0].expression {
+                Expression::Literal(Value::List(values)) => {
+                    assert!(values.is_empty());
+                }
+                other => panic!("unexpected WITH expression {other:?}"),
+            }
+            assert!(select.returns.len() == 1);
         }
         other => panic!("unexpected {other:?}"),
     }

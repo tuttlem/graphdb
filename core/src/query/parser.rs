@@ -320,7 +320,36 @@ fn update_edge_stmt(input: &str) -> IResult<Query> {
     ))
 }
 
-fn condition_expr(input: &str) -> IResult<Condition> {
+enum ConditionTerm {
+    Comparison(Condition),
+    Predicate(PredicateFilter),
+}
+
+fn condition_expr(input: &str) -> IResult<ConditionTerm> {
+    let (input, _) = skip_ws_and_comments(input)?;
+    if starts_with_predicate(input) {
+        predicate_condition(input)
+            .map(|(rest, predicate)| (rest, ConditionTerm::Predicate(predicate)))
+    } else {
+        comparison_condition(input).map(|(rest, cond)| (rest, ConditionTerm::Comparison(cond)))
+    }
+}
+
+fn predicate_condition(input: &str) -> IResult<PredicateFilter> {
+    let (input, _) = skip_ws_and_comments(input)?;
+    let (input, negated) = opt(ws(tag_no_case("NOT")))(input)?;
+    let (input, _) = skip_ws_and_comments(input)?;
+    let (input, function) = function_expression(input)?;
+    Ok((
+        input,
+        PredicateFilter {
+            function,
+            negated: negated.is_some(),
+        },
+    ))
+}
+
+fn comparison_condition(input: &str) -> IResult<Condition> {
     let (input, alias) = ws(identifier)(input)?;
     let (input, _) = ws(char('.'))(input)?;
     let (input, property) = ws(property_key)(input)?;
@@ -357,8 +386,41 @@ fn condition_expr(input: &str) -> IResult<Condition> {
     ))
 }
 
-fn condition_list(input: &str) -> IResult<Vec<Condition>> {
+fn condition_list(input: &str) -> IResult<Vec<ConditionTerm>> {
     separated_list1(ws(alt((tag_no_case("AND"), tag(",")))), condition_expr)(input)
+}
+
+fn starts_with_predicate(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    starts_with_function_call(trimmed)
+        || strip_keyword(trimmed, "not")
+            .map(|rest| starts_with_function_call(rest.trim_start()))
+            .unwrap_or(false)
+}
+
+fn starts_with_function_call(input: &str) -> bool {
+    const KEYWORDS: [&str; 6] = ["all", "any", "none", "single", "isempty", "exists"];
+    KEYWORDS.iter().any(|kw| {
+        strip_keyword(input, kw)
+            .map(|rest| rest.trim_start().starts_with('('))
+            .unwrap_or(false)
+    })
+}
+
+fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    if input.len() < keyword.len() {
+        return None;
+    }
+    let (prefix, rest) = input.split_at(keyword.len());
+    if !prefix.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    if let Some(next) = rest.chars().next() {
+        if next.is_alphanumeric() || next == '_' {
+            return None;
+        }
+    }
+    Some(rest)
 }
 
 fn comparison_operator(input: &str) -> IResult<ComparisonOperator> {
@@ -377,7 +439,7 @@ fn select_stmt(input: &str) -> IResult<Query> {
     let explain = explain_kw.is_some();
     let (input, _) = ws(tag_no_case("SELECT"))(input)?;
     let (input, match_clauses) = parse_select_match_clauses(input)?;
-    let (input, conditions) = opt(|input| {
+    let (input, condition_terms) = opt(|input| {
         let (input, _) = ws(tag_no_case("WHERE"))(input)?;
         condition_list(input)
     })(input)?;
@@ -386,11 +448,23 @@ fn select_stmt(input: &str) -> IResult<Query> {
     let mut parser = projection_list(true);
     let (input, returns) = parser(input)?;
 
+    let mut conditions = Vec::new();
+    let mut predicates = Vec::new();
+    if let Some(terms) = condition_terms {
+        for term in terms {
+            match term {
+                ConditionTerm::Comparison(cond) => conditions.push(cond),
+                ConditionTerm::Predicate(pred) => predicates.push(pred),
+            }
+        }
+    }
+
     Ok((
         input,
         Query::Select(SelectQuery {
             match_clauses,
-            conditions: conditions.unwrap_or_default(),
+            conditions,
+            predicates,
             with: with_clause,
             returns,
             explain,
@@ -467,8 +541,7 @@ fn projection<'a>(allow_aggregate: bool) -> impl FnMut(&'a str) -> IResult<'a, P
         let (input, expression) = if allow_aggregate {
             parse_expression(input)?
         } else {
-            let (input, field) = field_reference(input)?;
-            (input, Expression::Field(field))
+            non_aggregate_expression(input)?
         };
         let (input, alias) = opt(projection_alias)(input)?;
         Ok((input, Projection { expression, alias }))
@@ -478,6 +551,16 @@ fn projection<'a>(allow_aggregate: bool) -> impl FnMut(&'a str) -> IResult<'a, P
 fn parse_expression(input: &str) -> IResult<Expression> {
     if let Ok((rest, agg)) = aggregate_expression(input) {
         return Ok((rest, Expression::Aggregate(agg)));
+    }
+    non_aggregate_expression(input)
+}
+
+fn non_aggregate_expression(input: &str) -> IResult<Expression> {
+    if let Ok((rest, func)) = function_expression(input) {
+        return Ok((rest, Expression::Function(func)));
+    }
+    if let Ok((rest, literal)) = literal_expression(input) {
+        return Ok((rest, literal));
     }
     let (rest, field) = field_reference(input)?;
     Ok((rest, Expression::Field(field)))
@@ -518,6 +601,17 @@ fn aggregate_expression(input: &str) -> IResult<AggregateExpression> {
         stdev_function,
         stdevp_function,
         sum_function,
+    ))(input)
+}
+
+fn function_expression(input: &str) -> IResult<FunctionExpression> {
+    alt((
+        list_predicate_function("all", ListPredicateKind::All),
+        list_predicate_function("any", ListPredicateKind::Any),
+        list_predicate_function("none", ListPredicateKind::None),
+        list_predicate_function("single", ListPredicateKind::Single),
+        is_empty_function,
+        exists_function,
     ))(input)
 }
 
@@ -683,6 +777,118 @@ fn sum_function(input: &str) -> IResult<AggregateExpression> {
             target: Some(field),
             percentile: None,
         },
+    ))
+}
+
+fn list_predicate_function<'a>(
+    keyword: &'static str,
+    kind: ListPredicateKind,
+) -> impl FnMut(&'a str) -> IResult<'a, FunctionExpression> {
+    move |input| {
+        let (input, _) = ws(tag_no_case(keyword))(input)?;
+        let (input, _) = ws(char('('))(input)?;
+        let (input, variable) = ws(identifier)(input)?;
+        let (input, _) = ws(tag_no_case("IN"))(input)?;
+        let (input, list) = list_expression(input)?;
+        let (input, _) = ws(tag_no_case("WHERE"))(input)?;
+        let (input, predicate) = list_predicate_expr(variable)(input)?;
+        let (input, _) = ws(char(')'))(input)?;
+        Ok((
+            input,
+            FunctionExpression::ListPredicate(ListPredicateFunction {
+                kind,
+                variable: variable.to_string(),
+                list,
+                predicate,
+            }),
+        ))
+    }
+}
+
+fn list_expression(input: &str) -> IResult<ListExpression> {
+    if let Ok((rest, field)) = field_reference(input) {
+        return Ok((rest, ListExpression::Field(field)));
+    }
+    let (rest, literal) = ws(value_literal)(input)?;
+    Ok((rest, ListExpression::Literal(literal)))
+}
+
+fn list_predicate_expr<'a>(variable: &'a str) -> impl FnMut(&'a str) -> IResult<'a, ListPredicate> {
+    move |input| {
+        let (input, ident) = ws(identifier)(input)?;
+        if ident != variable {
+            return Err(nom::Err::Failure(VerboseError {
+                errors: vec![(
+                    input,
+                    VerboseErrorKind::Context("predicate variable mismatch"),
+                )],
+            }));
+        }
+
+        if let Ok((input, _)) = ws(tag_no_case("IS"))(input) {
+            let (input, not_kw) = opt(ws(tag_no_case("NOT")))(input)?;
+            let (input, _) = ws(tag_no_case("NULL"))(input)?;
+            return Ok((
+                input,
+                ListPredicate::IsNull {
+                    negated: not_kw.is_some(),
+                },
+            ));
+        }
+
+        let (input, operator) = comparison_operator(input)?;
+        let (input, value) = ws(value_literal)(input)?;
+        Ok((input, ListPredicate::Comparison { operator, value }))
+    }
+}
+
+fn value_operand(input: &str) -> IResult<ValueOperand> {
+    if let Ok((rest, field)) = field_reference(input) {
+        return Ok((rest, ValueOperand::Field(field)));
+    }
+    let (rest, literal) = ws(literal_value)(input)?;
+    Ok((rest, ValueOperand::Literal(literal)))
+}
+
+fn literal_expression(input: &str) -> IResult<Expression> {
+    let (input, value) = ws(literal_value)(input)?;
+    Ok((input, Expression::Literal(value)))
+}
+
+fn literal_value(input: &str) -> IResult<Value> {
+    alt((
+        string_literal,
+        array_literal,
+        bool_literal,
+        null_literal,
+        number_literal,
+    ))(input)
+}
+
+fn is_empty_function(input: &str) -> IResult<FunctionExpression> {
+    let (input, _) = ws(tag_no_case("isEmpty"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, operand) = value_operand(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((input, FunctionExpression::IsEmpty(operand)))
+}
+
+fn exists_function(input: &str) -> IResult<FunctionExpression> {
+    let (input, _) = ws(tag_no_case("exists"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, left) = ws(node_pattern)(input)?;
+    let (input, relationship) = ws(parse_relationship_pattern)(input)?;
+    let (input, right) = ws(node_pattern)(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        FunctionExpression::Exists(ExistsFunction {
+            pattern: RelationshipMatch {
+                left,
+                relationship,
+                right,
+            },
+        }),
     ))
 }
 

@@ -5,10 +5,12 @@ use std::sync::Arc;
 use common::attr::{AttributeContainer, AttributeValue};
 use graphdb_core::query::{
     AggregateExpression, AggregateFunction, ComparisonOperator, CreatePattern, CreateRelationship,
-    Expression, FieldReference, GraphDbProcedure, MatchPattern, NodePattern, PathFilter,
-    PathLength, PathMatchQuery, PathQueryMode, PathReturn, Procedure, Projection, Properties,
-    Query, RelationshipDirection, RelationshipMatch, RelationshipPattern, SelectMatchClause,
-    SelectQuery, Value, WithClause, parse_queries,
+    ExistsFunction, Expression, FieldReference, FunctionExpression, GraphDbProcedure,
+    ListExpression, ListPredicate, ListPredicateFunction, ListPredicateKind, MatchPattern,
+    NodePattern, PathFilter, PathLength, PathMatchQuery, PathQueryMode, PathReturn,
+    PredicateFilter, Procedure, Projection, Properties, Query, RelationshipDirection,
+    RelationshipMatch, RelationshipPattern, SelectMatchClause, SelectQuery, Value, ValueOperand,
+    WithClause, parse_queries,
 };
 use graphdb_core::{
     AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
@@ -208,6 +210,10 @@ fn execute_select<B: StorageBackend>(
         }
     }
 
+    if !query.predicates.is_empty() {
+        rows = apply_predicates(db, rows, &query.predicates)?;
+    }
+
     if rows.is_empty() {
         ctx.result_rows.clear();
         ctx.selected_nodes.clear();
@@ -216,7 +222,7 @@ fn execute_select<B: StorageBackend>(
     }
 
     if let Some(with_clause) = query.with.as_ref() {
-        rows = apply_with_clause(rows, with_clause)?;
+        rows = apply_with_clause(db, rows, with_clause)?;
     }
 
     let has_aggregate = query
@@ -226,11 +232,11 @@ fn execute_select<B: StorageBackend>(
     let has_non_aggregate = query
         .returns
         .iter()
-        .any(|projection| matches!(projection.expression, Expression::Field(_)));
+        .any(|projection| !matches!(projection.expression, Expression::Aggregate(_)));
 
     if has_aggregate {
         if has_non_aggregate {
-            ctx.result_rows = grouped_projection(&rows, &query.returns)?;
+            ctx.result_rows = grouped_projection(db, &rows, &query.returns)?;
             ctx.selected_nodes.clear();
         } else {
             let row = evaluate_aggregates(&rows, &query.returns)?;
@@ -238,7 +244,7 @@ fn execute_select<B: StorageBackend>(
             ctx.selected_nodes.clear();
         }
     } else {
-        ctx.result_rows = project_rows(&rows, &query.returns)?;
+        ctx.result_rows = project_rows(db, &rows, &query.returns)?;
         if query.returns.len() == 1 {
             if let Expression::Field(field) = &query.returns[0].expression {
                 if field.property.is_none() {
@@ -296,7 +302,7 @@ fn build_logical_plan(query: &SelectQuery) -> LogicalPlan {
         clauses: planned,
         total_clauses: clauses.len(),
         optional_clauses: clauses.iter().filter(|c| c.optional).count(),
-        filter_count: query.conditions.len(),
+        filter_count: query.conditions.len() + query.predicates.len(),
         has_with_clause: query.with.is_some(),
         return_count: query.returns.len(),
     };
@@ -376,7 +382,8 @@ fn apply_match_clause<B: StorageBackend>(
     Ok(result)
 }
 
-fn apply_with_clause(
+fn apply_with_clause<B: StorageBackend>(
+    db: &Database<B>,
     rows: Vec<QueryRow>,
     clause: &WithClause,
 ) -> Result<Vec<QueryRow>, DaemonError> {
@@ -384,20 +391,22 @@ fn apply_with_clause(
     for row in rows {
         let mut next = QueryRow::default();
         for projection in &clause.projections {
+            let label = projection_label(projection);
             match &projection.expression {
-                Expression::Field(field) => {
-                    let label = projection
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| field_label(field));
-                    match resolve_field(&row, field)? {
-                        FieldValue::Node(node) => {
-                            next.nodes.insert(label, Some(node));
-                        }
-                        FieldValue::Scalar(value) => {
-                            next.scalars.insert(label, value);
-                        }
+                Expression::Field(field) => match resolve_field(&row, field)? {
+                    FieldValue::Node(node) => {
+                        next.nodes.insert(label, Some(node));
                     }
+                    FieldValue::Scalar(value) => {
+                        next.scalars.insert(label, value);
+                    }
+                },
+                Expression::Function(func) => {
+                    let value = evaluate_function(db, &row, func)?;
+                    next.scalars.insert(label, value);
+                }
+                Expression::Literal(value) => {
+                    next.scalars.insert(label, value.clone());
                 }
                 Expression::Aggregate(_) => {
                     return Err(DaemonError::Query(
@@ -409,6 +418,49 @@ fn apply_with_clause(
         results.push(next);
     }
     Ok(results)
+}
+
+fn apply_predicates<B: StorageBackend>(
+    db: &Database<B>,
+    rows: Vec<QueryRow>,
+    predicates: &[PredicateFilter],
+) -> Result<Vec<QueryRow>, DaemonError> {
+    if predicates.is_empty() {
+        return Ok(rows);
+    }
+
+    let mut filtered = Vec::new();
+    'rows: for row in rows {
+        for predicate in predicates {
+            let mut value = evaluate_function(db, &row, &predicate.function)?;
+            if predicate.negated {
+                value = match value {
+                    Value::Boolean(flag) => Value::Boolean(!flag),
+                    Value::Null => Value::Null,
+                    other => {
+                        return Err(DaemonError::Query(format!(
+                            "predicate returned non-boolean value: {:?}",
+                            other
+                        )));
+                    }
+                };
+            }
+
+            match value {
+                Value::Boolean(true) => {}
+                Value::Boolean(false) | Value::Null => continue 'rows,
+                other => {
+                    return Err(DaemonError::Query(format!(
+                        "predicate returned non-boolean value: {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        filtered.push(row);
+    }
+
+    Ok(filtered)
 }
 
 fn select_nodes<B: StorageBackend>(
@@ -548,7 +600,8 @@ fn insert_edge<B: StorageBackend>(
     Ok(edge_id)
 }
 
-fn project_rows(
+fn project_rows<B: StorageBackend>(
+    db: &Database<B>,
     rows: &[QueryRow],
     projections: &[Projection],
 ) -> Result<Vec<JsonValue>, DaemonError> {
@@ -558,6 +611,8 @@ fn project_rows(
         for projection in projections {
             let value = match &projection.expression {
                 Expression::Field(field) => resolve_field(row, field)?,
+                Expression::Function(func) => FieldValue::Scalar(evaluate_function(db, row, func)?),
+                Expression::Literal(value) => FieldValue::Scalar(value.clone()),
                 Expression::Aggregate(_) => {
                     return Err(DaemonError::Query(
                         "unexpected aggregate in projection".into(),
@@ -585,7 +640,7 @@ fn evaluate_aggregates(
     for projection in projections {
         let agg = match &projection.expression {
             Expression::Aggregate(expr) => expr,
-            Expression::Field(_) => {
+            Expression::Field(_) | Expression::Function(_) | Expression::Literal(_) => {
                 return Err(DaemonError::Query(
                     "non-aggregate projection encountered in aggregate evaluation".into(),
                 ));
@@ -597,7 +652,8 @@ fn evaluate_aggregates(
     Ok(JsonValue::Object(map))
 }
 
-fn grouped_projection(
+fn grouped_projection<B: StorageBackend>(
+    db: &Database<B>,
     rows: &[QueryRow],
     projections: &[Projection],
 ) -> Result<Vec<JsonValue>, DaemonError> {
@@ -605,7 +661,9 @@ fn grouped_projection(
     let mut aggregate_fields = Vec::new();
     for projection in projections {
         match projection.expression {
-            Expression::Field(_) => group_fields.push(projection),
+            Expression::Field(_) | Expression::Function(_) | Expression::Literal(_) => {
+                group_fields.push(projection)
+            }
             Expression::Aggregate(_) => aggregate_fields.push(projection),
         }
     }
@@ -626,6 +684,8 @@ fn grouped_projection(
                     let field_value = resolve_field(row, field)?;
                     field_value_to_scalar(field_value)?
                 }
+                Expression::Function(func) => evaluate_function(db, row, func)?,
+                Expression::Literal(value) => value.clone(),
                 Expression::Aggregate(_) => unreachable!(),
             };
             key_components.push(value_to_json(&value));
@@ -646,7 +706,7 @@ fn grouped_projection(
         for projection in projections {
             let label = projection_label(projection);
             match &projection.expression {
-                Expression::Field(_) => {
+                Expression::Field(_) | Expression::Function(_) | Expression::Literal(_) => {
                     let value = state
                         .key_values
                         .get(&label)
@@ -674,6 +734,8 @@ fn projection_label(projection: &Projection) -> String {
     match &projection.expression {
         Expression::Field(field) => field_label(field),
         Expression::Aggregate(agg) => aggregate_label(agg),
+        Expression::Function(func) => function_label(func),
+        Expression::Literal(value) => literal_label(value),
     }
 }
 
@@ -712,6 +774,169 @@ fn aggregate_label(expr: &AggregateExpression) -> String {
     }
 }
 
+fn function_label(func: &FunctionExpression) -> String {
+    match func {
+        FunctionExpression::ListPredicate(spec) => {
+            let func_name = match spec.kind {
+                ListPredicateKind::All => "all",
+                ListPredicateKind::Any => "any",
+                ListPredicateKind::None => "none",
+                ListPredicateKind::Single => "single",
+            };
+            format!(
+                "{}({} IN {} WHERE {})",
+                func_name,
+                spec.variable,
+                list_expression_label(&spec.list),
+                list_predicate_label(&spec.variable, &spec.predicate)
+            )
+        }
+        FunctionExpression::IsEmpty(operand) => {
+            format!("isEmpty({})", value_operand_label(operand))
+        }
+        FunctionExpression::Exists(spec) => {
+            format!("exists({})", exists_pattern_label(&spec.pattern))
+        }
+    }
+}
+
+fn literal_label(value: &Value) -> String {
+    value_to_json(value).to_string()
+}
+
+fn list_expression_label(expr: &ListExpression) -> String {
+    match expr {
+        ListExpression::Field(field) => field_label(field),
+        ListExpression::Literal(value) => value_to_json(value).to_string(),
+    }
+}
+
+fn value_operand_label(operand: &ValueOperand) -> String {
+    match operand {
+        ValueOperand::Field(field) => field_label(field),
+        ValueOperand::Literal(value) => value_to_json(value).to_string(),
+    }
+}
+
+fn list_predicate_label(variable: &str, predicate: &ListPredicate) -> String {
+    match predicate {
+        ListPredicate::Comparison { operator, value } => format!(
+            "{} {} {}",
+            variable,
+            operator_symbol(operator),
+            value_to_json(value)
+        ),
+        ListPredicate::IsNull { negated } => {
+            if *negated {
+                format!("{} IS NOT NULL", variable)
+            } else {
+                format!("{} IS NULL", variable)
+            }
+        }
+    }
+}
+
+fn operator_symbol(op: &ComparisonOperator) -> &'static str {
+    match op {
+        ComparisonOperator::Equals => "=",
+        ComparisonOperator::NotEquals => "<>",
+        ComparisonOperator::GreaterThan => ">",
+        ComparisonOperator::GreaterThanOrEqual => ">=",
+        ComparisonOperator::LessThan => "<",
+        ComparisonOperator::LessThanOrEqual => "<=",
+        ComparisonOperator::IsNull => "IS",
+        ComparisonOperator::IsNotNull => "IS NOT",
+    }
+}
+
+fn exists_pattern_label(pattern: &RelationshipMatch) -> String {
+    format!(
+        "{}{}{}",
+        node_pattern_label(&pattern.left),
+        relationship_pattern_label(&pattern.relationship),
+        node_pattern_label(&pattern.right)
+    )
+}
+
+fn node_pattern_label(node: &NodePattern) -> String {
+    let mut parts = String::from("(");
+    if let Some(alias) = &node.alias {
+        parts.push_str(alias);
+    }
+    if let Some(label) = &node.label {
+        parts.push(':');
+        parts.push_str(label);
+    }
+    if !node.properties.0.is_empty() {
+        if node.alias.is_some() || node.label.is_some() {
+            parts.push(' ');
+        }
+        parts.push_str(&properties_label(&node.properties));
+    }
+    parts.push(')');
+    parts
+}
+
+fn relationship_pattern_label(pattern: &RelationshipPattern) -> String {
+    let mut inner = String::new();
+    if let Some(alias) = &pattern.alias {
+        inner.push_str(alias);
+    }
+    if let Some(label) = &pattern.label {
+        if !inner.is_empty() {
+            inner.push(':');
+        } else {
+            inner.push(':');
+        }
+        inner.push_str(label);
+    }
+    if !pattern.properties.0.is_empty() {
+        if !inner.is_empty() {
+            inner.push(' ');
+        }
+        inner.push_str(&properties_label(&pattern.properties));
+    }
+    let length = path_length_label(&pattern.length);
+    if !length.is_empty() {
+        if !inner.is_empty() {
+            inner.push_str(&length);
+        } else {
+            inner.push_str(&length);
+        }
+    }
+
+    match pattern.direction {
+        RelationshipDirection::Outbound => format!("-[{}]->", inner),
+        RelationshipDirection::Inbound => format!("<-[{}]-", inner),
+        RelationshipDirection::Undirected => format!("-[{}]-", inner),
+    }
+}
+
+fn path_length_label(length: &PathLength) -> String {
+    match length {
+        PathLength::Exact(1) => String::new(),
+        PathLength::Exact(n) => format!("*{n}"),
+        PathLength::Range { min, max } => match max {
+            Some(value) => format!("*{min}..{value}"),
+            None => format!("*{min}.."),
+        },
+    }
+}
+
+fn properties_label(props: &Properties) -> String {
+    if props.0.is_empty() {
+        return String::new();
+    }
+    let mut entries: Vec<_> = props.0.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let body = entries
+        .into_iter()
+        .map(|(key, value)| format!("{}: {}", key, value_to_json(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{}}}", body)
+}
+
 fn resolve_field(row: &QueryRow, field: &FieldReference) -> Result<FieldValue, DaemonError> {
     if let Some(value) = row.scalars.get(&field.alias) {
         if field.property.is_some() {
@@ -747,6 +972,231 @@ fn field_value_to_scalar(value: FieldValue) -> Result<Value, DaemonError> {
         FieldValue::Node(_) => Err(DaemonError::Query(
             "grouping by node aliases is not supported".into(),
         )),
+    }
+}
+
+fn evaluate_function<B: StorageBackend>(
+    db: &Database<B>,
+    row: &QueryRow,
+    func: &FunctionExpression,
+) -> Result<Value, DaemonError> {
+    match func {
+        FunctionExpression::ListPredicate(spec) => evaluate_list_predicate_function(row, spec),
+        FunctionExpression::IsEmpty(operand) => {
+            let value = value_operand_value(row, operand)?;
+            match value {
+                Value::Null => Ok(Value::Null),
+                Value::String(s) => Ok(Value::Boolean(s.is_empty())),
+                Value::List(values) => Ok(Value::Boolean(values.is_empty())),
+                _ => Err(DaemonError::Query(
+                    "isEmpty expects STRING or LIST input".into(),
+                )),
+            }
+        }
+        FunctionExpression::Exists(spec) => evaluate_exists_function(db, row, spec),
+    }
+}
+
+fn evaluate_list_predicate_function(
+    row: &QueryRow,
+    spec: &ListPredicateFunction,
+) -> Result<Value, DaemonError> {
+    let list_value = list_expression_value(row, &spec.list)?;
+    match list_value {
+        Value::Null => Ok(Value::Null),
+        Value::List(items) => match spec.kind {
+            ListPredicateKind::All => {
+                let mut saw_null = false;
+                for item in items.iter() {
+                    match evaluate_list_predicate(item, &spec.predicate)? {
+                        Some(true) => {}
+                        Some(false) => return Ok(Value::Boolean(false)),
+                        None => saw_null = true,
+                    }
+                }
+                if saw_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Boolean(true))
+                }
+            }
+            ListPredicateKind::Any => {
+                let mut saw_null = false;
+                for item in items.iter() {
+                    match evaluate_list_predicate(item, &spec.predicate)? {
+                        Some(true) => return Ok(Value::Boolean(true)),
+                        Some(false) => {}
+                        None => saw_null = true,
+                    }
+                }
+                if saw_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Boolean(false))
+                }
+            }
+            ListPredicateKind::None => {
+                let mut saw_null = false;
+                for item in items.iter() {
+                    match evaluate_list_predicate(item, &spec.predicate)? {
+                        Some(true) => return Ok(Value::Boolean(false)),
+                        Some(false) => {}
+                        None => saw_null = true,
+                    }
+                }
+                if saw_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Boolean(true))
+                }
+            }
+            ListPredicateKind::Single => {
+                let mut true_count = 0;
+                let mut saw_null_without_true = false;
+                for item in items.iter() {
+                    match evaluate_list_predicate(item, &spec.predicate)? {
+                        Some(true) => {
+                            true_count += 1;
+                            if true_count > 1 {
+                                return Ok(Value::Boolean(false));
+                            }
+                        }
+                        Some(false) => {}
+                        None => {
+                            if true_count == 0 {
+                                saw_null_without_true = true;
+                            }
+                        }
+                    }
+                }
+                if true_count == 1 {
+                    Ok(Value::Boolean(true))
+                } else if true_count == 0 {
+                    if saw_null_without_true {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Boolean(false))
+                    }
+                } else {
+                    Ok(Value::Boolean(false))
+                }
+            }
+        },
+        other => Err(DaemonError::Query(format!(
+            "{} expects LIST input, received {other:?}",
+            match spec.kind {
+                ListPredicateKind::All => "all",
+                ListPredicateKind::Any => "any",
+                ListPredicateKind::None => "none",
+                ListPredicateKind::Single => "single",
+            }
+        ))),
+    }
+}
+
+fn list_expression_value(row: &QueryRow, expr: &ListExpression) -> Result<Value, DaemonError> {
+    match expr {
+        ListExpression::Field(field) => {
+            let value = resolve_field(row, field)?;
+            field_value_to_scalar(value)
+        }
+        ListExpression::Literal(value) => Ok(value.clone()),
+    }
+}
+
+fn value_operand_value(row: &QueryRow, operand: &ValueOperand) -> Result<Value, DaemonError> {
+    match operand {
+        ValueOperand::Field(field) => {
+            let value = resolve_field(row, field)?;
+            field_value_to_scalar(value)
+        }
+        ValueOperand::Literal(value) => Ok(value.clone()),
+    }
+}
+
+fn evaluate_list_predicate(
+    item: &Value,
+    predicate: &ListPredicate,
+) -> Result<Option<bool>, DaemonError> {
+    match predicate {
+        ListPredicate::Comparison { operator, value } => match operator {
+            ComparisonOperator::Equals => {
+                if matches!(item, Value::Null) || matches!(value, Value::Null) {
+                    Ok(None)
+                } else {
+                    Ok(Some(values_equal(item, value)))
+                }
+            }
+            ComparisonOperator::NotEquals => {
+                if matches!(item, Value::Null) || matches!(value, Value::Null) {
+                    Ok(None)
+                } else {
+                    Ok(Some(!values_equal(item, value)))
+                }
+            }
+            ComparisonOperator::GreaterThan
+            | ComparisonOperator::GreaterThanOrEqual
+            | ComparisonOperator::LessThan
+            | ComparisonOperator::LessThanOrEqual => {
+                if let Some(ordering) = compare_query_values(item, value) {
+                    let result = match operator {
+                        ComparisonOperator::GreaterThan => ordering == Ordering::Greater,
+                        ComparisonOperator::GreaterThanOrEqual => {
+                            ordering == Ordering::Greater || ordering == Ordering::Equal
+                        }
+                        ComparisonOperator::LessThan => ordering == Ordering::Less,
+                        ComparisonOperator::LessThanOrEqual => {
+                            ordering == Ordering::Less || ordering == Ordering::Equal
+                        }
+                        _ => false,
+                    };
+                    Ok(Some(result))
+                } else {
+                    Ok(None)
+                }
+            }
+            ComparisonOperator::IsNull => Ok(Some(matches!(item, Value::Null))),
+            ComparisonOperator::IsNotNull => Ok(Some(!matches!(item, Value::Null))),
+        },
+        ListPredicate::IsNull { negated } => {
+            let is_null = matches!(item, Value::Null);
+            Ok(Some(if *negated { !is_null } else { is_null }))
+        }
+    }
+}
+
+fn evaluate_exists_function<B: StorageBackend>(
+    db: &Database<B>,
+    row: &QueryRow,
+    func: &ExistsFunction,
+) -> Result<Value, DaemonError> {
+    let alias = func
+        .pattern
+        .left
+        .alias
+        .as_ref()
+        .ok_or_else(|| DaemonError::Query("exists() requires a start alias".into()))?;
+
+    match row.nodes.get(alias.as_str()) {
+        Some(Some(node)) => {
+            let node_arc = Arc::new(node.clone());
+            if !node_matches_pattern(&node_arc, &func.pattern.left) {
+                return Ok(Value::Boolean(false));
+            }
+            let reachable = reachable_nodes_from(
+                db,
+                node,
+                &func.pattern.relationship,
+                &func.pattern.right,
+                &[],
+            )?;
+            Ok(Value::Boolean(!reachable.is_empty()))
+        }
+        Some(None) => Ok(Value::Null),
+        None => Err(DaemonError::Query(format!(
+            "alias '{}' not bound in exists()",
+            alias
+        ))),
     }
 }
 
@@ -2392,5 +2842,166 @@ mod query_tests {
                 RETURN start, end, length(p);"#,
         );
         assert!(report.path_pairs.iter().all(|pair| pair.length >= 1));
+    }
+}
+
+#[cfg(test)]
+mod predicate_tests {
+    use super::JsonValue;
+    use super::*;
+
+    fn bool_value(row: &JsonValue, key: &str) -> Option<bool> {
+        row.as_object()?.get(key)?.as_bool()
+    }
+
+    #[test]
+    fn list_predicate_functions_handle_empty_lists() {
+        let db = Database::new(InMemoryBackend::new());
+        let report = execute_script_for_test(
+            &db,
+            r#"
+INSERT NODE (n:Sample { id: 1, values: [] });
+SELECT MATCH (n:Sample { id: 1 })
+RETURN
+    all(x IN n.values WHERE x > 0) AS all_true,
+    any(x IN n.values WHERE x > 0) AS any_true,
+    none(x IN n.values WHERE x > 0) AS none_true,
+    single(x IN n.values WHERE x > 0) AS single_true;
+"#,
+        );
+
+        let row = report.result_rows.first().expect("result row");
+        assert_eq!(bool_value(row, "all_true"), Some(true));
+        assert_eq!(bool_value(row, "any_true"), Some(false));
+        assert_eq!(bool_value(row, "none_true"), Some(true));
+        assert_eq!(bool_value(row, "single_true"), Some(false));
+    }
+
+    #[test]
+    fn list_predicate_functions_handle_nulls() {
+        let db = Database::new(InMemoryBackend::new());
+        let report = execute_script_for_test(
+            &db,
+            r#"
+INSERT NODE (n:Sample { id: 2, values: [null] });
+SELECT MATCH (n:Sample { id: 2 })
+RETURN
+    any(x IN n.values WHERE x > 0) AS any_null,
+    single(x IN n.values WHERE x > 0) AS single_null;
+"#,
+        );
+        let row = report.result_rows.first().expect("result row");
+        assert!(
+            row.as_object()
+                .and_then(|map| map.get("any_null"))
+                .map(|val| val.is_null())
+                .unwrap_or(false)
+        );
+        assert!(
+            row.as_object()
+                .and_then(|map| map.get("single_null"))
+                .map(|val| val.is_null())
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn is_empty_filters_results() {
+        let db = Database::new(InMemoryBackend::new());
+        let report = execute_script_for_test(
+            &db,
+            r#"
+INSERT NODE (:Person { id: 1, name: "Ada", nicknames: [] });
+INSERT NODE (:Person { id: 2, name: "Bob", nicknames: ["Bobby"] });
+INSERT NODE (:Person { id: 3, name: "Cara" });
+SELECT MATCH (p:Person)
+WHERE p.nicknames IS NOT NULL AND NOT isEmpty(p.nicknames)
+RETURN p.name AS name;
+"#,
+        );
+        let names: Vec<_> = report
+            .result_rows
+            .iter()
+            .filter_map(|row| {
+                row.get("name")
+                    .and_then(|val| val.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert_eq!(names, vec!["Bob".to_string()]);
+    }
+
+    #[test]
+    fn exists_function_detects_relationships() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"
+SELECT MATCH (p:Person)
+RETURN p.name AS name, exists((p)-[:KNOWS]->()) AS has_knows;
+"#,
+        );
+
+        let mut seen = HashMap::new();
+        for row in &report.result_rows {
+            if let (Some(name), Some(flag)) = (
+                row.get("name").and_then(|val| val.as_str()),
+                row.get("has_knows").and_then(|val| val.as_bool()),
+            ) {
+                seen.insert(name.to_string(), flag);
+            }
+        }
+
+        assert_eq!(seen.get("Meg Ryan"), Some(&true));
+        assert_eq!(seen.get("Tom Hanks"), Some(&true));
+        assert_eq!(seen.get("Kevin Bacon"), Some(&true));
+        assert_eq!(seen.get("Carrie Fisher"), Some(&false));
+    }
+
+    #[test]
+    fn exists_function_filters_rows() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"
+SELECT MATCH (p:Person)
+WHERE exists((p)-[:KNOWS]->())
+RETURN p.name AS name;
+"#,
+        );
+        let mut names: Vec<_> = report
+            .result_rows
+            .iter()
+            .filter_map(|row| {
+                row.get("name")
+                    .and_then(|val| val.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Kevin Bacon", "Meg Ryan", "Tom Hanks"]);
+    }
+
+    #[test]
+    fn with_clause_accepts_literal_lists() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"
+SELECT MATCH (p:Person { name: "Meg Ryan" })
+WITH [] AS xs
+RETURN all(x IN xs WHERE x > 0) AS all_true;
+"#,
+        );
+        let value = report
+            .result_rows
+            .first()
+            .and_then(|row| row.get("all_true"))
+            .and_then(|val| val.as_bool())
+            .expect("boolean result");
+        assert!(value);
     }
 }
