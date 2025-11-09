@@ -837,6 +837,38 @@ fn function_label(func: &FunctionExpression) -> String {
 
 fn scalar_function_label(func: &ScalarFunction) -> String {
     match func {
+        ScalarFunction::Keys(expr) => format!("keys({})", expression_label(expr)),
+        ScalarFunction::Labels(expr) => format!("labels({})", expression_label(expr)),
+        ScalarFunction::Range { start, end, step } => {
+            if let Some(step_expr) = step {
+                format!(
+                    "range({},{},{})",
+                    expression_label(start),
+                    expression_label(end),
+                    expression_label(step_expr)
+                )
+            } else {
+                format!(
+                    "range({},{})",
+                    expression_label(start),
+                    expression_label(end)
+                )
+            }
+        }
+        ScalarFunction::Reverse(expr) => format!("reverse({})", expression_label(expr)),
+        ScalarFunction::Tail(expr) => format!("tail({})", expression_label(expr)),
+        ScalarFunction::ToBooleanList(expr) => {
+            format!("toBooleanList({})", expression_label(expr))
+        }
+        ScalarFunction::ToFloatList(expr) => {
+            format!("toFloatList({})", expression_label(expr))
+        }
+        ScalarFunction::ToIntegerList(expr) => {
+            format!("toIntegerList({})", expression_label(expr))
+        }
+        ScalarFunction::ToStringList(expr) => {
+            format!("toStringList({})", expression_label(expr))
+        }
         ScalarFunction::Coalesce(args) => {
             let inner = args
                 .iter()
@@ -1256,6 +1288,68 @@ fn convert_to_integer(value: Value, null_on_unsupported: bool) -> Result<Value, 
         }
     })
 }
+
+fn convert_to_string(value: Value, null_on_unsupported: bool) -> Result<Value, DaemonError> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        Value::String(s) => Value::String(s),
+        Value::Integer(i) => Value::String(i.to_string()),
+        Value::Float(f) => Value::String(f.to_string()),
+        Value::Boolean(b) => Value::String(b.to_string()),
+        other => {
+            if null_on_unsupported {
+                Value::Null
+            } else {
+                return Err(DaemonError::Query(format!(
+                    "toStringList() does not support value {:?}",
+                    other
+                )));
+            }
+        }
+    })
+}
+
+fn scalar_to_integer(value: Value, context: &str) -> Result<Option<i64>, DaemonError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Integer(i) => Ok(Some(i)),
+        Value::Float(f) => Ok(Some(f as i64)),
+        Value::Boolean(true) => Ok(Some(1)),
+        Value::Boolean(false) => Ok(Some(0)),
+        other => Err(DaemonError::Query(format!(
+            "{} expects integer input, received {:?}",
+            context, other
+        ))),
+    }
+}
+
+fn list_conversion_function<B, F>(
+    db: &Database<B>,
+    row: &QueryRow,
+    expr: &Expression,
+    query_timestamp: i64,
+    mapper: F,
+) -> Result<FieldValue, DaemonError>
+where
+    B: StorageBackend,
+    F: Fn(Value) -> Result<Value, DaemonError>,
+{
+    let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
+    match value {
+        Value::Null => Ok(FieldValue::Scalar(Value::Null)),
+        Value::List(values) => {
+            let mut mapped = Vec::with_capacity(values.len());
+            for item in values {
+                mapped.push(mapper(item)?);
+            }
+            Ok(FieldValue::Scalar(Value::List(mapped)))
+        }
+        other => Err(DaemonError::Query(format!(
+            "function expects LIST input, received {:?}",
+            other
+        ))),
+    }
+}
 fn evaluate_scalar_function<B: StorageBackend>(
     db: &Database<B>,
     row: &QueryRow,
@@ -1271,6 +1365,144 @@ fn evaluate_scalar_function<B: StorageBackend>(
                 }
             }
             Ok(FieldValue::Scalar(Value::Null))
+        }
+        ScalarFunction::Keys(expr) => {
+            let value = evaluate_expression(db, row, expr, query_timestamp)?;
+            let keys = match value {
+                FieldValue::Node(node) => collect_sorted_keys(node.attributes().keys().cloned()),
+                FieldValue::Relationship(edge) => {
+                    collect_sorted_keys(edge.attributes().keys().cloned())
+                }
+                FieldValue::Scalar(Value::Map(map)) => collect_sorted_keys(map.keys().cloned()),
+                FieldValue::Scalar(Value::Null) => return Ok(FieldValue::Scalar(Value::Null)),
+                _ => {
+                    return Err(DaemonError::Query(
+                        "keys() expects node, relationship, or map input".into(),
+                    ));
+                }
+            };
+            Ok(FieldValue::Scalar(keys))
+        }
+        ScalarFunction::Labels(expr) => {
+            let value = evaluate_expression(db, row, expr, query_timestamp)?;
+            match value {
+                FieldValue::Node(node) => {
+                    let mut labels = node.labels().to_vec();
+                    labels.sort();
+                    let values = labels.into_iter().map(Value::String).collect::<Vec<_>>();
+                    Ok(FieldValue::Scalar(Value::List(values)))
+                }
+                FieldValue::Scalar(Value::Null) => Ok(FieldValue::Scalar(Value::Null)),
+                _ => Err(DaemonError::Query("labels() expects a node".into())),
+            }
+        }
+        ScalarFunction::Range { start, end, step } => {
+            let start_value = evaluate_expression_to_scalar(db, row, start, query_timestamp)?;
+            let end_value = evaluate_expression_to_scalar(db, row, end, query_timestamp)?;
+            let step_value = match step {
+                Some(expr) => Some(evaluate_expression_to_scalar(
+                    db,
+                    row,
+                    expr,
+                    query_timestamp,
+                )?),
+                None => None,
+            };
+
+            let start = match scalar_to_integer(start_value, "range start")? {
+                Some(value) => value,
+                None => return Ok(FieldValue::Scalar(Value::Null)),
+            };
+            let end = match scalar_to_integer(end_value, "range end")? {
+                Some(value) => value,
+                None => return Ok(FieldValue::Scalar(Value::Null)),
+            };
+            let step = match step_value {
+                Some(value) => match scalar_to_integer(value, "range step")? {
+                    Some(v) => v,
+                    None => return Ok(FieldValue::Scalar(Value::Null)),
+                },
+                None => 1,
+            };
+            if step == 0 {
+                return Err(DaemonError::Query("range() step cannot be 0".into()));
+            }
+            let ascending = start <= end;
+            if (ascending && step < 0) || (!ascending && step > 0) {
+                return Ok(FieldValue::Scalar(Value::List(Vec::new())));
+            }
+            let mut values = Vec::new();
+            let mut current = start;
+            if step > 0 {
+                while current <= end {
+                    values.push(Value::Integer(current));
+                    current = match current.checked_add(step) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            } else {
+                while current >= end {
+                    values.push(Value::Integer(current));
+                    current = match current.checked_add(step) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            }
+            Ok(FieldValue::Scalar(Value::List(values)))
+        }
+        ScalarFunction::Reverse(expr) => {
+            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
+            match value {
+                Value::Null => Ok(FieldValue::Scalar(Value::Null)),
+                Value::List(mut values) => {
+                    values.reverse();
+                    Ok(FieldValue::Scalar(Value::List(values)))
+                }
+                other => Err(DaemonError::Query(format!(
+                    "reverse() expects LIST input, received {:?}",
+                    other
+                ))),
+            }
+        }
+        ScalarFunction::Tail(expr) => {
+            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
+            match value {
+                Value::Null => Ok(FieldValue::Scalar(Value::Null)),
+                Value::List(values) => {
+                    let tail = if values.is_empty() {
+                        Vec::new()
+                    } else {
+                        values.into_iter().skip(1).collect()
+                    };
+                    Ok(FieldValue::Scalar(Value::List(tail)))
+                }
+                other => Err(DaemonError::Query(format!(
+                    "tail() expects LIST input, received {:?}",
+                    other
+                ))),
+            }
+        }
+        ScalarFunction::ToBooleanList(expr) => {
+            list_conversion_function(db, row, expr, query_timestamp, |value| {
+                convert_to_boolean(value, true)
+            })
+        }
+        ScalarFunction::ToFloatList(expr) => {
+            list_conversion_function(db, row, expr, query_timestamp, |value| {
+                convert_to_float(value, true)
+            })
+        }
+        ScalarFunction::ToIntegerList(expr) => {
+            list_conversion_function(db, row, expr, query_timestamp, |value| {
+                convert_to_integer(value, true)
+            })
+        }
+        ScalarFunction::ToStringList(expr) => {
+            list_conversion_function(db, row, expr, query_timestamp, |value| {
+                convert_to_string(value, true)
+            })
         }
         ScalarFunction::StartNode(field) => {
             let relationship = resolve_relationship_from_field(row, field)?;
@@ -2688,6 +2920,15 @@ fn current_timestamp_millis() -> i64 {
         .unwrap_or(0)
 }
 
+fn collect_sorted_keys<I>(iter: I) -> Value
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut keys: Vec<String> = iter.into_iter().collect();
+    keys.sort();
+    Value::List(keys.into_iter().map(Value::String).collect())
+}
+
 fn node_class_rows(entries: Vec<NodeClassEntry>) -> Vec<JsonValue> {
     entries
         .into_iter()
@@ -3856,5 +4097,125 @@ mod scalar_function_tests {
             .filter_map(|row| row.get("t").and_then(|v| v.as_i64()))
             .collect();
         assert!(timestamps.iter().all(|ts| *ts == timestamps[0]));
+    }
+
+    #[test]
+    fn keys_and_labels_functions() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"SELECT MATCH (a:Person {name: "Meg Ryan"})-[r:KNOWS]->(b:Person {name: "Tom Hanks"})
+            RETURN keys(a) AS nodeKeys, labels(a) AS nodeLabels, keys(r) AS relKeys;"#,
+        );
+        let row = &report.result_rows[0];
+        let node_keys = row
+            .get("nodeKeys")
+            .and_then(|v| v.as_array())
+            .expect("node keys");
+        let node_labels = row
+            .get("nodeLabels")
+            .and_then(|v| v.as_array())
+            .expect("node labels");
+        let rel_keys = row
+            .get("relKeys")
+            .and_then(|v| v.as_array())
+            .expect("rel keys");
+        assert!(node_labels.iter().any(|v| v.as_str() == Some("Person")));
+        let key_set: Vec<_> = node_keys.iter().filter_map(|v| v.as_str()).collect();
+        assert!(key_set.contains(&"name"));
+        assert!(rel_keys.iter().any(|v| v.as_str() == Some("id")));
+    }
+
+    #[test]
+    fn range_reverse_tail_functions() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            RETURN range(0,5,2) AS evens,
+                   range(3,0,-1) AS countdown,
+                   reverse(['a','b','c']) AS reversed,
+                   tail(['one','two','three']) AS tailValues;"#,
+        );
+        let row = &report.result_rows[0];
+        assert_eq!(
+            row.get("evens").and_then(|v| v.as_array()).unwrap().len(),
+            3
+        );
+        assert_eq!(
+            row.get("countdown")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .iter()
+                .map(|val| val.as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1, 0]
+        );
+        assert_eq!(
+            row.get("reversed")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .iter()
+                .map(|val| val.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["c", "b", "a"]
+        );
+        assert_eq!(
+            row.get("tailValues")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .iter()
+                .map(|val| val.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["two", "three"]
+        );
+    }
+
+    #[test]
+    fn conversion_list_functions() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            RETURN toIntegerList(['1','2','bad','4']) AS ints,
+                   toFloatList(['1.5','oops']) AS floats,
+                   toBooleanList([1,0,'true','nope']) AS bools,
+                   toStringList([1,true,null]) AS strings;"#,
+        );
+        let row = &report.result_rows[0];
+        assert_eq!(
+            row.get("ints")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .iter()
+                .map(|val| val.as_i64())
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), None, Some(4)]
+        );
+        let floats = row
+            .get("floats")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|val| val.as_f64())
+            .collect::<Vec<_>>();
+        assert_eq!(floats[0].unwrap() as i32, 1);
+        assert!(floats[1].is_none());
+        let bools = row.get("bools").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(bools[0].as_bool(), Some(true));
+        assert_eq!(bools[1].as_bool(), Some(false));
+        assert_eq!(bools[2].as_bool(), Some(true));
+        assert!(bools[3].is_null());
+        let strings = row
+            .get("strings")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|val| val.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(strings, vec![Some("1"), Some("true"), None]);
     }
 }

@@ -245,6 +245,45 @@ fn parse_scalar_functions() {
 }
 
 #[test]
+fn parse_list_scalar_functions() {
+    let input = "SELECT MATCH (p:Person) RETURN range(0,10,2) AS nums, reverse([1,2,3]) AS rev, keys(p) AS propKeys;";
+    let queries = parse_queries(input).unwrap();
+    match &queries[0] {
+        Query::Select(select) => {
+            assert_eq!(select.returns.len(), 3);
+            match &select.returns[0].expression {
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::Scalar(ScalarFunction::Range {
+                        start: _,
+                        end: _,
+                        step,
+                    }) => {
+                        assert!(step.is_some());
+                    }
+                    other => panic!("unexpected expression {other:?}"),
+                },
+                other => panic!("unexpected expression {other:?}"),
+            }
+            match &select.returns[1].expression {
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::Scalar(ScalarFunction::Reverse(_)) => {}
+                    other => panic!("unexpected expression {other:?}"),
+                },
+                other => panic!("unexpected expression {other:?}"),
+            }
+            match &select.returns[2].expression {
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::Scalar(ScalarFunction::Keys(_)) => {}
+                    other => panic!("unexpected expression {other:?}"),
+                },
+                other => panic!("unexpected expression {other:?}"),
+            }
+        }
+        other => panic!("unexpected query {other:?}"),
+    }
+}
+
+#[test]
 fn parse_create_patterns() {
     let node_input = "CREATE (:Person {name: \"Ada\"});";
     let node_queries = parse_queries(node_input).unwrap();

@@ -151,6 +151,19 @@ pub enum FunctionExpression {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarFunction {
+    Keys(Expression),
+    Labels(Expression),
+    Range {
+        start: Expression,
+        end: Expression,
+        step: Option<Expression>,
+    },
+    Reverse(Expression),
+    Tail(Expression),
+    ToBooleanList(Expression),
+    ToFloatList(Expression),
+    ToIntegerList(Expression),
+    ToStringList(Expression),
     Coalesce(Vec<Expression>),
     StartNode(FieldReference),
     EndNode(FieldReference),

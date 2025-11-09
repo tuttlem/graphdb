@@ -619,27 +619,54 @@ fn function_expression(input: &str) -> IResult<FunctionExpression> {
 fn scalar_function_expression(input: &str) -> IResult<FunctionExpression> {
     map(
         alt((
-            coalesce_function,
-            start_node_function,
-            end_node_function,
-            head_function,
-            last_function,
-            id_function,
-            properties_function,
-            random_uuid_function,
-            size_function,
-            length_function,
-            timestamp_function,
-            to_boolean_function,
-            to_boolean_or_null_function,
-            to_float_function,
-            to_float_or_null_function,
-            to_integer_function,
-            to_integer_or_null_function,
-            type_function,
+            scalar_function_group_one,
+            scalar_function_group_two,
+            scalar_function_group_three,
         )),
         FunctionExpression::Scalar,
     )(input)
+}
+
+fn scalar_function_group_one(input: &str) -> IResult<ScalarFunction> {
+    alt((
+        keys_function,
+        labels_function,
+        range_function,
+        reverse_function,
+        tail_function,
+        to_boolean_list_function,
+        to_float_list_function,
+        to_integer_list_function,
+        to_string_list_function,
+    ))(input)
+}
+
+fn scalar_function_group_two(input: &str) -> IResult<ScalarFunction> {
+    alt((
+        coalesce_function,
+        start_node_function,
+        end_node_function,
+        head_function,
+        last_function,
+        id_function,
+        properties_function,
+        random_uuid_function,
+        size_function,
+        length_function,
+        timestamp_function,
+    ))(input)
+}
+
+fn scalar_function_group_three(input: &str) -> IResult<ScalarFunction> {
+    alt((
+        to_boolean_function,
+        to_boolean_or_null_function,
+        to_float_function,
+        to_float_or_null_function,
+        to_integer_function,
+        to_integer_or_null_function,
+        type_function,
+    ))(input)
 }
 
 fn coalesce_function(input: &str) -> IResult<ScalarFunction> {
@@ -790,6 +817,69 @@ fn type_function(input: &str) -> IResult<ScalarFunction> {
     let (input, _) = ws(tag_no_case("type"))(input)?;
     let (input, field) = delimited(ws(char('(')), field_reference, ws(char(')')))(input)?;
     Ok((input, ScalarFunction::Type(field)))
+}
+
+fn keys_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("keys"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Keys(expr)))
+}
+
+fn labels_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("labels"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Labels(expr)))
+}
+
+fn range_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("range"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, start) = non_aggregate_expression(input)?;
+    let (input, _) = ws(char(','))(input)?;
+    let (input, end) = non_aggregate_expression(input)?;
+    let (input, step) = opt(|input| {
+        let (input, _) = ws(char(','))(input)?;
+        let (input, expr) = non_aggregate_expression(input)?;
+        Ok((input, expr))
+    })(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((input, ScalarFunction::Range { start, end, step }))
+}
+
+fn reverse_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("reverse"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Reverse(expr)))
+}
+
+fn tail_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("tail"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Tail(expr)))
+}
+
+fn to_boolean_list_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toBooleanList"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::ToBooleanList(expr)))
+}
+
+fn to_float_list_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toFloatList"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::ToFloatList(expr)))
+}
+
+fn to_integer_list_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toIntegerList"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::ToIntegerList(expr)))
+}
+
+fn to_string_list_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toStringList"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::ToStringList(expr)))
 }
 
 fn avg_function(input: &str) -> IResult<AggregateExpression> {
