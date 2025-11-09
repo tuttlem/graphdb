@@ -73,7 +73,8 @@ fn parse_select_where() {
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
-            match &select.matches[0] {
+            let clause = &select.match_clauses[0];
+            match &clause.patterns[0] {
                 MatchPattern::Node(pattern) => {
                     assert_eq!(pattern.label.as_deref(), Some("Person"));
                 }

@@ -72,13 +72,16 @@ fn execute_query(
             db.remove_edge(edge_id).map_err(|e| e.to_string())?;
             Ok(())
         }
-        Query::Select(select) => match select.matches.first() {
-            Some(MatchPattern::Node(pattern)) => {
-                let nodes = select_nodes(db, pattern, &select.conditions)?;
-                ctx.last_nodes = nodes;
-                Ok(())
-            }
-            _ => Err("unsupported match shape in test executor".into()),
+        Query::Select(select) => match select.match_clauses.first() {
+            Some(clause) => match clause.patterns.first() {
+                Some(MatchPattern::Node(pattern)) => {
+                    let nodes = select_nodes(db, pattern, &select.conditions)?;
+                    ctx.last_nodes = nodes;
+                    Ok(())
+                }
+                _ => Err("unsupported match shape in test executor".into()),
+            },
+            None => Err("MATCH clause required".into()),
         },
         Query::Create { .. } => Err("CREATE not supported in executor test".into()),
         Query::UpdateNode { .. } | Query::UpdateEdge { .. } => {

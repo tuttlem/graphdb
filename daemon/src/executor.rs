@@ -7,8 +7,8 @@ use graphdb_core::query::{
     AggregateExpression, AggregateFunction, ComparisonOperator, CreatePattern, CreateRelationship,
     Expression, FieldReference, GraphDbProcedure, MatchPattern, NodePattern, PathFilter,
     PathLength, PathMatchQuery, PathQueryMode, PathReturn, Procedure, Projection, Properties,
-    Query, RelationshipDirection, RelationshipPattern, SelectQuery, Value, WithClause,
-    parse_queries,
+    Query, RelationshipDirection, RelationshipMatch, RelationshipPattern, SelectMatchClause,
+    SelectQuery, Value, WithClause, parse_queries,
 };
 use graphdb_core::{
     AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
@@ -31,28 +31,14 @@ pub struct ExecutionReport {
 
 #[derive(Clone, Default)]
 struct QueryRow {
-    nodes: HashMap<String, Node>,
+    nodes: HashMap<String, Option<Node>>,
     scalars: HashMap<String, Value>,
 }
-
-impl QueryRow {}
 
 #[derive(Clone)]
 enum FieldValue {
     Node(Node),
     Scalar(Value),
-}
-
-struct MatchPlan {
-    alias_order: Vec<String>,
-    aliases: HashMap<String, NodePattern>,
-    relationships: Vec<RelationshipRequirement>,
-}
-
-struct RelationshipRequirement {
-    left_alias: String,
-    right_alias: String,
-    pattern: RelationshipPattern,
 }
 
 struct GroupState {
@@ -165,21 +151,19 @@ fn execute_select<B: StorageBackend>(
     query: SelectQuery,
     ctx: &mut ExecutionReport,
 ) -> Result<(), DaemonError> {
-    let plan = build_match_plan(&query.matches)?;
-    let conditions_by_alias = group_conditions_by_alias(&query.conditions);
-    let mut candidate_nodes = HashMap::new();
-    for alias in &plan.alias_order {
-        let pattern = plan
-            .aliases
-            .get(alias)
-            .expect("alias pattern missing")
-            .clone();
-        let alias_conditions = conditions_by_alias.get(alias).cloned().unwrap_or_default();
-        let nodes = select_nodes(db, &pattern, &alias_conditions)?;
-        candidate_nodes.insert(alias.clone(), nodes);
+    if query.match_clauses.is_empty() {
+        return Err(DaemonError::Query("MATCH clause is required".into()));
     }
 
-    let mut rows = build_rows(db, &plan, &candidate_nodes, &conditions_by_alias)?;
+    let mut rows = vec![QueryRow::default()];
+    let conditions_by_alias = group_conditions_by_alias(&query.conditions);
+
+    for clause in &query.match_clauses {
+        rows = apply_match_clause(db, rows, clause, &conditions_by_alias)?;
+        if rows.is_empty() {
+            break;
+        }
+    }
 
     if rows.is_empty() {
         ctx.result_rows.clear();
@@ -243,269 +227,81 @@ fn group_conditions_by_alias(
     map
 }
 
-fn build_match_plan(matches: &[MatchPattern]) -> Result<MatchPlan, DaemonError> {
-    if matches.is_empty() {
-        return Err(DaemonError::Query("MATCH clause is required".into()));
-    }
-
-    let mut alias_order = Vec::new();
-    let mut aliases: HashMap<String, NodePattern> = HashMap::new();
-    let mut relationships = Vec::new();
-
-    for pattern in matches {
-        match pattern {
-            MatchPattern::Node(node) => register_alias(node, &mut alias_order, &mut aliases)?,
-            MatchPattern::Relationship(rel) => {
-                register_alias(&rel.left, &mut alias_order, &mut aliases)?;
-                register_alias(&rel.right, &mut alias_order, &mut aliases)?;
-                let left_alias = rel
-                    .left
-                    .alias
-                    .clone()
-                    .ok_or_else(|| DaemonError::Query("left node requires alias".into()))?;
-                let right_alias = rel
-                    .right
-                    .alias
-                    .clone()
-                    .ok_or_else(|| DaemonError::Query("right node requires alias".into()))?;
-                relationships.push(RelationshipRequirement {
-                    left_alias,
-                    right_alias,
-                    pattern: rel.relationship.clone(),
-                });
-            }
-        }
-    }
-
-    if aliases.is_empty() {
-        return Err(DaemonError::Query(
-            "MATCH must bind at least one alias".into(),
-        ));
-    }
-
-    Ok(MatchPlan {
-        alias_order,
-        aliases,
-        relationships,
-    })
-}
-
-fn register_alias(
-    node: &NodePattern,
-    order: &mut Vec<String>,
-    aliases: &mut HashMap<String, NodePattern>,
-) -> Result<(), DaemonError> {
-    let alias = node
-        .alias
-        .clone()
-        .ok_or_else(|| DaemonError::Query("nodes in MATCH must have aliases".into()))?;
-
-    match aliases.get_mut(&alias) {
-        Some(existing) => merge_node_patterns(existing, node)?,
-        None => {
-            order.push(alias.clone());
-            aliases.insert(alias, node.clone());
-        }
-    }
-    Ok(())
-}
-
-fn merge_node_patterns(
-    target: &mut NodePattern,
-    incoming: &NodePattern,
-) -> Result<(), DaemonError> {
-    if let Some(label) = &incoming.label {
-        match &target.label {
-            Some(existing) if existing != label => {
-                return Err(DaemonError::Query("conflicting labels for alias".into()));
-            }
-            _ => target.label = Some(label.clone()),
-        }
-    }
-
-    for (key, value) in incoming.properties.0.iter() {
-        if let Some(existing) = target.properties.0.get(key) {
-            if existing != value {
-                return Err(DaemonError::Query(format!(
-                    "conflicting property constraints for alias on {key}"
-                )));
-            }
-        } else {
-            target.properties.0.insert(key.clone(), value.clone());
-        }
-    }
-
-    Ok(())
-}
-
-fn build_rows<B: StorageBackend>(
+fn apply_match_clause<B: StorageBackend>(
     db: &Database<B>,
-    plan: &MatchPlan,
-    candidates: &HashMap<String, Vec<Node>>,
+    rows: Vec<QueryRow>,
+    clause: &SelectMatchClause,
     conditions_by_alias: &HashMap<String, Vec<graphdb_core::query::Condition>>,
 ) -> Result<Vec<QueryRow>, DaemonError> {
-    let mut rows = Vec::new();
-    let mut current = QueryRow::default();
-    backtrack_rows(
-        db,
-        plan,
-        candidates,
-        conditions_by_alias,
-        0,
-        &mut current,
-        &mut rows,
-    )?;
-    Ok(rows)
-}
-
-fn backtrack_rows<B: StorageBackend>(
-    db: &Database<B>,
-    plan: &MatchPlan,
-    candidates: &HashMap<String, Vec<Node>>,
-    conditions_by_alias: &HashMap<String, Vec<graphdb_core::query::Condition>>,
-    index: usize,
-    current: &mut QueryRow,
-    rows: &mut Vec<QueryRow>,
-) -> Result<(), DaemonError> {
-    if index >= plan.alias_order.len() {
-        rows.push(current.clone());
-        return Ok(());
-    }
-
-    let alias = &plan.alias_order[index];
-    let nodes = candidates
-        .get(alias)
-        .cloned()
-        .ok_or_else(|| DaemonError::Query("missing node candidates".into()))?;
-    let conditions = conditions_by_alias.get(alias);
-
-    for node in nodes {
-        if let Some(conds) = conditions {
-            let arc = Arc::new(node.clone());
-            if !conds
-                .iter()
-                .all(|cond| node_satisfies_condition(&arc, cond))
-            {
-                continue;
+    let mut result = Vec::new();
+    for row in rows {
+        let mut expanded = vec![row.clone()];
+        for pattern in &clause.patterns {
+            let mut next = Vec::new();
+            for partial in expanded {
+                let mut produced = match pattern {
+                    MatchPattern::Node(node_pattern) => {
+                        extend_with_node_pattern(db, partial, node_pattern, conditions_by_alias)?
+                    }
+                    MatchPattern::Relationship(rel) => {
+                        extend_with_relationship_pattern(db, partial, rel, conditions_by_alias)?
+                    }
+                };
+                next.append(&mut produced);
+            }
+            expanded = next;
+            if expanded.is_empty() {
+                break;
             }
         }
 
-        if !relationships_ok(db, alias, &node, current, &plan.relationships)? {
-            continue;
+        if expanded.is_empty() {
+            if clause.optional {
+                let mut fallback = row.clone();
+                register_missing_aliases(&mut fallback, clause);
+                result.push(fallback);
+            }
+        } else {
+            result.extend(expanded);
         }
-
-        current.nodes.insert(alias.clone(), node.clone());
-        backtrack_rows(
-            db,
-            plan,
-            candidates,
-            conditions_by_alias,
-            index + 1,
-            current,
-            rows,
-        )?;
-        current.nodes.remove(alias);
     }
 
-    Ok(())
+    Ok(result)
 }
 
-fn relationships_ok<B: StorageBackend>(
-    db: &Database<B>,
-    alias: &str,
-    node: &Node,
-    current: &QueryRow,
-    relationships: &[RelationshipRequirement],
-) -> Result<bool, DaemonError> {
-    for req in relationships {
-        let left_ready = current.nodes.contains_key(&req.left_alias) || req.left_alias == alias;
-        let right_ready = current.nodes.contains_key(&req.right_alias) || req.right_alias == alias;
-        if left_ready && right_ready {
-            let left_node = if req.left_alias == alias {
-                node
-            } else {
-                current
-                    .nodes
-                    .get(&req.left_alias)
-                    .ok_or_else(|| DaemonError::Query("alias binding missing".into()))?
-            };
-            let right_node = if req.right_alias == alias {
-                node
-            } else {
-                current
-                    .nodes
-                    .get(&req.right_alias)
-                    .ok_or_else(|| DaemonError::Query("alias binding missing".into()))?
-            };
-            if !relationship_exists(db, left_node, right_node, &req.pattern)? {
-                return Ok(false);
+fn apply_with_clause(
+    rows: Vec<QueryRow>,
+    clause: &WithClause,
+) -> Result<Vec<QueryRow>, DaemonError> {
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut next = QueryRow::default();
+        for projection in &clause.projections {
+            match &projection.expression {
+                Expression::Field(field) => {
+                    let label = projection
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| field_label(field));
+                    match resolve_field(&row, field)? {
+                        FieldValue::Node(node) => {
+                            next.nodes.insert(label, Some(node));
+                        }
+                        FieldValue::Scalar(value) => {
+                            next.scalars.insert(label, value);
+                        }
+                    }
+                }
+                Expression::Aggregate(_) => {
+                    return Err(DaemonError::Query(
+                        "aggregates are not supported in WITH clauses".into(),
+                    ));
+                }
             }
         }
+        results.push(next);
     }
-    Ok(true)
-}
-
-fn relationship_exists<B: StorageBackend>(
-    db: &Database<B>,
-    left: &Node,
-    right: &Node,
-    pattern: &RelationshipPattern,
-) -> Result<bool, DaemonError> {
-    match pattern.direction {
-        RelationshipDirection::Outbound => edge_between(db, left.id(), right.id(), pattern),
-        RelationshipDirection::Inbound => edge_between(db, right.id(), left.id(), pattern),
-        RelationshipDirection::Undirected => {
-            if edge_between(db, left.id(), right.id(), pattern)? {
-                Ok(true)
-            } else {
-                edge_between(db, right.id(), left.id(), pattern)
-            }
-        }
-    }
-}
-
-fn edge_between<B: StorageBackend>(
-    db: &Database<B>,
-    from: NodeId,
-    to: NodeId,
-    pattern: &RelationshipPattern,
-) -> Result<bool, DaemonError> {
-    if pattern.length != PathLength::Exact(1) {
-        return Err(DaemonError::Query(
-            "variable length relationships are not supported in MATCH".into(),
-        ));
-    }
-    for edge in db.edges_for_node(from)? {
-        if edge.source() == from && edge.target() == to && edge_matches_pattern(&edge, pattern) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn insert_node<B: StorageBackend>(
-    db: &Database<B>,
-    pattern: graphdb_core::query::NodePattern,
-) -> Result<NodeId, DaemonError> {
-    let node = materialize_node(pattern)?;
-    let node_id = node.id();
-    db.insert_node(node)?;
-    Ok(node_id)
-}
-
-fn insert_edge<B: StorageBackend>(
-    db: &Database<B>,
-    source_pattern: graphdb_core::query::NodePattern,
-    edge_pattern: graphdb_core::query::EdgePattern,
-    target_pattern: graphdb_core::query::NodePattern,
-) -> Result<EdgeId, DaemonError> {
-    let source_id = extract_node_id(source_pattern, "source id missing")?;
-    let target_id = extract_node_id(target_pattern, "target id missing")?;
-
-    let edge = materialize_edge(edge_pattern, source_id, target_id)?;
-    let edge_id = edge.id();
-    db.insert_edge(edge)?;
-    Ok(edge_id)
+    Ok(results)
 }
 
 fn select_nodes<B: StorageBackend>(
@@ -529,10 +325,7 @@ fn select_nodes<B: StorageBackend>(
     Ok(matches)
 }
 
-fn node_matches_pattern(
-    node: &std::sync::Arc<Node>,
-    pattern: &graphdb_core::query::NodePattern,
-) -> bool {
+fn node_matches_pattern(node: &Arc<Node>, pattern: &graphdb_core::query::NodePattern) -> bool {
     if let Some(label) = &pattern.label {
         if !node.labels().iter().any(|l| l == label) {
             return false;
@@ -553,10 +346,7 @@ fn node_matches_pattern(
     true
 }
 
-fn node_satisfies_condition(
-    node: &std::sync::Arc<Node>,
-    condition: &graphdb_core::query::Condition,
-) -> bool {
+fn node_satisfies_condition(node: &Arc<Node>, condition: &graphdb_core::query::Condition) -> bool {
     let attr_value = node
         .attribute(&condition.property)
         .map(attribute_to_query_value)
@@ -620,70 +410,35 @@ fn value_equals_attribute(value: &Value, attribute: &AttributeValue) -> bool {
     }
 }
 
-fn values_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::String(x), Value::String(y)) => x == y,
-        (Value::Integer(x), Value::Integer(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => (*x - *y).abs() < f64::EPSILON,
-        (Value::Integer(x), Value::Float(y)) | (Value::Float(y), Value::Integer(x)) => {
-            ((*x as f64) - *y).abs() < f64::EPSILON
-        }
-        (Value::Boolean(x), Value::Boolean(y)) => x == y,
-        (Value::Null, Value::Null) => true,
-        (Value::List(xs), Value::List(ys)) => {
-            xs.len() == ys.len() && xs.iter().zip(ys).all(|(lx, ly)| values_equal(lx, ly))
-        }
-        _ => false,
-    }
-}
-
-fn compare_query_values(left: &Value, right: &Value) -> Option<Ordering> {
-    match (left, right) {
-        (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
-        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
-        (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
-        (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
-        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
-        (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
-        _ => None,
-    }
-}
-
 fn collect_nodes(rows: &[QueryRow], alias: &str) -> Vec<Node> {
     rows.iter()
-        .filter_map(|row| row.nodes.get(alias).cloned())
+        .filter_map(|row| row.nodes.get(alias).and_then(|entry| entry.clone()))
         .collect()
 }
 
-fn apply_with_clause(
-    rows: Vec<QueryRow>,
-    clause: &WithClause,
-) -> Result<Vec<QueryRow>, DaemonError> {
-    let mut projected = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut next = QueryRow::default();
-        for projection in &clause.projections {
-            let value = match &projection.expression {
-                Expression::Field(field) => resolve_field(&row, field)?,
-                Expression::Aggregate(_) => {
-                    return Err(DaemonError::Query(
-                        "aggregate expressions are not supported in WITH clauses".into(),
-                    ));
-                }
-            };
-            let name = projection_label(projection);
-            match value {
-                FieldValue::Node(node) => {
-                    next.nodes.insert(name, node);
-                }
-                FieldValue::Scalar(val) => {
-                    next.scalars.insert(name, val);
-                }
-            }
-        }
-        projected.push(next);
-    }
-    Ok(projected)
+fn insert_node<B: StorageBackend>(
+    db: &Database<B>,
+    pattern: graphdb_core::query::NodePattern,
+) -> Result<NodeId, DaemonError> {
+    let node = materialize_node(pattern)?;
+    let node_id = node.id();
+    db.insert_node(node)?;
+    Ok(node_id)
+}
+
+fn insert_edge<B: StorageBackend>(
+    db: &Database<B>,
+    source_pattern: graphdb_core::query::NodePattern,
+    edge_pattern: graphdb_core::query::EdgePattern,
+    target_pattern: graphdb_core::query::NodePattern,
+) -> Result<EdgeId, DaemonError> {
+    let source_id = extract_node_id(source_pattern, "source id missing")?;
+    let target_id = extract_node_id(target_pattern, "target id missing")?;
+
+    let edge = materialize_edge(edge_pattern, source_id, target_id)?;
+    let edge_id = edge.id();
+    db.insert_edge(edge)?;
+    Ok(edge_id)
 }
 
 fn project_rows(
@@ -861,31 +616,21 @@ fn resolve_field(row: &QueryRow, field: &FieldReference) -> Result<FieldValue, D
         return Ok(FieldValue::Scalar(value.clone()));
     }
 
-    if let Some(node) = row.nodes.get(&field.alias) {
-        if let Some(property) = &field.property {
-            let attr = node.attribute(property);
-            let value = attr.map(attribute_to_query_value).unwrap_or(Value::Null);
-            return Ok(FieldValue::Scalar(value));
+    match row.nodes.get(&field.alias) {
+        Some(Some(node)) => {
+            if let Some(property) = &field.property {
+                let attr = node.attribute(property);
+                let value = attr.map(attribute_to_query_value).unwrap_or(Value::Null);
+                Ok(FieldValue::Scalar(value))
+            } else {
+                Ok(FieldValue::Node(node.clone()))
+            }
         }
-        return Ok(FieldValue::Node(node.clone()));
-    }
-
-    Err(DaemonError::Query(format!(
-        "unknown alias '{}'",
-        field.alias
-    )))
-}
-
-fn attribute_to_query_value(attr: &AttributeValue) -> Value {
-    match attr {
-        AttributeValue::String(s) => Value::String(s.clone()),
-        AttributeValue::Integer(i) => Value::Integer(*i),
-        AttributeValue::Float(f) => Value::Float(*f),
-        AttributeValue::Boolean(b) => Value::Boolean(*b),
-        AttributeValue::Null => Value::Null,
-        AttributeValue::List(items) => {
-            Value::List(items.iter().map(attribute_to_query_value).collect())
-        }
+        Some(None) => Ok(FieldValue::Scalar(Value::Null)),
+        None => Err(DaemonError::Query(format!(
+            "unknown alias '{}'",
+            field.alias
+        ))),
     }
 }
 
@@ -898,6 +643,387 @@ fn field_value_to_scalar(value: FieldValue) -> Result<Value, DaemonError> {
     }
 }
 
+fn attribute_to_query_value(attr: &AttributeValue) -> Value {
+    match attr {
+        AttributeValue::String(s) => Value::String(s.clone()),
+        AttributeValue::Integer(i) => Value::Integer(*i),
+        AttributeValue::Float(f) => Value::Float(*f),
+        AttributeValue::Boolean(b) => Value::Boolean(*b),
+        AttributeValue::Null => Value::Null,
+        AttributeValue::List(values) => {
+            Value::List(values.iter().map(attribute_to_query_value).collect())
+        }
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => (*x - *y).abs() < f64::EPSILON,
+        (Value::Integer(x), Value::Float(y)) | (Value::Float(y), Value::Integer(x)) => {
+            ((*x as f64) - *y).abs() < f64::EPSILON
+        }
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Null, Value::Null) => true,
+        (Value::List(xs), Value::List(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(lx, ly)| values_equal(lx, ly))
+        }
+        _ => false,
+    }
+}
+
+fn compare_query_values(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => Some(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
+        (Value::Integer(x), Value::Float(y)) => (*x as f64).partial_cmp(y),
+        (Value::Float(x), Value::Integer(y)) => x.partial_cmp(&(*y as f64)),
+        (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
+        (Value::Boolean(x), Value::Boolean(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+enum AliasState {
+    Bound(Node),
+    Null,
+    Unbound,
+}
+
+fn alias_state(row: &QueryRow, alias: &str) -> AliasState {
+    match row.nodes.get(alias) {
+        Some(Some(node)) => AliasState::Bound(node.clone()),
+        Some(None) => AliasState::Null,
+        None => AliasState::Unbound,
+    }
+}
+
+fn extend_with_node_pattern<B: StorageBackend>(
+    db: &Database<B>,
+    row: QueryRow,
+    node_pattern: &NodePattern,
+    conditions_by_alias: &HashMap<String, Vec<graphdb_core::query::Condition>>,
+) -> Result<Vec<QueryRow>, DaemonError> {
+    let alias = node_pattern
+        .alias
+        .as_ref()
+        .ok_or_else(|| DaemonError::Query("nodes in MATCH must have aliases".into()))?
+        .to_string();
+
+    match alias_state(&row, &alias) {
+        AliasState::Bound(node) => {
+            let arc = Arc::new(node.clone());
+            if node_matches_pattern(&arc, node_pattern)
+                && conditions_by_alias
+                    .get(&alias)
+                    .map(|conds| {
+                        conds
+                            .iter()
+                            .all(|cond| node_satisfies_condition(&arc, cond))
+                    })
+                    .unwrap_or(true)
+            {
+                Ok(vec![row])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        AliasState::Null => Ok(Vec::new()),
+        AliasState::Unbound => {
+            let alias_conditions = conditions_by_alias.get(&alias).cloned().unwrap_or_default();
+            let nodes = select_nodes(db, node_pattern, &alias_conditions)?;
+            let mut results = Vec::new();
+            for node in nodes {
+                let mut next = row.clone();
+                next.nodes.insert(alias.clone(), Some(node));
+                results.push(next);
+            }
+            Ok(results)
+        }
+    }
+}
+
+fn extend_with_relationship_pattern<B: StorageBackend>(
+    db: &Database<B>,
+    row: QueryRow,
+    rel: &RelationshipMatch,
+    conditions_by_alias: &HashMap<String, Vec<graphdb_core::query::Condition>>,
+) -> Result<Vec<QueryRow>, DaemonError> {
+    let left_alias = rel
+        .left
+        .alias
+        .as_ref()
+        .ok_or_else(|| DaemonError::Query("left node requires alias".into()))?
+        .to_string();
+    let right_alias = rel
+        .right
+        .alias
+        .as_ref()
+        .ok_or_else(|| DaemonError::Query("right node requires alias".into()))?
+        .to_string();
+
+    match (
+        alias_state(&row, &left_alias),
+        alias_state(&row, &right_alias),
+    ) {
+        (AliasState::Bound(left_node), AliasState::Bound(right_node)) => {
+            if relationship_pair_satisfies(db, &left_node, &right_node, rel, conditions_by_alias)? {
+                Ok(vec![row])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        (AliasState::Bound(left_node), AliasState::Unbound) => {
+            let candidates = reachable_nodes_from(
+                db,
+                &left_node,
+                &rel.relationship,
+                &rel.right,
+                conditions_by_alias
+                    .get(&right_alias)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+            )?;
+            let mut results = Vec::new();
+            for node in candidates {
+                let mut next = row.clone();
+                next.nodes.insert(right_alias.clone(), Some(node));
+                results.push(next);
+            }
+            Ok(results)
+        }
+        (AliasState::Unbound, AliasState::Bound(right_node)) => {
+            let mut reversed = rel.clone();
+            reversed.left = rel.right.clone();
+            reversed.right = rel.left.clone();
+            reversed.relationship.direction = match rel.relationship.direction {
+                RelationshipDirection::Outbound => RelationshipDirection::Inbound,
+                RelationshipDirection::Inbound => RelationshipDirection::Outbound,
+                RelationshipDirection::Undirected => RelationshipDirection::Undirected,
+            };
+            let candidates = reachable_nodes_from(
+                db,
+                &right_node,
+                &reversed.relationship,
+                &reversed.right,
+                conditions_by_alias
+                    .get(&left_alias)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+            )?;
+            let mut results = Vec::new();
+            for node in candidates {
+                let mut next = row.clone();
+                next.nodes.insert(left_alias.clone(), Some(node));
+                results.push(next);
+            }
+            Ok(results)
+        }
+        (AliasState::Unbound, AliasState::Unbound) => {
+            let left_candidates = select_nodes(
+                db,
+                &rel.left,
+                &conditions_by_alias
+                    .get(&left_alias)
+                    .cloned()
+                    .unwrap_or_default(),
+            )?;
+            let mut results = Vec::new();
+            for left in left_candidates {
+                let reachable = reachable_nodes_from(
+                    db,
+                    &left,
+                    &rel.relationship,
+                    &rel.right,
+                    conditions_by_alias
+                        .get(&right_alias)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]),
+                )?;
+                for right in reachable {
+                    let mut next = row.clone();
+                    next.nodes.insert(left_alias.clone(), Some(left.clone()));
+                    next.nodes.insert(right_alias.clone(), Some(right));
+                    results.push(next);
+                }
+            }
+            Ok(results)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn relationship_pair_satisfies<B: StorageBackend>(
+    db: &Database<B>,
+    left: &Node,
+    right: &Node,
+    rel: &RelationshipMatch,
+    conditions_by_alias: &HashMap<String, Vec<graphdb_core::query::Condition>>,
+) -> Result<bool, DaemonError> {
+    let left_alias = rel.left.alias.as_deref().unwrap_or("");
+    let right_alias = rel.right.alias.as_deref().unwrap_or("");
+
+    let left_arc = Arc::new(left.clone());
+    let right_arc = Arc::new(right.clone());
+    if !node_matches_pattern(&left_arc, &rel.left) || !node_matches_pattern(&right_arc, &rel.right)
+    {
+        return Ok(false);
+    }
+
+    if let Some(conds) = conditions_by_alias.get(left_alias) {
+        if !conds
+            .iter()
+            .all(|cond| node_satisfies_condition(&left_arc, cond))
+        {
+            return Ok(false);
+        }
+    }
+    if let Some(conds) = conditions_by_alias.get(right_alias) {
+        if !conds
+            .iter()
+            .all(|cond| node_satisfies_condition(&right_arc, cond))
+        {
+            return Ok(false);
+        }
+    }
+
+    relationship_path_exists_between(db, left.id(), right.id(), &rel.relationship)
+}
+
+fn reachable_nodes_from<B: StorageBackend>(
+    db: &Database<B>,
+    start: &Node,
+    relationship: &RelationshipPattern,
+    target_pattern: &NodePattern,
+    target_conditions: &[graphdb_core::query::Condition],
+) -> Result<Vec<Node>, DaemonError> {
+    let (min_hops, max_hops) = length_bounds(&relationship.length);
+    let mut results = Vec::new();
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
+    queue.push_back((start.id(), 0u32));
+    visited.insert(start.id());
+
+    while let Some((node_id, depth)) = queue.pop_front() {
+        if depth >= max_hops {
+            continue;
+        }
+        for next_id in neighbor_node_ids(db, node_id, relationship)? {
+            if visited.insert(next_id) {
+                let next_depth = depth + 1;
+                if let Some(node) = db.get_node(next_id)? {
+                    if next_depth >= min_hops
+                        && node_matches_pattern(&node, target_pattern)
+                        && target_conditions
+                            .iter()
+                            .all(|cond| node_satisfies_condition(&node, cond))
+                    {
+                        results.push((*node).clone());
+                    }
+                    if next_depth < max_hops {
+                        queue.push_back((next_id, next_depth));
+                    }
+                }
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn relationship_path_exists_between<B: StorageBackend>(
+    db: &Database<B>,
+    start: NodeId,
+    target: NodeId,
+    pattern: &RelationshipPattern,
+) -> Result<bool, DaemonError> {
+    let (min_hops, max_hops) = length_bounds(&pattern.length);
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
+    queue.push_back((start, 0u32));
+    visited.insert(start);
+
+    while let Some((node_id, depth)) = queue.pop_front() {
+        if depth >= max_hops {
+            continue;
+        }
+        for next_id in neighbor_node_ids(db, node_id, pattern)? {
+            let next_depth = depth + 1;
+            if next_depth >= min_hops && next_id == target {
+                return Ok(true);
+            }
+            if visited.insert(next_id) {
+                if next_depth < max_hops {
+                    queue.push_back((next_id, next_depth));
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn neighbor_node_ids<B: StorageBackend>(
+    db: &Database<B>,
+    node_id: NodeId,
+    pattern: &RelationshipPattern,
+) -> Result<Vec<NodeId>, DaemonError> {
+    let mut neighbors = Vec::new();
+    for edge in db.edges_for_node(node_id)? {
+        match pattern.direction {
+            RelationshipDirection::Outbound => {
+                if edge.source() == node_id && edge_matches_pattern(&edge, pattern) {
+                    neighbors.push(edge.target());
+                }
+            }
+            RelationshipDirection::Inbound => {
+                if edge.target() == node_id && edge_matches_pattern(&edge, pattern) {
+                    neighbors.push(edge.source());
+                }
+            }
+            RelationshipDirection::Undirected => {
+                if edge.source() == node_id && edge_matches_pattern(&edge, pattern) {
+                    neighbors.push(edge.target());
+                } else if edge.target() == node_id && edge_matches_pattern(&edge, pattern) {
+                    neighbors.push(edge.source());
+                }
+            }
+        }
+    }
+    Ok(neighbors)
+}
+
+fn register_missing_aliases(row: &mut QueryRow, clause: &SelectMatchClause) {
+    for alias in clause_aliases(clause) {
+        row.nodes.entry(alias).or_insert(None);
+    }
+}
+
+fn clause_aliases(clause: &SelectMatchClause) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for pattern in &clause.patterns {
+        match pattern {
+            MatchPattern::Node(node) => {
+                if let Some(alias) = node.alias.as_ref() {
+                    if !aliases.contains(alias) {
+                        aliases.push(alias.clone());
+                    }
+                }
+            }
+            MatchPattern::Relationship(rel) => {
+                for node in [&rel.left, &rel.right] {
+                    if let Some(alias) = node.alias.as_ref() {
+                        if !aliases.contains(alias) {
+                            aliases.push(alias.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    aliases
+}
 fn execute_create<B: StorageBackend>(
     db: &Database<B>,
     pattern: CreatePattern,

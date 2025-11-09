@@ -374,7 +374,7 @@ fn comparison_operator(input: &str) -> IResult<ComparisonOperator> {
 
 fn select_stmt(input: &str) -> IResult<Query> {
     let (input, _) = ws(tag_no_case("SELECT"))(input)?;
-    let (input, matches) = match_clauses(input)?;
+    let (input, match_clauses) = parse_select_match_clauses(input)?;
     let (input, conditions) = opt(|input| {
         let (input, _) = ws(tag_no_case("WHERE"))(input)?;
         condition_list(input)
@@ -387,7 +387,7 @@ fn select_stmt(input: &str) -> IResult<Query> {
     Ok((
         input,
         Query::Select(SelectQuery {
-            matches,
+            match_clauses,
             conditions: conditions.unwrap_or_default(),
             with: with_clause,
             returns,
@@ -395,14 +395,12 @@ fn select_stmt(input: &str) -> IResult<Query> {
     ))
 }
 
-fn match_clauses(mut input: &str) -> IResult<Vec<MatchPattern>> {
-    let (next, mut patterns) = match_clause_list(input)?;
-    input = next;
-
+fn parse_select_match_clauses(mut input: &str) -> IResult<Vec<SelectMatchClause>> {
+    let mut clauses = Vec::new();
     loop {
-        match match_clause_list(input) {
-            Ok((rest, mut more)) => {
-                patterns.append(&mut more);
+        match parse_single_match_clause(input) {
+            Ok((rest, clause)) => {
+                clauses.push(clause);
                 input = rest;
             }
             Err(nom::Err::Error(_)) => break,
@@ -410,12 +408,26 @@ fn match_clauses(mut input: &str) -> IResult<Vec<MatchPattern>> {
         }
     }
 
-    Ok((input, patterns))
+    if clauses.is_empty() {
+        return Err(nom::Err::Error(VerboseError {
+            errors: vec![(input, VerboseErrorKind::Context("MATCH clause is required"))],
+        }));
+    }
+
+    Ok((input, clauses))
 }
 
-fn match_clause_list(input: &str) -> IResult<Vec<MatchPattern>> {
+fn parse_single_match_clause(input: &str) -> IResult<SelectMatchClause> {
+    let (input, optional) = opt(ws(tag_no_case("OPTIONAL")))(input)?;
     let (input, _) = ws(tag_no_case("MATCH"))(input)?;
-    separated_list1(ws(char(',')), match_pattern)(input)
+    let (input, patterns) = separated_list1(ws(char(',')), match_pattern)(input)?;
+    Ok((
+        input,
+        SelectMatchClause {
+            optional: optional.is_some(),
+            patterns,
+        },
+    ))
 }
 
 fn match_pattern(input: &str) -> IResult<MatchPattern> {
