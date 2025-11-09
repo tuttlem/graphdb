@@ -107,6 +107,20 @@ fn parse_select_with_aggregate() {
                 select.returns[0].expression,
                 Expression::Aggregate(_)
             ));
+            assert!(!select.explain);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn parse_explain_select() {
+    let input = "EXPLAIN SELECT MATCH (n:Person) RETURN n;";
+    let queries = parse_queries(input).unwrap();
+    match &queries[0] {
+        Query::Select(select) => {
+            assert!(select.explain);
+            assert_eq!(select.match_clauses.len(), 1);
         }
         other => panic!("unexpected {other:?}"),
     }

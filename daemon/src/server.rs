@@ -110,6 +110,7 @@ struct SuccessResponse {
     paths: Vec<crate::executor::PathResult>,
     path_pairs: Vec<crate::executor::PathPairResult>,
     rows: Vec<JsonValue>,
+    plan_summary: Option<JsonValue>,
 }
 
 #[derive(Serialize)]
@@ -162,6 +163,7 @@ async fn handle_query(
                 paths,
                 path_pairs,
                 result_rows,
+                plan_summary,
             } = report;
 
             Ok(Json(SuccessResponse {
@@ -172,6 +174,7 @@ async fn handle_query(
                 paths,
                 path_pairs,
                 rows: result_rows,
+                plan_summary,
             }))
         }
         Err(err) => {

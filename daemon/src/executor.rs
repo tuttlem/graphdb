@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -27,6 +27,7 @@ pub struct ExecutionReport {
     pub paths: Vec<PathResult>,
     pub path_pairs: Vec<PathPairResult>,
     pub result_rows: Vec<JsonValue>,
+    pub plan_summary: Option<JsonValue>,
 }
 
 #[derive(Clone, Default)]
@@ -39,6 +40,30 @@ struct QueryRow {
 enum FieldValue {
     Node(Node),
     Scalar(Value),
+}
+
+#[derive(Debug, Serialize)]
+struct PlanSummary {
+    clauses: Vec<PlannedClause>,
+    total_clauses: usize,
+    optional_clauses: usize,
+    filter_count: usize,
+    has_with_clause: bool,
+    return_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PlannedClause {
+    order: usize,
+    optional: bool,
+    pattern_count: usize,
+    aliases: Vec<String>,
+    selectivity_score: usize,
+}
+
+struct LogicalPlan {
+    clauses: Vec<SelectMatchClause>,
+    summary: PlanSummary,
 }
 
 struct GroupState {
@@ -155,10 +180,28 @@ fn execute_select<B: StorageBackend>(
         return Err(DaemonError::Query("MATCH clause is required".into()));
     }
 
+    let plan = build_logical_plan(&query);
+    let plan_json = serde_json::to_value(&plan.summary).unwrap_or(JsonValue::Null);
+    if plan_json != JsonValue::Null {
+        tracing::debug!(target = "graphdb::planner", event = "query.plan", summary = %plan_json);
+        ctx.plan_summary = Some(plan_json.clone());
+    } else {
+        ctx.plan_summary = None;
+    }
+
+    if query.explain {
+        if plan_json != JsonValue::Null {
+            ctx.result_rows = vec![plan_json];
+        }
+        ctx.selected_nodes.clear();
+        ctx.messages.push("query plan only (EXPLAIN)".into());
+        return Ok(());
+    }
+
     let mut rows = vec![QueryRow::default()];
     let conditions_by_alias = group_conditions_by_alias(&query.conditions);
 
-    for clause in &query.match_clauses {
+    for clause in &plan.clauses {
         rows = apply_match_clause(db, rows, clause, &conditions_by_alias)?;
         if rows.is_empty() {
             break;
@@ -225,6 +268,70 @@ fn group_conditions_by_alias(
             .push(condition.clone());
     }
     map
+}
+
+fn build_logical_plan(query: &SelectQuery) -> LogicalPlan {
+    let mut clauses = query.match_clauses.clone();
+    clauses.sort_by_key(|clause| {
+        (
+            clause.optional,
+            Reverse(clause_selectivity(clause)),
+            clause.patterns.len(),
+        )
+    });
+
+    let mut planned = Vec::new();
+    for (idx, clause) in clauses.iter().enumerate() {
+        let selectivity = clause_selectivity(clause);
+        planned.push(PlannedClause {
+            order: idx,
+            optional: clause.optional,
+            pattern_count: clause.patterns.len(),
+            aliases: clause_aliases(clause),
+            selectivity_score: selectivity,
+        });
+    }
+
+    let summary = PlanSummary {
+        clauses: planned,
+        total_clauses: clauses.len(),
+        optional_clauses: clauses.iter().filter(|c| c.optional).count(),
+        filter_count: query.conditions.len(),
+        has_with_clause: query.with.is_some(),
+        return_count: query.returns.len(),
+    };
+
+    LogicalPlan { clauses, summary }
+}
+
+fn clause_selectivity(clause: &SelectMatchClause) -> usize {
+    clause.patterns.iter().map(pattern_selectivity).sum()
+}
+
+fn pattern_selectivity(pattern: &MatchPattern) -> usize {
+    match pattern {
+        MatchPattern::Node(node) => {
+            let label_score = if node.label.is_some() { 3 } else { 1 };
+            label_score + node.properties.0.len()
+        }
+        MatchPattern::Relationship(rel) => {
+            let label_score = if rel.relationship.label.is_some() {
+                3
+            } else {
+                1
+            };
+            let property_score = rel.relationship.properties.0.len();
+            let length_score = match &rel.relationship.length {
+                PathLength::Exact(1) => 4,
+                PathLength::Exact(n) => (4 + (*n as usize)).max(1),
+                PathLength::Range { min, max } => {
+                    let upper = max.unwrap_or(*min);
+                    (4 + (*min as usize) + (upper as usize)).max(1)
+                }
+            };
+            label_score + property_score + length_score
+        }
+    }
 }
 
 fn apply_match_clause<B: StorageBackend>(

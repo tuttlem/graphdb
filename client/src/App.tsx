@@ -39,6 +39,7 @@ type QuerySuccess = {
   paths: PathResult[];
   path_pairs: PathPairResult[];
   rows: Record<string, unknown>[];
+  plan_summary?: Record<string, unknown> | null;
 };
 
 type QueryError = {
@@ -129,6 +130,15 @@ function App() {
     );
   }, [result?.rows]);
 
+  const renderedPlan = useMemo(() => {
+    if (!result?.plan_summary) {
+      return null;
+    }
+    return (
+      <pre>{JSON.stringify(result.plan_summary, null, 2)}</pre>
+    );
+  }, [result?.plan_summary]);
+
   return (
     <div className="page">
       <header>
@@ -208,6 +218,15 @@ function App() {
           </div>
           {renderedRows}
         </div>
+
+        {renderedPlan && (
+          <div className="panel">
+            <div className="panel-header">
+              <h2>Plan</h2>
+            </div>
+            {renderedPlan}
+          </div>
+        )}
 
         <div className="panel">
           <div className="panel-header">

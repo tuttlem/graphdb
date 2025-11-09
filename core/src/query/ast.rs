@@ -85,6 +85,7 @@ pub struct SelectQuery {
     pub conditions: Vec<Condition>,
     pub with: Option<WithClause>,
     pub returns: Vec<Projection>,
+    pub explain: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

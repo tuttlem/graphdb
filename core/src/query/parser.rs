@@ -373,6 +373,8 @@ fn comparison_operator(input: &str) -> IResult<ComparisonOperator> {
 }
 
 fn select_stmt(input: &str) -> IResult<Query> {
+    let (input, explain_kw) = opt(ws(tag_no_case("EXPLAIN")))(input)?;
+    let explain = explain_kw.is_some();
     let (input, _) = ws(tag_no_case("SELECT"))(input)?;
     let (input, match_clauses) = parse_select_match_clauses(input)?;
     let (input, conditions) = opt(|input| {
@@ -391,6 +393,7 @@ fn select_stmt(input: &str) -> IResult<Query> {
             conditions: conditions.unwrap_or_default(),
             with: with_clause,
             returns,
+            explain,
         }),
     ))
 }
