@@ -132,9 +132,12 @@ function App() {
   return (
     <div className="page">
       <header>
-        <div>
-          <h1>GraphDB Client</h1>
-          <p>Run Cypher-inspired statements against the daemon and inspect catalog procedures.</p>
+        <div className="brand">
+          <img src="/img/logo.png" alt="GraphDB logo" className="brand-logo" />
+          <div>
+            <h1>GraphDB Client</h1>
+            <p>Run Cypher-inspired statements against the daemon and inspect catalog procedures.</p>
+          </div>
         </div>
         <div className="status-group">
           <div className="status-pill">
