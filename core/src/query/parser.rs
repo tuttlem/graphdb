@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use nom::branch::alt;
 use nom::bytes::complete::{escaped, tag, tag_no_case, take_while, take_while1};
-use nom::character::complete::{alpha1, char, digit1};
+use nom::character::complete::{alpha1, char, digit1, one_of};
 use nom::combinator::{all_consuming, map, opt, recognize, value};
 use nom::error::{ErrorKind, VerboseError, VerboseErrorKind, convert_error};
 use nom::multi::{many0, many1, separated_list0, separated_list1};
@@ -508,6 +508,9 @@ fn parse_single_match_clause(input: &str) -> IResult<SelectMatchClause> {
 }
 
 fn match_pattern(input: &str) -> IResult<MatchPattern> {
+    if let Ok((rest, path)) = path_match_pattern(input) {
+        return Ok((rest, MatchPattern::Path(path)));
+    }
     let (input, left) = ws(node_pattern)(input)?;
     if let Ok((input, relationship)) = parse_relationship_pattern(input) {
         let (input, right) = ws(node_pattern)(input)?;
@@ -521,6 +524,24 @@ fn match_pattern(input: &str) -> IResult<MatchPattern> {
         ));
     }
     Ok((input, MatchPattern::Node(left)))
+}
+
+fn path_match_pattern(input: &str) -> IResult<PathPattern> {
+    let (input, alias) = ws(identifier)(input)?;
+    let (input, _) = ws(char('='))(input)?;
+    let (input, binding) = parse_path_expression(input, alias.to_string())?;
+    Ok((
+        input,
+        PathPattern {
+            alias: binding.alias,
+            pattern: RelationshipMatch {
+                left: binding.start,
+                relationship: binding.relationship,
+                right: binding.end,
+            },
+            mode: binding.mode,
+        },
+    ))
 }
 
 fn with_clause(input: &str) -> IResult<WithClause> {
@@ -556,6 +577,34 @@ fn parse_expression(input: &str) -> IResult<Expression> {
 }
 
 fn non_aggregate_expression(input: &str) -> IResult<Expression> {
+    parse_additive_expression(input)
+}
+
+fn parse_additive_expression(input: &str) -> IResult<Expression> {
+    let (mut input, mut expr) = non_aggregate_term(input)?;
+    loop {
+        let op_result = ws(one_of("+-"))(input);
+        let (next_input, op_char) = match op_result {
+            Ok(result) => result,
+            Err(_) => break,
+        };
+        let (next_input, rhs) = non_aggregate_term(next_input)?;
+        let operator = match op_char {
+            '+' => BinaryOperator::Add,
+            '-' => BinaryOperator::Subtract,
+            _ => unreachable!(),
+        };
+        expr = Expression::BinaryOp {
+            left: Box::new(expr),
+            operator,
+            right: Box::new(rhs),
+        };
+        input = next_input;
+    }
+    Ok((input, expr))
+}
+
+fn non_aggregate_term(input: &str) -> IResult<Expression> {
     if let Ok((rest, func)) = function_expression(input) {
         return Ok((rest, Expression::Function(Box::new(func))));
     }
@@ -629,6 +678,8 @@ fn scalar_function_expression(input: &str) -> IResult<FunctionExpression> {
 
 fn scalar_function_group_one(input: &str) -> IResult<ScalarFunction> {
     alt((
+        nodes_function,
+        relationships_function,
         keys_function,
         labels_function,
         range_function,
@@ -654,6 +705,7 @@ fn scalar_function_group_two(input: &str) -> IResult<ScalarFunction> {
         size_function,
         length_function,
         timestamp_function,
+        reduce_function,
     ))(input)
 }
 
@@ -831,6 +883,18 @@ fn labels_function(input: &str) -> IResult<ScalarFunction> {
     Ok((input, ScalarFunction::Labels(expr)))
 }
 
+fn nodes_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("nodes"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Nodes(expr)))
+}
+
+fn relationships_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("relationships"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((input, ScalarFunction::Relationships(expr)))
+}
+
 fn range_function(input: &str) -> IResult<ScalarFunction> {
     let (input, _) = ws(tag_no_case("range"))(input)?;
     let (input, _) = ws(char('('))(input)?;
@@ -844,6 +908,31 @@ fn range_function(input: &str) -> IResult<ScalarFunction> {
     })(input)?;
     let (input, _) = ws(char(')'))(input)?;
     Ok((input, ScalarFunction::Range { start, end, step }))
+}
+
+fn reduce_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("reduce"))(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, accumulator) = ws(identifier)(input)?;
+    let (input, _) = ws(char('='))(input)?;
+    let (input, initial) = non_aggregate_expression(input)?;
+    let (input, _) = ws(char(','))(input)?;
+    let (input, variable) = ws(identifier)(input)?;
+    let (input, _) = ws(tag_no_case("IN"))(input)?;
+    let (input, list_expr) = non_aggregate_expression(input)?;
+    let (input, _) = ws(char('|'))(input)?;
+    let (input, expression) = non_aggregate_expression(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        ScalarFunction::Reduce {
+            accumulator: accumulator.to_string(),
+            initial,
+            variable: variable.to_string(),
+            list: list_expr,
+            expression,
+        },
+    ))
 }
 
 fn reverse_function(input: &str) -> IResult<ScalarFunction> {

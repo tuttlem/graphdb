@@ -100,6 +100,14 @@ pub struct SelectMatchClause {
 pub enum MatchPattern {
     Node(NodePattern),
     Relationship(RelationshipMatch),
+    Path(PathPattern),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathPattern {
+    pub alias: String,
+    pub pattern: RelationshipMatch,
+    pub mode: PathQueryMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +134,17 @@ pub enum Expression {
     Aggregate(AggregateExpression),
     Function(Box<FunctionExpression>),
     Literal(Value),
+    BinaryOp {
+        left: Box<Expression>,
+        operator: BinaryOperator,
+        right: Box<Expression>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BinaryOperator {
+    Add,
+    Subtract,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +172,8 @@ pub enum FunctionExpression {
 pub enum ScalarFunction {
     Keys(Expression),
     Labels(Expression),
+    Nodes(Expression),
+    Relationships(Expression),
     Range {
         start: Expression,
         end: Expression,
@@ -188,6 +209,13 @@ pub enum ScalarFunction {
         null_on_unsupported: bool,
     },
     Type(FieldReference),
+    Reduce {
+        accumulator: String,
+        initial: Expression,
+        variable: String,
+        list: Expression,
+        expression: Expression,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

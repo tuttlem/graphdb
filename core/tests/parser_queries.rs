@@ -397,3 +397,14 @@ RETURN a, b;
         other => panic!("unexpected query {other:?}"),
     }
 }
+
+#[test]
+fn parse_reduce_function() {
+    let input = r#"
+SELECT MATCH p = (a:Person)-[:KNOWS*1..2]->(b:Person)
+RETURN nodes(p) AS nodes,
+       relationships(p) AS rels,
+       reduce(total = 0, person IN nodes(p) | total + 1) AS score;
+"#;
+    parse_queries(input).expect("reduce query");
+}

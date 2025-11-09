@@ -208,7 +208,8 @@ Snippet of the response payload:
 The query engine includes several Cypher-style helpers:
 
 - **Predicate** – `all`, `any`, `none`, `single`, `isEmpty`, and pattern `exists(...)` all behave like their Cypher equivalents (e.g. `all([])` is vacuously `true`, `any([])` is `false`, nulls propagate when no decisive value exists).
-- **Scalar/List** – `coalesce`, `keys`, `labels`, `head`, `last`, `tail`, `reverse`, `range`, `startNode`, `endNode`, `id`, `type`, `properties`, `randomUUID`, `size`, `length`, `timestamp`, plus the conversion helpers `toBoolean`, `toBooleanOrNull`, `toBooleanList`, `toFloat`, `toFloatOrNull`, `toFloatList`, `toInteger`, `toIntegerOrNull`, `toIntegerList`, and `toStringList`. Conversion functions return `null` for `null` or unsupported inputs when using the `OrNull`/list variants.
+- **Scalar/List** – `coalesce`, `keys`, `labels`, `head`, `last`, `tail`, `reverse`, `range`, `startNode`, `endNode`, `id`, `type`, `properties`, `randomUUID`, `size`, `length`, `timestamp`, plus the conversion helpers `toBoolean`, `toBooleanOrNull`, `toBooleanList`, `toFloat`, `toFloatOrNull`, `toFloatList`, `toInteger`, `toIntegerOrNull`, `toIntegerList`, and `toStringList`. Conversion functions return `null` for `null` or unsupported inputs when using the `OrNull`/list variants. `relationships`, `nodes` and `reduce`.
+
 
 Example:
 

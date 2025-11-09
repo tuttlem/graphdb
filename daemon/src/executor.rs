@@ -5,11 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::attr::{AttributeContainer, AttributeValue};
 use graphdb_core::query::{
-    AggregateExpression, AggregateFunction, ComparisonOperator, CreatePattern, CreateRelationship,
-    ExistsFunction, Expression, FieldReference, FunctionExpression, GraphDbProcedure,
-    ListExpression, ListPredicate, ListPredicateFunction, ListPredicateKind, MatchPattern,
-    NodePattern, PathFilter, PathLength, PathMatchQuery, PathQueryMode, PathReturn,
-    PredicateFilter, Procedure, Projection, Properties, Query, RelationshipDirection,
+    AggregateExpression, AggregateFunction, BinaryOperator, ComparisonOperator, CreatePattern,
+    CreateRelationship, ExistsFunction, Expression, FieldReference, FunctionExpression,
+    GraphDbProcedure, ListExpression, ListPredicate, ListPredicateFunction, ListPredicateKind,
+    MatchPattern, NodePattern, PathFilter, PathLength, PathMatchQuery, PathPattern, PathQueryMode,
+    PathReturn, PredicateFilter, Procedure, Projection, Properties, Query, RelationshipDirection,
     RelationshipMatch, RelationshipPattern, ScalarFunction, SelectMatchClause, SelectQuery, Value,
     ValueOperand, WithClause, parse_queries,
 };
@@ -38,13 +38,23 @@ pub struct ExecutionReport {
 struct QueryRow {
     nodes: HashMap<String, Option<Node>>,
     relationships: HashMap<String, Option<Edge>>,
+    paths: HashMap<String, Option<QueryPath>>,
+    lists: HashMap<String, Vec<FieldValue>>,
     scalars: HashMap<String, Value>,
+}
+
+#[derive(Clone)]
+struct QueryPath {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
 }
 
 #[derive(Clone)]
 enum FieldValue {
     Node(Node),
     Relationship(Edge),
+    Path(QueryPath),
+    List(Vec<FieldValue>),
     Scalar(Value),
 }
 
@@ -342,6 +352,24 @@ fn pattern_selectivity(pattern: &MatchPattern) -> usize {
             };
             label_score + property_score + length_score
         }
+        MatchPattern::Path(path) => {
+            let rel = &path.pattern;
+            let label_score = if rel.relationship.label.is_some() {
+                3
+            } else {
+                1
+            };
+            let property_score = rel.relationship.properties.0.len();
+            let length_score = match &rel.relationship.length {
+                PathLength::Exact(1) => 4,
+                PathLength::Exact(n) => (4 + (*n as usize)).max(1),
+                PathLength::Range { min, max } => {
+                    let upper = max.unwrap_or(*min);
+                    (4 + (*min as usize) + (upper as usize)).max(1)
+                }
+            };
+            label_score + property_score + length_score
+        }
     }
 }
 
@@ -363,6 +391,9 @@ fn apply_match_clause<B: StorageBackend>(
                     }
                     MatchPattern::Relationship(rel) => {
                         extend_with_relationship_pattern(db, partial, rel, conditions_by_alias)?
+                    }
+                    MatchPattern::Path(path_pattern) => {
+                        extend_with_path_pattern(db, partial, path_pattern, conditions_by_alias)?
                     }
                 };
                 next.append(&mut produced);
@@ -406,6 +437,12 @@ fn apply_with_clause<B: StorageBackend>(
                     FieldValue::Relationship(edge) => {
                         next.relationships.insert(label, Some(edge));
                     }
+                    FieldValue::Path(path) => {
+                        next.paths.insert(label, Some(path));
+                    }
+                    FieldValue::List(items) => {
+                        next.lists.insert(label, items);
+                    }
                     FieldValue::Scalar(value) => {
                         next.scalars.insert(label, value);
                     }
@@ -417,6 +454,31 @@ fn apply_with_clause<B: StorageBackend>(
                         }
                         FieldValue::Relationship(edge) => {
                             next.relationships.insert(label, Some(edge));
+                        }
+                        FieldValue::Path(path) => {
+                            next.paths.insert(label, Some(path));
+                        }
+                        FieldValue::List(items) => {
+                            next.lists.insert(label, items);
+                        }
+                        FieldValue::Scalar(value) => {
+                            next.scalars.insert(label, value);
+                        }
+                    }
+                }
+                Expression::BinaryOp { .. } => {
+                    match evaluate_expression(db, &row, &projection.expression, query_timestamp)? {
+                        FieldValue::Node(node) => {
+                            next.nodes.insert(label, Some(node));
+                        }
+                        FieldValue::Relationship(edge) => {
+                            next.relationships.insert(label, Some(edge));
+                        }
+                        FieldValue::Path(path) => {
+                            next.paths.insert(label, Some(path));
+                        }
+                        FieldValue::List(items) => {
+                            next.lists.insert(label, items);
                         }
                         FieldValue::Scalar(value) => {
                             next.scalars.insert(label, value);
@@ -639,6 +701,9 @@ fn project_rows<B: StorageBackend>(
                 Expression::Function(func) => {
                     evaluate_function(db, row, func.as_ref(), query_timestamp)?
                 }
+                Expression::BinaryOp { .. } => {
+                    evaluate_expression(db, row, &projection.expression, query_timestamp)?
+                }
                 Expression::Literal(value) => FieldValue::Scalar(value.clone()),
                 Expression::Aggregate(_) => {
                     return Err(DaemonError::Query(
@@ -646,15 +711,7 @@ fn project_rows<B: StorageBackend>(
                     ));
                 }
             };
-            let json_value = match value {
-                FieldValue::Node(node) => serde_json::to_value(node).map_err(|err| {
-                    DaemonError::Query(format!("failed to serialize node: {err}"))
-                })?,
-                FieldValue::Relationship(edge) => serde_json::to_value(edge).map_err(|err| {
-                    DaemonError::Query(format!("failed to serialize relationship: {err}"))
-                })?,
-                FieldValue::Scalar(val) => value_to_json(&val),
-            };
+            let json_value = field_value_to_json(&value)?;
             map.insert(projection_label(projection), json_value);
         }
         results.push(JsonValue::Object(map));
@@ -671,6 +728,11 @@ fn evaluate_aggregates(
         let agg = match &projection.expression {
             Expression::Aggregate(expr) => expr,
             Expression::Field(_) | Expression::Function(_) | Expression::Literal(_) => {
+                return Err(DaemonError::Query(
+                    "non-aggregate projection encountered in aggregate evaluation".into(),
+                ));
+            }
+            Expression::BinaryOp { .. } => {
                 return Err(DaemonError::Query(
                     "non-aggregate projection encountered in aggregate evaluation".into(),
                 ));
@@ -695,6 +757,7 @@ fn grouped_projection<B: StorageBackend>(
             Expression::Field(_) | Expression::Function(_) | Expression::Literal(_) => {
                 group_fields.push(projection)
             }
+            Expression::BinaryOp { .. } => group_fields.push(projection),
             Expression::Aggregate(_) => aggregate_fields.push(projection),
         }
     }
@@ -720,6 +783,11 @@ fn grouped_projection<B: StorageBackend>(
                     field_value_to_scalar(value)?
                 }
                 Expression::Literal(value) => value.clone(),
+                Expression::BinaryOp { .. } => {
+                    let value =
+                        evaluate_expression(db, row, &projection.expression, query_timestamp)?;
+                    field_value_to_scalar(value)?
+                }
                 Expression::Aggregate(_) => unreachable!(),
             };
             key_components.push(value_to_json(&value));
@@ -752,6 +820,14 @@ fn grouped_projection<B: StorageBackend>(
                     let value = compute_aggregate(&subset, expr)?;
                     map.insert(label, value_to_json(&value));
                 }
+                Expression::BinaryOp { .. } => {
+                    let value = state
+                        .key_values
+                        .get(&label)
+                        .cloned()
+                        .ok_or_else(|| DaemonError::Query("group key missing".into()))?;
+                    map.insert(label, value_to_json(&value));
+                }
             }
         }
         results.push(JsonValue::Object(map));
@@ -770,6 +846,7 @@ fn projection_label(projection: &Projection) -> String {
         Expression::Aggregate(agg) => aggregate_label(agg),
         Expression::Function(func) => function_label(func.as_ref()),
         Expression::Literal(value) => literal_label(value),
+        Expression::BinaryOp { .. } => expression_label(&projection.expression),
     }
 }
 
@@ -837,6 +914,10 @@ fn function_label(func: &FunctionExpression) -> String {
 
 fn scalar_function_label(func: &ScalarFunction) -> String {
     match func {
+        ScalarFunction::Nodes(expr) => format!("nodes({})", expression_label(expr)),
+        ScalarFunction::Relationships(expr) => {
+            format!("relationships({})", expression_label(expr))
+        }
         ScalarFunction::Keys(expr) => format!("keys({})", expression_label(expr)),
         ScalarFunction::Labels(expr) => format!("labels({})", expression_label(expr)),
         ScalarFunction::Range { start, end, step } => {
@@ -887,6 +968,11 @@ fn scalar_function_label(func: &ScalarFunction) -> String {
         ScalarFunction::Size(expr) => format!("size({})", expression_label(expr)),
         ScalarFunction::Length(expr) => format!("length({})", expression_label(expr)),
         ScalarFunction::Timestamp => "timestamp()".into(),
+        ScalarFunction::Reduce {
+            accumulator,
+            variable,
+            ..
+        } => format!("reduce({} = …, {} IN …)", accumulator, variable),
         ScalarFunction::ToBoolean {
             expr,
             null_on_unsupported,
@@ -926,6 +1012,22 @@ fn expression_label(expr: &Expression) -> String {
         Expression::Field(field) => field_label(field),
         Expression::Function(func) => function_label(func.as_ref()),
         Expression::Literal(value) => value_to_json(value).to_string(),
+        Expression::BinaryOp {
+            left,
+            operator,
+            right,
+        } => {
+            let op_str = match operator {
+                BinaryOperator::Add => "+",
+                BinaryOperator::Subtract => "-",
+            };
+            format!(
+                "({} {} {})",
+                expression_label(left),
+                op_str,
+                expression_label(right)
+            )
+        }
         Expression::Aggregate(_) => "<agg>".into(),
     }
 }
@@ -1078,6 +1180,15 @@ fn resolve_field(row: &QueryRow, field: &FieldReference) -> Result<FieldValue, D
         return Ok(FieldValue::Scalar(value.clone()));
     }
 
+    if let Some(items) = row.lists.get(&field.alias) {
+        if field.property.is_some() {
+            return Err(DaemonError::Query(
+                "list aliases do not support property access".into(),
+            ));
+        }
+        return Ok(FieldValue::List(items.clone()));
+    }
+
     if let Some(entry) = row.nodes.get(&field.alias) {
         return match entry {
             Some(node) => {
@@ -1087,6 +1198,21 @@ fn resolve_field(row: &QueryRow, field: &FieldReference) -> Result<FieldValue, D
                     Ok(FieldValue::Scalar(value))
                 } else {
                     Ok(FieldValue::Node(node.clone()))
+                }
+            }
+            None => Ok(FieldValue::Scalar(Value::Null)),
+        };
+    }
+
+    if let Some(entry) = row.paths.get(&field.alias) {
+        return match entry {
+            Some(path) => {
+                if field.property.is_some() {
+                    Err(DaemonError::Query(
+                        "path aliases do not support property access".into(),
+                    ))
+                } else {
+                    Ok(FieldValue::Path(path.clone()))
                 }
             }
             None => Ok(FieldValue::Scalar(Value::Null)),
@@ -1119,6 +1245,12 @@ fn field_value_to_scalar(value: FieldValue) -> Result<Value, DaemonError> {
         )),
         FieldValue::Relationship(_) => Err(DaemonError::Query(
             "grouping by relationship aliases is not supported".into(),
+        )),
+        FieldValue::Path(_) => Err(DaemonError::Query(
+            "grouping by path aliases is not supported".into(),
+        )),
+        FieldValue::List(_) => Err(DaemonError::Query(
+            "grouping by list aliases is not supported".into(),
         )),
     }
 }
@@ -1168,6 +1300,16 @@ fn evaluate_expression<B: StorageBackend>(
         Expression::Field(field) => resolve_field(row, field),
         Expression::Function(func) => evaluate_function(db, row, func.as_ref(), query_timestamp),
         Expression::Literal(value) => Ok(FieldValue::Scalar(value.clone())),
+        Expression::BinaryOp {
+            left,
+            operator,
+            right,
+        } => {
+            let left_value = evaluate_expression_to_scalar(db, row, left, query_timestamp)?;
+            let right_value = evaluate_expression_to_scalar(db, row, right, query_timestamp)?;
+            let result = apply_binary_operator(*operator, left_value, right_value)?;
+            Ok(FieldValue::Scalar(result))
+        }
         Expression::Aggregate(_) => Err(DaemonError::Query(
             "aggregates are not allowed in this context".into(),
         )),
@@ -1289,6 +1431,49 @@ fn convert_to_integer(value: Value, null_on_unsupported: bool) -> Result<Value, 
     })
 }
 
+fn apply_binary_operator(
+    operator: BinaryOperator,
+    left: Value,
+    right: Value,
+) -> Result<Value, DaemonError> {
+    match operator {
+        BinaryOperator::Add => add_values(left, right),
+        BinaryOperator::Subtract => subtract_values(left, right),
+    }
+}
+
+fn add_values(left: Value, right: Value) -> Result<Value, DaemonError> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Integer(a), Value::Integer(b)) => match a.checked_add(b) {
+            Some(sum) => Ok(Value::Integer(sum)),
+            None => Ok(Value::Float(a as f64 + b as f64)),
+        },
+        (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(a as f64 + b)),
+        (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a + b as f64)),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+        _ => Err(DaemonError::Query(
+            "addition requires numeric operands".into(),
+        )),
+    }
+}
+
+fn subtract_values(left: Value, right: Value) -> Result<Value, DaemonError> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Integer(a), Value::Integer(b)) => match a.checked_sub(b) {
+            Some(diff) => Ok(Value::Integer(diff)),
+            None => Ok(Value::Float(a as f64 - b as f64)),
+        },
+        (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(a as f64 - b)),
+        (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a - b as f64)),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
+        _ => Err(DaemonError::Query(
+            "subtraction requires numeric operands".into(),
+        )),
+    }
+}
+
 fn convert_to_string(value: Value, null_on_unsupported: bool) -> Result<Value, DaemonError> {
     Ok(match value {
         Value::Null => Value::Null,
@@ -1394,6 +1579,38 @@ fn evaluate_scalar_function<B: StorageBackend>(
                 }
                 FieldValue::Scalar(Value::Null) => Ok(FieldValue::Scalar(Value::Null)),
                 _ => Err(DaemonError::Query("labels() expects a node".into())),
+            }
+        }
+        ScalarFunction::Nodes(expr) => {
+            let value = evaluate_expression(db, row, expr, query_timestamp)?;
+            match value {
+                FieldValue::Scalar(Value::Null) => Ok(FieldValue::Scalar(Value::Null)),
+                FieldValue::Path(path) => {
+                    let items = path.nodes.into_iter().map(FieldValue::Node).collect();
+                    Ok(FieldValue::List(items))
+                }
+                other => Err(DaemonError::Query(format!(
+                    "nodes() expects a path, received {}",
+                    field_value_type(&other)
+                ))),
+            }
+        }
+        ScalarFunction::Relationships(expr) => {
+            let value = evaluate_expression(db, row, expr, query_timestamp)?;
+            match value {
+                FieldValue::Scalar(Value::Null) => Ok(FieldValue::Scalar(Value::Null)),
+                FieldValue::Path(path) => {
+                    let items = path
+                        .edges
+                        .into_iter()
+                        .map(FieldValue::Relationship)
+                        .collect();
+                    Ok(FieldValue::List(items))
+                }
+                other => Err(DaemonError::Query(format!(
+                    "relationships() expects a path, received {}",
+                    field_value_type(&other)
+                ))),
             }
         }
         ScalarFunction::Range { start, end, step } => {
@@ -1568,6 +1785,11 @@ fn evaluate_scalar_function<B: StorageBackend>(
                         "properties() expects node, relationship, or map".into(),
                     ));
                 }
+                FieldValue::Path(_) | FieldValue::List(_) => {
+                    return Err(DaemonError::Query(
+                        "properties() expects node, relationship, or map".into(),
+                    ));
+                }
             };
             Ok(FieldValue::Scalar(map))
         }
@@ -1594,6 +1816,22 @@ fn evaluate_scalar_function<B: StorageBackend>(
             Ok(FieldValue::Scalar(len))
         }
         ScalarFunction::Timestamp => Ok(FieldValue::Scalar(Value::Integer(query_timestamp))),
+        ScalarFunction::Reduce {
+            accumulator,
+            initial,
+            variable,
+            list,
+            expression,
+        } => evaluate_reduce_function(
+            db,
+            row,
+            accumulator,
+            initial,
+            variable,
+            list,
+            expression,
+            query_timestamp,
+        ),
         ScalarFunction::ToBoolean {
             expr,
             null_on_unsupported,
@@ -1641,6 +1879,34 @@ fn evaluate_scalar_function<B: StorageBackend>(
             }
         }
     }
+}
+
+fn evaluate_reduce_function<B: StorageBackend>(
+    db: &Database<B>,
+    row: &QueryRow,
+    accumulator_alias: &str,
+    initial: &Expression,
+    variable_alias: &str,
+    list_expr: &Expression,
+    expression: &Expression,
+    query_timestamp: i64,
+) -> Result<FieldValue, DaemonError> {
+    let mut accumulator = evaluate_expression_to_scalar(db, row, initial, query_timestamp)?;
+    let list_value = evaluate_expression(db, row, list_expr, query_timestamp)?;
+    let items = match normalize_list_items(list_value)? {
+        Some(items) => items,
+        None => return Ok(FieldValue::Scalar(Value::Null)),
+    };
+
+    let mut scoped_row = row.clone();
+    for item in items {
+        bind_reduce_alias(&mut scoped_row, variable_alias, &item);
+        let acc_field = FieldValue::Scalar(accumulator.clone());
+        bind_reduce_alias(&mut scoped_row, accumulator_alias, &acc_field);
+        accumulator = evaluate_expression_to_scalar(db, &scoped_row, expression, query_timestamp)?;
+    }
+
+    Ok(FieldValue::Scalar(accumulator))
 }
 
 fn evaluate_list_predicate_function(
@@ -1757,6 +2023,57 @@ fn value_operand_value(row: &QueryRow, operand: &ValueOperand) -> Result<Value, 
             field_value_to_scalar(value)
         }
         ValueOperand::Literal(value) => Ok(value.clone()),
+    }
+}
+
+fn normalize_list_items(value: FieldValue) -> Result<Option<Vec<FieldValue>>, DaemonError> {
+    match value {
+        FieldValue::Scalar(Value::Null) => Ok(None),
+        FieldValue::Scalar(Value::List(values)) => {
+            Ok(Some(values.into_iter().map(FieldValue::Scalar).collect()))
+        }
+        FieldValue::List(items) => Ok(Some(items)),
+        other => Err(DaemonError::Query(format!(
+            "reduce() expects LIST input, received {}",
+            field_value_type(&other)
+        ))),
+    }
+}
+
+fn bind_reduce_alias(row: &mut QueryRow, alias: &str, value: &FieldValue) {
+    row.nodes.remove(alias);
+    row.relationships.remove(alias);
+    row.paths.remove(alias);
+    row.lists.remove(alias);
+    row.scalars.remove(alias);
+
+    match value {
+        FieldValue::Node(node) => {
+            row.nodes.insert(alias.to_string(), Some(node.clone()));
+        }
+        FieldValue::Relationship(edge) => {
+            row.relationships
+                .insert(alias.to_string(), Some(edge.clone()));
+        }
+        FieldValue::Path(path) => {
+            row.paths.insert(alias.to_string(), Some(path.clone()));
+        }
+        FieldValue::List(items) => {
+            row.lists.insert(alias.to_string(), items.clone());
+        }
+        FieldValue::Scalar(val) => {
+            row.scalars.insert(alias.to_string(), val.clone());
+        }
+    }
+}
+
+fn field_value_type(value: &FieldValue) -> &'static str {
+    match value {
+        FieldValue::Scalar(_) => "scalar",
+        FieldValue::Node(_) => "node",
+        FieldValue::Relationship(_) => "relationship",
+        FieldValue::Path(_) => "path",
+        FieldValue::List(_) => "list",
     }
 }
 
@@ -2319,6 +2636,260 @@ fn edge_satisfies_direction(
     }
 }
 
+fn extend_with_path_pattern<B: StorageBackend>(
+    db: &Database<B>,
+    row: QueryRow,
+    path: &PathPattern,
+    conditions_by_alias: &HashMap<String, Vec<graphdb_core::query::Condition>>,
+) -> Result<Vec<QueryRow>, DaemonError> {
+    if path.pattern.relationship.alias.is_some() {
+        ensure_single_length(&path.pattern.relationship.length)?;
+    }
+
+    let left_alias = path
+        .pattern
+        .left
+        .alias
+        .as_ref()
+        .ok_or_else(|| DaemonError::Query("left node requires alias".into()))?
+        .to_string();
+    let right_alias = path
+        .pattern
+        .right
+        .alias
+        .as_ref()
+        .ok_or_else(|| DaemonError::Query("right node requires alias".into()))?
+        .to_string();
+
+    match (
+        alias_state(&row, &left_alias),
+        alias_state(&row, &right_alias),
+    ) {
+        (AliasState::Null, _) | (_, AliasState::Null) => Ok(Vec::new()),
+        (AliasState::Bound(left_node), AliasState::Bound(right_node)) => {
+            if !relationship_pair_satisfies(
+                db,
+                &left_node,
+                &right_node,
+                &path.pattern,
+                conditions_by_alias,
+            )? {
+                return Ok(Vec::new());
+            }
+            let mut end_ids = HashSet::new();
+            end_ids.insert(right_node.id());
+            let path_states = enumerate_path_states_for_nodes(
+                db,
+                &[left_node.clone()],
+                &end_ids,
+                &path.pattern.relationship,
+                path.mode.clone(),
+            )?;
+            let mut results = Vec::new();
+            for state in path_states {
+                let query_path = path_state_to_query_path(db, &state)?;
+                let mut next = row.clone();
+                store_path_value(
+                    &mut next,
+                    &path.alias,
+                    query_path,
+                    path.pattern.relationship.alias.as_ref(),
+                )?;
+                results.push(next);
+            }
+            Ok(results)
+        }
+        (AliasState::Bound(left_node), AliasState::Unbound) => {
+            let right_candidates = select_nodes(
+                db,
+                &path.pattern.right,
+                alias_conditions_slice(conditions_by_alias, &right_alias),
+            )?;
+            if right_candidates.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut right_index = HashMap::new();
+            let mut end_ids = HashSet::new();
+            for (idx, node) in right_candidates.iter().enumerate() {
+                right_index.insert(node.id(), idx);
+                end_ids.insert(node.id());
+            }
+            let path_states = enumerate_path_states_for_nodes(
+                db,
+                &[left_node.clone()],
+                &end_ids,
+                &path.pattern.relationship,
+                path.mode.clone(),
+            )?;
+            let mut results = Vec::new();
+            for state in path_states {
+                if let Some(&idx) = state.nodes.last().and_then(|id| right_index.get(id)) {
+                    let query_path = path_state_to_query_path(db, &state)?;
+                    let mut next = row.clone();
+                    next.nodes
+                        .insert(right_alias.clone(), Some(right_candidates[idx].clone()));
+                    store_path_value(
+                        &mut next,
+                        &path.alias,
+                        query_path,
+                        path.pattern.relationship.alias.as_ref(),
+                    )?;
+                    results.push(next);
+                }
+            }
+            Ok(results)
+        }
+        (AliasState::Unbound, AliasState::Bound(right_node)) => {
+            let left_candidates = select_nodes(
+                db,
+                &path.pattern.left,
+                alias_conditions_slice(conditions_by_alias, &left_alias),
+            )?;
+            if left_candidates.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut left_index = HashMap::new();
+            for (idx, node) in left_candidates.iter().enumerate() {
+                left_index.insert(node.id(), idx);
+            }
+            let mut end_ids = HashSet::new();
+            end_ids.insert(right_node.id());
+            let path_states = enumerate_path_states_for_nodes(
+                db,
+                &left_candidates,
+                &end_ids,
+                &path.pattern.relationship,
+                path.mode.clone(),
+            )?;
+            let mut results = Vec::new();
+            for state in path_states {
+                if let Some(&idx) = state.nodes.first().and_then(|id| left_index.get(id)) {
+                    let query_path = path_state_to_query_path(db, &state)?;
+                    let mut next = row.clone();
+                    next.nodes
+                        .insert(left_alias.clone(), Some(left_candidates[idx].clone()));
+                    store_path_value(
+                        &mut next,
+                        &path.alias,
+                        query_path,
+                        path.pattern.relationship.alias.as_ref(),
+                    )?;
+                    results.push(next);
+                }
+            }
+            Ok(results)
+        }
+        (AliasState::Unbound, AliasState::Unbound) => {
+            let left_candidates = select_nodes(
+                db,
+                &path.pattern.left,
+                alias_conditions_slice(conditions_by_alias, &left_alias),
+            )?;
+            let right_candidates = select_nodes(
+                db,
+                &path.pattern.right,
+                alias_conditions_slice(conditions_by_alias, &right_alias),
+            )?;
+            if left_candidates.is_empty() || right_candidates.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut left_index = HashMap::new();
+            for (idx, node) in left_candidates.iter().enumerate() {
+                left_index.insert(node.id(), idx);
+            }
+            let mut right_index = HashMap::new();
+            let mut end_ids = HashSet::new();
+            for (idx, node) in right_candidates.iter().enumerate() {
+                right_index.insert(node.id(), idx);
+                end_ids.insert(node.id());
+            }
+            let path_states = enumerate_path_states_for_nodes(
+                db,
+                &left_candidates,
+                &end_ids,
+                &path.pattern.relationship,
+                path.mode.clone(),
+            )?;
+            let mut results = Vec::new();
+            for state in path_states {
+                let start_idx = state
+                    .nodes
+                    .first()
+                    .and_then(|id| left_index.get(id))
+                    .copied();
+                let end_idx = state
+                    .nodes
+                    .last()
+                    .and_then(|id| right_index.get(id))
+                    .copied();
+                if let (Some(l_idx), Some(r_idx)) = (start_idx, end_idx) {
+                    let query_path = path_state_to_query_path(db, &state)?;
+                    let mut next = row.clone();
+                    next.nodes
+                        .insert(left_alias.clone(), Some(left_candidates[l_idx].clone()));
+                    next.nodes
+                        .insert(right_alias.clone(), Some(right_candidates[r_idx].clone()));
+                    store_path_value(
+                        &mut next,
+                        &path.alias,
+                        query_path,
+                        path.pattern.relationship.alias.as_ref(),
+                    )?;
+                    results.push(next);
+                }
+            }
+            Ok(results)
+        }
+    }
+}
+
+fn alias_conditions_slice<'a>(
+    conditions_by_alias: &'a HashMap<String, Vec<graphdb_core::query::Condition>>,
+    alias: &str,
+) -> &'a [graphdb_core::query::Condition] {
+    conditions_by_alias
+        .get(alias)
+        .map(|conds| conds.as_slice())
+        .unwrap_or(&[])
+}
+
+fn enumerate_path_states_for_nodes<B: StorageBackend>(
+    db: &Database<B>,
+    starts: &[Node],
+    end_ids: &HashSet<NodeId>,
+    relationship: &RelationshipPattern,
+    mode: PathQueryMode,
+) -> Result<Vec<PathState>, DaemonError> {
+    if starts.is_empty() || end_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let start_arcs: Vec<_> = starts.iter().cloned().map(Arc::new).collect();
+    let start_ids: HashSet<NodeId> = start_arcs.iter().map(|node| node.id()).collect();
+    let bounds = length_bounds(&relationship.length);
+    match mode {
+        PathQueryMode::Shortest => shortest_path(
+            db,
+            &start_arcs,
+            &start_ids,
+            end_ids,
+            relationship,
+            bounds,
+            None,
+            "",
+        ),
+        PathQueryMode::All => enumerate_paths(
+            db,
+            &start_arcs,
+            &start_ids,
+            end_ids,
+            relationship,
+            bounds,
+            None,
+            "",
+        ),
+    }
+}
+
 fn relationship_pair_satisfies<B: StorageBackend>(
     db: &Database<B>,
     left: &Node,
@@ -2476,6 +3047,17 @@ fn register_missing_aliases(row: &mut QueryRow, clause: &SelectMatchClause) {
                     row.relationships.entry(alias.clone()).or_insert(None);
                 }
             }
+            MatchPattern::Path(path) => {
+                for node in [&path.pattern.left, &path.pattern.right] {
+                    if let Some(alias) = node.alias.as_ref() {
+                        row.nodes.entry(alias.clone()).or_insert(None);
+                    }
+                }
+                if let Some(alias) = path.pattern.relationship.alias.as_ref() {
+                    row.relationships.entry(alias.clone()).or_insert(None);
+                }
+                row.paths.entry(path.alias.clone()).or_insert(None);
+            }
         }
     }
 }
@@ -2498,6 +3080,28 @@ fn clause_aliases(clause: &SelectMatchClause) -> Vec<String> {
                             aliases.push(alias.clone());
                         }
                     }
+                }
+                if let Some(alias) = rel.relationship.alias.as_ref() {
+                    if !aliases.contains(alias) {
+                        aliases.push(alias.clone());
+                    }
+                }
+            }
+            MatchPattern::Path(path) => {
+                for node in [&path.pattern.left, &path.pattern.right] {
+                    if let Some(alias) = node.alias.as_ref() {
+                        if !aliases.contains(alias) {
+                            aliases.push(alias.clone());
+                        }
+                    }
+                }
+                if let Some(alias) = path.pattern.relationship.alias.as_ref() {
+                    if !aliases.contains(alias) {
+                        aliases.push(alias.clone());
+                    }
+                }
+                if !aliases.contains(&path.alias) {
+                    aliases.push(path.alias.clone());
                 }
             }
         }
@@ -2582,9 +3186,11 @@ fn compute_aggregate(rows: &[QueryRow], expr: &AggregateExpression) -> Result<Va
             for row in rows {
                 match resolve_field(row, field)? {
                     FieldValue::Scalar(Value::Null) => {}
-                    FieldValue::Scalar(_) | FieldValue::Node(_) | FieldValue::Relationship(_) => {
-                        total += 1
-                    }
+                    FieldValue::Scalar(_)
+                    | FieldValue::Node(_)
+                    | FieldValue::Relationship(_)
+                    | FieldValue::Path(_)
+                    | FieldValue::List(_) => total += 1,
                 }
             }
             Ok(Value::Integer(total))
@@ -2599,18 +3205,11 @@ fn compute_aggregate(rows: &[QueryRow], expr: &AggregateExpression) -> Result<Va
                 match resolve_field(row, field)? {
                     FieldValue::Scalar(Value::Null) => {}
                     FieldValue::Scalar(value) => items.push(value),
-                    FieldValue::Node(node) => {
-                        let serialized = serde_json::to_string(&node).map_err(|err| {
+                    other => {
+                        let json_value = field_value_to_json(&other)?;
+                        let serialized = serde_json::to_string(&json_value).map_err(|err| {
                             DaemonError::Query(format!(
-                                "failed to serialize node for collect: {err}"
-                            ))
-                        })?;
-                        items.push(Value::String(serialized));
-                    }
-                    FieldValue::Relationship(edge) => {
-                        let serialized = serde_json::to_string(&edge).map_err(|err| {
-                            DaemonError::Query(format!(
-                                "failed to serialize relationship for collect: {err}"
+                                "failed to serialize value for collect: {err}"
                             ))
                         })?;
                         items.push(Value::String(serialized));
@@ -2804,6 +3403,16 @@ fn numeric_values(
                     "numeric aggregate cannot operate on relationships".into(),
                 ));
             }
+            FieldValue::Path(_) => {
+                return Err(DaemonError::Query(
+                    "numeric aggregate cannot operate on paths".into(),
+                ));
+            }
+            FieldValue::List(_) => {
+                return Err(DaemonError::Query(
+                    "numeric aggregate cannot operate on list aliases".into(),
+                ));
+            }
         }
     }
     Ok((values, all_int))
@@ -2822,6 +3431,11 @@ fn scalar_values(rows: &[QueryRow], field: &FieldReference) -> Result<Vec<Value>
             FieldValue::Relationship(_) => {
                 return Err(DaemonError::Query(
                     "aggregation cannot operate on relationship aliases".into(),
+                ));
+            }
+            FieldValue::Path(_) | FieldValue::List(_) => {
+                return Err(DaemonError::Query(
+                    "aggregation cannot operate on path or list aliases".into(),
                 ));
             }
         }
@@ -3550,6 +4164,86 @@ fn load_nodes_by_ids<B: StorageBackend>(
     Ok(nodes)
 }
 
+fn load_edges_by_ids<B: StorageBackend>(
+    db: &Database<B>,
+    ids: &[EdgeId],
+) -> Result<Vec<Edge>, DaemonError> {
+    let mut edges = Vec::new();
+    for id in ids {
+        if let Some(edge) = db.get_edge(*id)? {
+            edges.push((*edge).clone());
+        }
+    }
+    Ok(edges)
+}
+
+fn path_state_to_query_path<B: StorageBackend>(
+    db: &Database<B>,
+    state: &PathState,
+) -> Result<QueryPath, DaemonError> {
+    let nodes = load_nodes_by_ids(db, &state.nodes)?;
+    let edges = load_edges_by_ids(db, &state.edges)?;
+    Ok(QueryPath { nodes, edges })
+}
+
+fn store_path_value(
+    row: &mut QueryRow,
+    alias: &str,
+    path: QueryPath,
+    relationship_alias: Option<&String>,
+) -> Result<(), DaemonError> {
+    if let Some(rel_alias) = relationship_alias {
+        if path.edges.len() != 1 {
+            return Err(DaemonError::Query(
+                "relationship alias requires single-hop path".into(),
+            ));
+        }
+        row.relationships
+            .insert(rel_alias.clone(), Some(path.edges[0].clone()));
+    }
+    row.paths.insert(alias.to_string(), Some(path));
+    Ok(())
+}
+
+fn path_to_json(path: &QueryPath) -> Result<JsonValue, DaemonError> {
+    let mut node_json = Vec::with_capacity(path.nodes.len());
+    for node in &path.nodes {
+        node_json.push(
+            serde_json::to_value(node)
+                .map_err(|err| DaemonError::Query(format!("failed to serialize node: {err}")))?,
+        );
+    }
+    let mut edge_json = Vec::with_capacity(path.edges.len());
+    for edge in &path.edges {
+        edge_json.push(serde_json::to_value(edge).map_err(|err| {
+            DaemonError::Query(format!("failed to serialize relationship: {err}"))
+        })?);
+    }
+    Ok(json!({
+        "nodes": node_json,
+        "relationships": edge_json,
+        "length": path.edges.len(),
+    }))
+}
+
+fn field_value_to_json(value: &FieldValue) -> Result<JsonValue, DaemonError> {
+    match value {
+        FieldValue::Scalar(val) => Ok(value_to_json(val)),
+        FieldValue::Node(node) => serde_json::to_value(node)
+            .map_err(|err| DaemonError::Query(format!("failed to serialize node: {err}"))),
+        FieldValue::Relationship(edge) => serde_json::to_value(edge)
+            .map_err(|err| DaemonError::Query(format!("failed to serialize relationship: {err}"))),
+        FieldValue::Path(path) => path_to_json(path),
+        FieldValue::List(items) => {
+            let mut array = Vec::with_capacity(items.len());
+            for item in items {
+                array.push(field_value_to_json(item)?);
+            }
+            Ok(JsonValue::Array(array))
+        }
+    }
+}
+
 fn person_pattern(alias: &str, id: &str) -> graphdb_core::query::NodePattern {
     let mut props = HashMap::new();
     props.insert("id".to_string(), Value::String(id.to_string()));
@@ -4171,6 +4865,35 @@ mod scalar_function_tests {
                 .collect::<Vec<_>>(),
             vec!["two", "three"]
         );
+    }
+
+    #[test]
+    fn nodes_relationships_and_reduce_functions() {
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"SELECT MATCH p = (a:Person {name: "Meg Ryan"})-[:KNOWS*1..2]->(b:Person)
+            RETURN nodes(p) AS pathNodes,
+                   relationships(p) AS pathRels,
+                   reduce(total = 0, person IN nodes(p) | total + size(person.name)) AS nameScore;"#,
+        );
+        assert!(!report.result_rows.is_empty());
+        let row = &report.result_rows[0];
+        let nodes = row
+            .get("pathNodes")
+            .and_then(|v| v.as_array())
+            .expect("nodes list");
+        let rels = row
+            .get("pathRels")
+            .and_then(|v| v.as_array())
+            .expect("relationships list");
+        assert_eq!(nodes.len(), rels.len() + 1);
+        let score = row
+            .get("nameScore")
+            .and_then(|v| v.as_i64())
+            .expect("reduce result");
+        assert!(score > 0);
     }
 
     #[test]
