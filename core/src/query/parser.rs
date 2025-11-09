@@ -374,8 +374,7 @@ fn comparison_operator(input: &str) -> IResult<ComparisonOperator> {
 
 fn select_stmt(input: &str) -> IResult<Query> {
     let (input, _) = ws(tag_no_case("SELECT"))(input)?;
-    let (input, _) = ws(tag_no_case("MATCH"))(input)?;
-    let (input, pattern) = ws(node_pattern)(input)?;
+    let (input, matches) = match_clauses(input)?;
     let (input, conditions) = opt(|input| {
         let (input, _) = ws(tag_no_case("WHERE"))(input)?;
         condition_list(input)
@@ -388,12 +387,51 @@ fn select_stmt(input: &str) -> IResult<Query> {
     Ok((
         input,
         Query::Select(SelectQuery {
-            pattern,
+            matches,
             conditions: conditions.unwrap_or_default(),
             with: with_clause,
             returns,
         }),
     ))
+}
+
+fn match_clauses(mut input: &str) -> IResult<Vec<MatchPattern>> {
+    let (next, mut patterns) = match_clause_list(input)?;
+    input = next;
+
+    loop {
+        match match_clause_list(input) {
+            Ok((rest, mut more)) => {
+                patterns.append(&mut more);
+                input = rest;
+            }
+            Err(nom::Err::Error(_)) => break,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok((input, patterns))
+}
+
+fn match_clause_list(input: &str) -> IResult<Vec<MatchPattern>> {
+    let (input, _) = ws(tag_no_case("MATCH"))(input)?;
+    separated_list1(ws(char(',')), match_pattern)(input)
+}
+
+fn match_pattern(input: &str) -> IResult<MatchPattern> {
+    let (input, left) = ws(node_pattern)(input)?;
+    if let Ok((input, relationship)) = parse_relationship_pattern(input) {
+        let (input, right) = ws(node_pattern)(input)?;
+        return Ok((
+            input,
+            MatchPattern::Relationship(RelationshipMatch {
+                left,
+                relationship,
+                right,
+            }),
+        ));
+    }
+    Ok((input, MatchPattern::Node(left)))
 }
 
 fn with_clause(input: &str) -> IResult<WithClause> {

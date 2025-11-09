@@ -1,12 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use common::attr::{AttributeContainer, AttributeValue};
 use graphdb_core::query::{
     AggregateExpression, AggregateFunction, ComparisonOperator, CreatePattern, CreateRelationship,
-    Expression, FieldReference, GraphDbProcedure, PathFilter, PathLength, PathMatchQuery,
-    PathQueryMode, PathReturn, Procedure, Projection, Properties, Query, RelationshipDirection,
-    RelationshipPattern, SelectQuery, Value, WithClause, parse_queries,
+    Expression, FieldReference, GraphDbProcedure, MatchPattern, NodePattern, PathFilter,
+    PathLength, PathMatchQuery, PathQueryMode, PathReturn, Procedure, Projection, Properties,
+    Query, RelationshipDirection, RelationshipPattern, SelectQuery, Value, WithClause,
+    parse_queries,
 };
 use graphdb_core::{
     AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
@@ -33,18 +35,29 @@ struct QueryRow {
     scalars: HashMap<String, Value>,
 }
 
-impl QueryRow {
-    fn from_node(alias: &str, node: Node) -> Self {
-        let mut row = QueryRow::default();
-        row.nodes.insert(alias.to_string(), node);
-        row
-    }
-}
+impl QueryRow {}
 
 #[derive(Clone)]
 enum FieldValue {
     Node(Node),
     Scalar(Value),
+}
+
+struct MatchPlan {
+    alias_order: Vec<String>,
+    aliases: HashMap<String, NodePattern>,
+    relationships: Vec<RelationshipRequirement>,
+}
+
+struct RelationshipRequirement {
+    left_alias: String,
+    right_alias: String,
+    pattern: RelationshipPattern,
+}
+
+struct GroupState {
+    key_values: HashMap<String, Value>,
+    row_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,17 +165,28 @@ fn execute_select<B: StorageBackend>(
     query: SelectQuery,
     ctx: &mut ExecutionReport,
 ) -> Result<(), DaemonError> {
-    let alias = query
-        .pattern
-        .alias
-        .clone()
-        .ok_or_else(|| DaemonError::Query("MATCH requires an alias".into()))?;
+    let plan = build_match_plan(&query.matches)?;
+    let conditions_by_alias = group_conditions_by_alias(&query.conditions);
+    let mut candidate_nodes = HashMap::new();
+    for alias in &plan.alias_order {
+        let pattern = plan
+            .aliases
+            .get(alias)
+            .expect("alias pattern missing")
+            .clone();
+        let alias_conditions = conditions_by_alias.get(alias).cloned().unwrap_or_default();
+        let nodes = select_nodes(db, &pattern, &alias_conditions)?;
+        candidate_nodes.insert(alias.clone(), nodes);
+    }
 
-    let nodes = select_nodes(db, &query.pattern, &query.conditions)?;
-    let mut rows: Vec<QueryRow> = nodes
-        .into_iter()
-        .map(|node| QueryRow::from_node(&alias, node))
-        .collect();
+    let mut rows = build_rows(db, &plan, &candidate_nodes, &conditions_by_alias)?;
+
+    if rows.is_empty() {
+        ctx.result_rows.clear();
+        ctx.selected_nodes.clear();
+        ctx.messages.push("match returned 0 rows".into());
+        return Ok(());
+    }
 
     if let Some(with_clause) = query.with.as_ref() {
         rows = apply_with_clause(rows, with_clause)?;
@@ -172,24 +196,22 @@ fn execute_select<B: StorageBackend>(
         .returns
         .iter()
         .any(|projection| matches!(projection.expression, Expression::Aggregate(_)));
-    if has_aggregate
-        && query
-            .returns
-            .iter()
-            .any(|projection| !matches!(projection.expression, Expression::Aggregate(_)))
-    {
-        return Err(DaemonError::Query(
-            "cannot mix aggregate and non-aggregate RETURN items".into(),
-        ));
-    }
+    let has_non_aggregate = query
+        .returns
+        .iter()
+        .any(|projection| matches!(projection.expression, Expression::Field(_)));
 
     if has_aggregate {
-        let row = evaluate_aggregates(&rows, &query.returns)?;
-        ctx.result_rows = vec![row];
-        ctx.selected_nodes.clear();
+        if has_non_aggregate {
+            ctx.result_rows = grouped_projection(&rows, &query.returns)?;
+            ctx.selected_nodes.clear();
+        } else {
+            let row = evaluate_aggregates(&rows, &query.returns)?;
+            ctx.result_rows = vec![row];
+            ctx.selected_nodes.clear();
+        }
     } else {
-        let json_rows = project_rows(&rows, &query.returns)?;
-        ctx.result_rows = json_rows;
+        ctx.result_rows = project_rows(&rows, &query.returns)?;
         if query.returns.len() == 1 {
             if let Expression::Field(field) = &query.returns[0].expression {
                 if field.property.is_none() {
@@ -207,6 +229,258 @@ fn execute_select<B: StorageBackend>(
 
     ctx.messages.push("match completed".into());
     Ok(())
+}
+
+fn group_conditions_by_alias(
+    conditions: &[graphdb_core::query::Condition],
+) -> HashMap<String, Vec<graphdb_core::query::Condition>> {
+    let mut map: HashMap<String, Vec<graphdb_core::query::Condition>> = HashMap::new();
+    for condition in conditions {
+        map.entry(condition.alias.clone())
+            .or_default()
+            .push(condition.clone());
+    }
+    map
+}
+
+fn build_match_plan(matches: &[MatchPattern]) -> Result<MatchPlan, DaemonError> {
+    if matches.is_empty() {
+        return Err(DaemonError::Query("MATCH clause is required".into()));
+    }
+
+    let mut alias_order = Vec::new();
+    let mut aliases: HashMap<String, NodePattern> = HashMap::new();
+    let mut relationships = Vec::new();
+
+    for pattern in matches {
+        match pattern {
+            MatchPattern::Node(node) => register_alias(node, &mut alias_order, &mut aliases)?,
+            MatchPattern::Relationship(rel) => {
+                register_alias(&rel.left, &mut alias_order, &mut aliases)?;
+                register_alias(&rel.right, &mut alias_order, &mut aliases)?;
+                let left_alias = rel
+                    .left
+                    .alias
+                    .clone()
+                    .ok_or_else(|| DaemonError::Query("left node requires alias".into()))?;
+                let right_alias = rel
+                    .right
+                    .alias
+                    .clone()
+                    .ok_or_else(|| DaemonError::Query("right node requires alias".into()))?;
+                relationships.push(RelationshipRequirement {
+                    left_alias,
+                    right_alias,
+                    pattern: rel.relationship.clone(),
+                });
+            }
+        }
+    }
+
+    if aliases.is_empty() {
+        return Err(DaemonError::Query(
+            "MATCH must bind at least one alias".into(),
+        ));
+    }
+
+    Ok(MatchPlan {
+        alias_order,
+        aliases,
+        relationships,
+    })
+}
+
+fn register_alias(
+    node: &NodePattern,
+    order: &mut Vec<String>,
+    aliases: &mut HashMap<String, NodePattern>,
+) -> Result<(), DaemonError> {
+    let alias = node
+        .alias
+        .clone()
+        .ok_or_else(|| DaemonError::Query("nodes in MATCH must have aliases".into()))?;
+
+    match aliases.get_mut(&alias) {
+        Some(existing) => merge_node_patterns(existing, node)?,
+        None => {
+            order.push(alias.clone());
+            aliases.insert(alias, node.clone());
+        }
+    }
+    Ok(())
+}
+
+fn merge_node_patterns(
+    target: &mut NodePattern,
+    incoming: &NodePattern,
+) -> Result<(), DaemonError> {
+    if let Some(label) = &incoming.label {
+        match &target.label {
+            Some(existing) if existing != label => {
+                return Err(DaemonError::Query("conflicting labels for alias".into()));
+            }
+            _ => target.label = Some(label.clone()),
+        }
+    }
+
+    for (key, value) in incoming.properties.0.iter() {
+        if let Some(existing) = target.properties.0.get(key) {
+            if existing != value {
+                return Err(DaemonError::Query(format!(
+                    "conflicting property constraints for alias on {key}"
+                )));
+            }
+        } else {
+            target.properties.0.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(())
+}
+
+fn build_rows<B: StorageBackend>(
+    db: &Database<B>,
+    plan: &MatchPlan,
+    candidates: &HashMap<String, Vec<Node>>,
+    conditions_by_alias: &HashMap<String, Vec<graphdb_core::query::Condition>>,
+) -> Result<Vec<QueryRow>, DaemonError> {
+    let mut rows = Vec::new();
+    let mut current = QueryRow::default();
+    backtrack_rows(
+        db,
+        plan,
+        candidates,
+        conditions_by_alias,
+        0,
+        &mut current,
+        &mut rows,
+    )?;
+    Ok(rows)
+}
+
+fn backtrack_rows<B: StorageBackend>(
+    db: &Database<B>,
+    plan: &MatchPlan,
+    candidates: &HashMap<String, Vec<Node>>,
+    conditions_by_alias: &HashMap<String, Vec<graphdb_core::query::Condition>>,
+    index: usize,
+    current: &mut QueryRow,
+    rows: &mut Vec<QueryRow>,
+) -> Result<(), DaemonError> {
+    if index >= plan.alias_order.len() {
+        rows.push(current.clone());
+        return Ok(());
+    }
+
+    let alias = &plan.alias_order[index];
+    let nodes = candidates
+        .get(alias)
+        .cloned()
+        .ok_or_else(|| DaemonError::Query("missing node candidates".into()))?;
+    let conditions = conditions_by_alias.get(alias);
+
+    for node in nodes {
+        if let Some(conds) = conditions {
+            let arc = Arc::new(node.clone());
+            if !conds
+                .iter()
+                .all(|cond| node_satisfies_condition(&arc, cond))
+            {
+                continue;
+            }
+        }
+
+        if !relationships_ok(db, alias, &node, current, &plan.relationships)? {
+            continue;
+        }
+
+        current.nodes.insert(alias.clone(), node.clone());
+        backtrack_rows(
+            db,
+            plan,
+            candidates,
+            conditions_by_alias,
+            index + 1,
+            current,
+            rows,
+        )?;
+        current.nodes.remove(alias);
+    }
+
+    Ok(())
+}
+
+fn relationships_ok<B: StorageBackend>(
+    db: &Database<B>,
+    alias: &str,
+    node: &Node,
+    current: &QueryRow,
+    relationships: &[RelationshipRequirement],
+) -> Result<bool, DaemonError> {
+    for req in relationships {
+        let left_ready = current.nodes.contains_key(&req.left_alias) || req.left_alias == alias;
+        let right_ready = current.nodes.contains_key(&req.right_alias) || req.right_alias == alias;
+        if left_ready && right_ready {
+            let left_node = if req.left_alias == alias {
+                node
+            } else {
+                current
+                    .nodes
+                    .get(&req.left_alias)
+                    .ok_or_else(|| DaemonError::Query("alias binding missing".into()))?
+            };
+            let right_node = if req.right_alias == alias {
+                node
+            } else {
+                current
+                    .nodes
+                    .get(&req.right_alias)
+                    .ok_or_else(|| DaemonError::Query("alias binding missing".into()))?
+            };
+            if !relationship_exists(db, left_node, right_node, &req.pattern)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn relationship_exists<B: StorageBackend>(
+    db: &Database<B>,
+    left: &Node,
+    right: &Node,
+    pattern: &RelationshipPattern,
+) -> Result<bool, DaemonError> {
+    match pattern.direction {
+        RelationshipDirection::Outbound => edge_between(db, left.id(), right.id(), pattern),
+        RelationshipDirection::Inbound => edge_between(db, right.id(), left.id(), pattern),
+        RelationshipDirection::Undirected => {
+            if edge_between(db, left.id(), right.id(), pattern)? {
+                Ok(true)
+            } else {
+                edge_between(db, right.id(), left.id(), pattern)
+            }
+        }
+    }
+}
+
+fn edge_between<B: StorageBackend>(
+    db: &Database<B>,
+    from: NodeId,
+    to: NodeId,
+    pattern: &RelationshipPattern,
+) -> Result<bool, DaemonError> {
+    if pattern.length != PathLength::Exact(1) {
+        return Err(DaemonError::Query(
+            "variable length relationships are not supported in MATCH".into(),
+        ));
+    }
+    for edge in db.edges_for_node(from)? {
+        if edge.source() == from && edge.target() == to && edge_matches_pattern(&edge, pattern) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn insert_node<B: StorageBackend>(
@@ -246,7 +520,7 @@ fn select_nodes<B: StorageBackend>(
             if node_matches_pattern(&node_arc, pattern)
                 && conditions
                     .iter()
-                    .all(|cond| node_matches_condition(&node_arc, pattern, cond))
+                    .all(|cond| node_satisfies_condition(&node_arc, cond))
             {
                 matches.push((*node_arc).clone());
             }
@@ -279,17 +553,10 @@ fn node_matches_pattern(
     true
 }
 
-fn node_matches_condition(
+fn node_satisfies_condition(
     node: &std::sync::Arc<Node>,
-    pattern: &graphdb_core::query::NodePattern,
     condition: &graphdb_core::query::Condition,
 ) -> bool {
-    if let Some(alias) = &pattern.alias {
-        if alias != &condition.alias {
-            return true;
-        }
-    }
-
     let attr_value = node
         .attribute(&condition.property)
         .map(attribute_to_query_value)
@@ -468,6 +735,75 @@ fn evaluate_aggregates(
     Ok(JsonValue::Object(map))
 }
 
+fn grouped_projection(
+    rows: &[QueryRow],
+    projections: &[Projection],
+) -> Result<Vec<JsonValue>, DaemonError> {
+    let mut group_fields = Vec::new();
+    let mut aggregate_fields = Vec::new();
+    for projection in projections {
+        match projection.expression {
+            Expression::Field(_) => group_fields.push(projection),
+            Expression::Aggregate(_) => aggregate_fields.push(projection),
+        }
+    }
+
+    if group_fields.is_empty() {
+        let row = evaluate_aggregates(rows, projections)?;
+        return Ok(vec![row]);
+    }
+
+    let mut groups: HashMap<String, GroupState> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        let mut key_components = Vec::new();
+        let mut key_values = HashMap::new();
+        for projection in &group_fields {
+            let label = projection_label(projection);
+            let value = match &projection.expression {
+                Expression::Field(field) => {
+                    let field_value = resolve_field(row, field)?;
+                    field_value_to_scalar(field_value)?
+                }
+                Expression::Aggregate(_) => unreachable!(),
+            };
+            key_components.push(value_to_json(&value));
+            key_values.insert(label, value);
+        }
+        let key = JsonValue::Array(key_components).to_string();
+        let entry = groups.entry(key).or_insert_with(|| GroupState {
+            key_values: key_values.clone(),
+            row_indices: Vec::new(),
+        });
+        entry.row_indices.push(index);
+    }
+
+    let mut results = Vec::new();
+    for state in groups.values() {
+        let subset: Vec<QueryRow> = state.row_indices.iter().map(|&i| rows[i].clone()).collect();
+        let mut map = serde_json::Map::new();
+        for projection in projections {
+            let label = projection_label(projection);
+            match &projection.expression {
+                Expression::Field(_) => {
+                    let value = state
+                        .key_values
+                        .get(&label)
+                        .cloned()
+                        .ok_or_else(|| DaemonError::Query("group key missing".into()))?;
+                    map.insert(label, value_to_json(&value));
+                }
+                Expression::Aggregate(expr) => {
+                    let value = compute_aggregate(&subset, expr)?;
+                    map.insert(label, value_to_json(&value));
+                }
+            }
+        }
+        results.push(JsonValue::Object(map));
+    }
+
+    Ok(results)
+}
+
 fn projection_label(projection: &Projection) -> String {
     if let Some(alias) = &projection.alias {
         return alias.clone();
@@ -550,6 +886,15 @@ fn attribute_to_query_value(attr: &AttributeValue) -> Value {
         AttributeValue::List(items) => {
             Value::List(items.iter().map(attribute_to_query_value).collect())
         }
+    }
+}
+
+fn field_value_to_scalar(value: FieldValue) -> Result<Value, DaemonError> {
+    match value {
+        FieldValue::Scalar(val) => Ok(val),
+        FieldValue::Node(_) => Err(DaemonError::Query(
+            "grouping by node aliases is not supported".into(),
+        )),
     }
 }
 

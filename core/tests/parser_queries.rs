@@ -1,6 +1,6 @@
 use graphdb_core::query::{
-    ComparisonOperator, Expression, GraphDbProcedure, PathQueryMode, PathReturn, Procedure, Query,
-    RelationshipDirection, Value, parse_queries,
+    ComparisonOperator, Expression, GraphDbProcedure, MatchPattern, PathQueryMode, PathReturn,
+    Procedure, Query, RelationshipDirection, Value, parse_queries,
 };
 
 #[test]
@@ -73,7 +73,12 @@ fn parse_select_where() {
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
-            assert_eq!(select.pattern.label.as_deref(), Some("Person"));
+            match &select.matches[0] {
+                MatchPattern::Node(pattern) => {
+                    assert_eq!(pattern.label.as_deref(), Some("Person"));
+                }
+                other => panic!("unexpected match pattern {other:?}"),
+            }
             assert_eq!(select.conditions.len(), 2);
             assert!(matches!(
                 select.conditions[0].operator,

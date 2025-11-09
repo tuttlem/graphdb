@@ -81,10 +81,23 @@ pub enum Query {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectQuery {
-    pub pattern: NodePattern,
+    pub matches: Vec<MatchPattern>,
     pub conditions: Vec<Condition>,
     pub with: Option<WithClause>,
     pub returns: Vec<Projection>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchPattern {
+    Node(NodePattern),
+    Relationship(RelationshipMatch),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationshipMatch {
+    pub left: NodePattern,
+    pub relationship: RelationshipPattern,
+    pub right: NodePattern,
 }
 
 #[derive(Debug, Clone, PartialEq)]
