@@ -51,7 +51,7 @@ curl -s -X POST \
 # Select nodes
 curl -s -X POST \
   -H 'Content-Type: application/json' \
-  -d '{"query":"SELECT MATCH (p:Person) RETURN p"}' \
+  -d '{"query":"MATCH (p:Person) RETURN p"}' \
   http://127.0.0.1:8080/query | jq
 ```
 
@@ -215,7 +215,7 @@ The query engine includes a broad set of Cypher-style helpers:
 Example:
 
 ```cypher
-SELECT MATCH (p:Person)
+MATCH (p:Person)
 RETURN coalesce(p.nickname, p.name, 'unknown') AS display,
        size(p.nicknames) AS nicknameCount,
        toInteger(p.age) AS age;
@@ -302,7 +302,7 @@ Cypher-inspired statements:
 - `INSERT NODE …`, `INSERT EDGE …`
 - `DELETE NODE id`, `DELETE EDGE id`
 - `UPDATE NODE/EDGE id SET …`
-- `SELECT MATCH (…) [WHERE …] RETURN …`
+- `MATCH (…) [WHERE …] RETURN …`
 
 Property maps accept booleans, numbers, strings, `null`, and arbitrarily nested
 arrays (e.g. `skills: ["rust", "distributed"]`).

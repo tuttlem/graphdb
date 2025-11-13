@@ -434,10 +434,9 @@ fn comparison_operator(input: &str) -> IResult<ComparisonOperator> {
     )))(input)
 }
 
-fn select_stmt(input: &str) -> IResult<Query> {
+fn match_return_stmt(input: &str) -> IResult<Query> {
     let (input, explain_kw) = opt(ws(tag_no_case("EXPLAIN")))(input)?;
     let explain = explain_kw.is_some();
-    let (input, _) = ws(tag_no_case("SELECT"))(input)?;
     let (input, match_clauses) = parse_select_match_clauses(input)?;
     let (input, condition_terms) = opt(|input| {
         let (input, _) = ws(tag_no_case("WHERE"))(input)?;
@@ -1529,11 +1528,14 @@ fn path_match_stmt(origin: &str) -> IResult<Query> {
 
     let (rest, return_items) = return_clause(rest)?;
 
-    let binding = path_binding.ok_or_else(|| {
-        nom::Err::Failure(VerboseError {
-            errors: vec![(origin, VerboseErrorKind::Context("missing path binding"))],
-        })
-    })?;
+    let binding = match path_binding {
+        Some(binding) => binding,
+        None => {
+            return Err(nom::Err::Error(VerboseError {
+                errors: vec![(origin, VerboseErrorKind::Context("missing path binding"))],
+            }))
+        }
+    };
 
     let start_pattern = resolve_node_pattern(binding.start.clone(), &node_bindings, origin)?;
     let end_pattern = resolve_node_pattern(binding.end.clone(), &node_bindings, origin)?;
@@ -1916,7 +1918,7 @@ fn build_return_clause(
             end_alias,
             include_length: true,
         }),
-        _ => Err(nom::Err::Failure(VerboseError {
+        _ => Err(nom::Err::Error(VerboseError {
             errors: vec![(ctx, VerboseErrorKind::Context("unsupported RETURN clause"))],
         })),
     }
@@ -1933,7 +1935,7 @@ fn statement(input: &str) -> IResult<Query> {
         delete_edge_stmt,
         update_node_stmt,
         update_edge_stmt,
-        select_stmt,
+        match_return_stmt,
     ))(input)
 }
 

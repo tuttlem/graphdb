@@ -23,7 +23,7 @@ fn end_to_end_insert_and_select() {
         INSERT NODE (a:Person { id: 1, name: "Alice", city: "Zurich" });
         INSERT NODE (b:Person { id: 2, name: "Bob", city: "Zurich" });
         INSERT EDGE (a:Person { id: 1 })-[r:KNOWS { id: 10, since: 2020 }]->(b:Person { id: 2 });
-        SELECT MATCH (n:Person { city: "Zurich" }) WHERE n.id = 1 RETURN n;
+        MATCH (n:Person { city: "Zurich" }) WHERE n.id = 1 RETURN n;
     "#;
 
     let queries = parse_queries(script).expect("parse queries");

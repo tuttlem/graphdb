@@ -4959,7 +4959,7 @@ mod predicate_tests {
             &db,
             r#"
 INSERT NODE (n:Sample { id: 1, values: [] });
-SELECT MATCH (n:Sample { id: 1 })
+MATCH (n:Sample { id: 1 })
 RETURN
     all(x IN n.values WHERE x > 0) AS all_true,
     any(x IN n.values WHERE x > 0) AS any_true,
@@ -4982,7 +4982,7 @@ RETURN
             &db,
             r#"
 INSERT NODE (n:Sample { id: 2, values: [null] });
-SELECT MATCH (n:Sample { id: 2 })
+MATCH (n:Sample { id: 2 })
 RETURN
     any(x IN n.values WHERE x > 0) AS any_null,
     single(x IN n.values WHERE x > 0) AS single_null;
@@ -5012,7 +5012,7 @@ RETURN
 INSERT NODE (:Person { id: 1, name: "Ada", nicknames: [] });
 INSERT NODE (:Person { id: 2, name: "Bob", nicknames: ["Bobby"] });
 INSERT NODE (:Person { id: 3, name: "Cara" });
-SELECT MATCH (p:Person)
+MATCH (p:Person)
 WHERE p.nicknames IS NOT NULL AND NOT isEmpty(p.nicknames)
 RETURN p.name AS name;
 "#,
@@ -5036,7 +5036,7 @@ RETURN p.name AS name;
         let report = execute_script_for_test(
             &db,
             r#"
-SELECT MATCH (p:Person)
+MATCH (p:Person)
 RETURN p.name AS name, exists((p)-[:KNOWS]->()) AS has_knows;
 "#,
         );
@@ -5064,7 +5064,7 @@ RETURN p.name AS name, exists((p)-[:KNOWS]->()) AS has_knows;
         let report = execute_script_for_test(
             &db,
             r#"
-SELECT MATCH (p:Person)
+MATCH (p:Person)
 WHERE exists((p)-[:KNOWS]->())
 RETURN p.name AS name;
 "#,
@@ -5089,7 +5089,7 @@ RETURN p.name AS name;
         let report = execute_script_for_test(
             &db,
             r#"
-SELECT MATCH (p:Person { name: "Meg Ryan" })
+MATCH (p:Person { name: "Meg Ryan" })
 WITH [] AS xs
 RETURN all(x IN xs WHERE x > 0) AS all_true;
 "#,
@@ -5114,7 +5114,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            r#"MATCH (p:Person {name: "Meg Ryan"})
             RETURN coalesce(p.nickname, p.name, "unknown") AS display;"#,
         );
         let value = report.result_rows[0]
@@ -5130,7 +5130,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (a:Person {name: "Meg Ryan"})-[r:KNOWS]->(b:Person {name: "Tom Hanks"})
+            r#"MATCH (a:Person {name: "Meg Ryan"})-[r:KNOWS]->(b:Person {name: "Tom Hanks"})
             RETURN properties(startNode(r)) AS start, properties(endNode(r)) AS end, type(r) AS relType, id(r) AS relId;"#,
         );
         let row = &report.result_rows[0];
@@ -5156,7 +5156,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            r#"MATCH (p:Person {name: "Meg Ryan"})
             RETURN head(['a','b','c']) AS first,
                       last(['a','b','c']) AS last,
                       size(['x','y']) AS listSize,
@@ -5178,7 +5178,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            r#"MATCH (p:Person {name: "Meg Ryan"})
             RETURN toInteger('42') AS i,
                       toFloat('1.5') AS f,
                       toBoolean(0) AS b,
@@ -5202,7 +5202,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            r#"MATCH (p:Person {name: "Meg Ryan"})
             RETURN abs(-5) AS absInt,
                    abs(-1.5) AS absFloat,
                    ceil(1.2) AS ceilVal,
@@ -5269,7 +5269,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            r#"MATCH (p:Person {name: "Meg Ryan"})
             RETURN e() AS eVal,
                    exp(1.0) AS expVal,
                    log(e()) AS lnE,
@@ -5324,7 +5324,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            r#"MATCH (p:Person {name: "Meg Ryan"})
             RETURN properties(p) AS props;"#,
         );
         let props = report.result_rows[0]
@@ -5340,7 +5340,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (p:Person)
+            r#"MATCH (p:Person)
             WITH timestamp() AS t, p
             RETURN t, p.name;"#,
         );
@@ -5358,7 +5358,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (a:Person {name: "Meg Ryan"})-[r:KNOWS]->(b:Person {name: "Tom Hanks"})
+            r#"MATCH (a:Person {name: "Meg Ryan"})-[r:KNOWS]->(b:Person {name: "Tom Hanks"})
             RETURN keys(a) AS nodeKeys, labels(a) AS nodeLabels, keys(r) AS relKeys;"#,
         );
         let row = &report.result_rows[0];
@@ -5386,7 +5386,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            r#"MATCH (p:Person {name: "Meg Ryan"})
             RETURN range(0,5,2) AS evens,
                    range(3,0,-1) AS countdown,
                    reverse(['a','b','c']) AS reversed,
@@ -5432,7 +5432,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH p = (a:Person {name: "Meg Ryan"})-[:KNOWS*1..2]->(b:Person)
+            r#"MATCH p = (a:Person {name: "Meg Ryan"})-[:KNOWS*1..2]->(b:Person)
             RETURN nodes(p) AS pathNodes,
                    relationships(p) AS pathRels,
                    reduce(total = 0, person IN nodes(p) | total + size(person.name)) AS nameScore;"#,
@@ -5461,7 +5461,7 @@ mod scalar_function_tests {
         seed_basic_graph(&db);
         let report = execute_script_for_test(
             &db,
-            r#"SELECT MATCH (p:Person {name: "Meg Ryan"})
+            r#"MATCH (p:Person {name: "Meg Ryan"})
             RETURN toIntegerList(['1','2','bad','4']) AS ints,
                    toFloatList(['1.5','oops']) AS floats,
                    toBooleanList([1,0,'true','nope']) AS bools,

@@ -49,7 +49,7 @@ type QueryError = {
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '');
 const SAMPLE_QUERIES = [
-  'SELECT MATCH (n:Person) RETURN n;',
+  'MATCH (n:Person) RETURN n;',
   'CALL graphdb.nodeClasses();',
   'CALL graphdb.roles();',
 ];
@@ -170,7 +170,7 @@ function App() {
                 className="pill"
                 onClick={() => setQuery(sample)}
               >
-                {sample.startsWith('CALL') ? sample : 'Sample SELECT'}
+                {sample.startsWith('CALL') ? sample : 'Sample MATCH'}
               </button>
             ))}
           </div>

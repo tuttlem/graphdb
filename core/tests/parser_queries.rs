@@ -70,7 +70,7 @@ fn parse_delete_update() {
 #[test]
 fn parse_select_where() {
     let input =
-        "SELECT MATCH (n:Person {city: \"Zurich\"}) WHERE n.age = 30 AND n.active = true RETURN n;";
+        "MATCH (n:Person {city: \"Zurich\"}) WHERE n.age = 30 AND n.active = true RETURN n;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
@@ -98,7 +98,7 @@ fn parse_select_where() {
 
 #[test]
 fn parse_select_with_aggregate() {
-    let input = "SELECT MATCH (n:Person) RETURN count(*) AS total;";
+    let input = "MATCH (n:Person) RETURN count(*) AS total;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
@@ -116,7 +116,7 @@ fn parse_select_with_aggregate() {
 
 #[test]
 fn parse_explain_select() {
-    let input = "EXPLAIN SELECT MATCH (n:Person) RETURN n;";
+    let input = "EXPLAIN MATCH (n:Person) RETURN n;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
@@ -129,7 +129,7 @@ fn parse_explain_select() {
 
 #[test]
 fn parse_where_rich_predicates() {
-    let input = "SELECT MATCH (n:Person) WHERE n.age >= 30 AND n.salary <> 0 AND n.city IS NOT NULL AND n.manager IS NULL RETURN n;";
+    let input = "MATCH (n:Person) WHERE n.age >= 30 AND n.salary <> 0 AND n.city IS NOT NULL AND n.manager IS NULL RETURN n;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
@@ -153,7 +153,7 @@ fn parse_where_rich_predicates() {
 
 #[test]
 fn parse_where_with_predicate_functions() {
-    let input = "SELECT MATCH (p:Person) WHERE p.nicknames IS NOT NULL AND NOT isEmpty(p.nicknames) AND exists((p)-[:KNOWS]->()) RETURN p;";
+    let input = "MATCH (p:Person) WHERE p.nicknames IS NOT NULL AND NOT isEmpty(p.nicknames) AND exists((p)-[:KNOWS]->()) RETURN p;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
@@ -174,7 +174,7 @@ fn parse_where_with_predicate_functions() {
 
 #[test]
 fn parse_return_list_predicate_function() {
-    let input = "SELECT MATCH (n:Item) RETURN all(x IN n.values WHERE x > 0) AS ok;";
+    let input = "MATCH (n:Item) RETURN all(x IN n.values WHERE x > 0) AS ok;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
@@ -196,7 +196,7 @@ fn parse_return_list_predicate_function() {
 
 #[test]
 fn parse_with_literal_projection() {
-    let input = "SELECT MATCH (n:Person) WITH [] AS xs RETURN xs;";
+    let input = "MATCH (n:Person) WITH [] AS xs RETURN xs;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
@@ -216,7 +216,7 @@ fn parse_with_literal_projection() {
 
 #[test]
 fn parse_scalar_functions() {
-    let input = "SELECT MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN coalesce(a.nickname, a.name) AS display, startNode(r) AS start, endNode(r) AS end, randomUUID() AS uuid;";
+    let input = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN coalesce(a.nickname, a.name) AS display, startNode(r) AS start, endNode(r) AS end, randomUUID() AS uuid;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
@@ -246,7 +246,7 @@ fn parse_scalar_functions() {
 
 #[test]
 fn parse_math_functions() {
-    let input = "SELECT MATCH (p:Person) RETURN abs(p.id) AS absVal, round(1.2, 1, 'HALF_EVEN') AS rounded, atan2(1.0, 2.0) AS angle;";
+    let input = "MATCH (p:Person) RETURN abs(p.id) AS absVal, round(1.2, 1, 'HALF_EVEN') AS rounded, atan2(1.0, 2.0) AS angle;";
     let queries = parse_queries(input).expect("math functions parsed");
     match &queries[0] {
         Query::Select(select) => {
@@ -291,7 +291,7 @@ fn parse_math_functions() {
 
 #[test]
 fn parse_list_scalar_functions() {
-    let input = "SELECT MATCH (p:Person) RETURN range(0,10,2) AS nums, reverse([1,2,3]) AS rev, keys(p) AS propKeys;";
+    let input = "MATCH (p:Person) RETURN range(0,10,2) AS nums, reverse([1,2,3]) AS rev, keys(p) AS propKeys;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
@@ -446,7 +446,7 @@ RETURN a, b;
 #[test]
 fn parse_reduce_function() {
     let input = r#"
-SELECT MATCH p = (a:Person)-[:KNOWS*1..2]->(b:Person)
+MATCH p = (a:Person)-[:KNOWS*1..2]->(b:Person)
 RETURN nodes(p) AS nodes,
        relationships(p) AS rels,
        reduce(total = 0, person IN nodes(p) | total + 1) AS score;
