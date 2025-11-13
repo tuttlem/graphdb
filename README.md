@@ -221,6 +221,79 @@ RETURN coalesce(p.nickname, p.name, 'unknown') AS display,
        toInteger(p.age) AS age;
 ```
 
+### Custom Scalar Functions
+
+You can register additional scalar functions at runtime through the shared
+`function-api` crate. Add it as a dependency to any workspace crate, then call
+into the registry during startup (or from a plugin) to expose your custom logic
+without touching the parser again.
+
+```rust
+use function_api::{registry, FunctionArity, FunctionError, FunctionSpec};
+use graphdb_core::query::Value;
+
+fn register_custom_functions() {
+    registry()
+        .register(FunctionSpec::new(
+            "doubleValue",
+            FunctionArity::Exact(1),
+            |args| match args.first() {
+                Some(Value::Integer(i)) => Ok(Value::Integer(i * 2)),
+                Some(Value::Float(f)) => Ok(Value::Float(f * 2.0)),
+                Some(_) => Err(FunctionError::execution(
+                    "doubleValue expects INTEGER or FLOAT",
+                )),
+                None => Err(FunctionError::execution(
+                    "doubleValue expects an argument",
+                )),
+            },
+        ))
+        .expect("register doubleValue");
+}
+```
+
+Once registered, the function behaves like any other scalar helper:
+
+```cypher
+MATCH (m:Measurement)
+RETURN doubleValue(m.reading) AS amplified;
+```
+
+Function names are looked up case-insensitively, and registration should happen
+before the server begins serving queries (e.g., during startup or via a plugin
+module).
+
+#### Plugin libraries (`./lib`)
+
+At startup the daemon scans `plugin_dir` (defaults to `./lib` relative to the
+config file) for shared libraries and calls an export named
+`graphdb_register_functions`. This lets you ship optional function packs
+without rebuilding the main binary.
+
+The workspace includes a sample plugin crate, `stdfunc`, which exposes a
+`hello()` function to Cypher:
+
+```bash
+cargo build -p stdfunc
+mkdir -p lib
+cp target/debug/libstdfunc.* lib/        # .so/.dylib/.dll depending on OS
+```
+
+Restart the daemon and you should see a log entry indicating the plugin was
+loaded. You can then call the new function:
+
+```cypher
+RETURN hello() AS greeting;
+```
+
+Plugins register their functions by calling into the same `function-api`
+registry shown above, so authoring external packs feels identical to adding a
+built-in helper.
+
+> Tip: building the workspace (`cargo build` or `cargo test`) automatically
+> refreshes `./lib` with the latest `stdfunc` artifact, so the plugin is always
+> ready when you launch the daemon.
+
 ### Using the Privilege Model
 
 Node and edge inserts go through the privilege pipeline automatically. The
@@ -265,6 +338,7 @@ stdout = "./graphdb.log"
 stderr = "./graphdb.err"
 umask = 0o022
 log_level = "info"
+plugin_dir = "./lib"
 
 [storage]
 backend = "simple"            # or "memory"

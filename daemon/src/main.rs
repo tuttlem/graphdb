@@ -4,6 +4,7 @@ mod database;
 mod error;
 mod executor;
 mod logging;
+mod plugins;
 mod server;
 mod signals;
 
@@ -36,6 +37,12 @@ fn main() -> Result<()> {
     let _signal_manager = signal_manager;
 
     let database = shared_database(&config)?;
+    let plugin_guard = plugins::load_plugins(config.plugin_dir())?;
+    tracing::info!(
+        event = "plugins.initialised",
+        count = plugin_guard.count(),
+        "loaded custom function libraries"
+    );
 
     tracing::info!(
         event = "daemon.started",

@@ -31,3 +31,8 @@ futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time", "tracing-log"] }
 rand = "0.8"
+function-api = { path = "../function-api" }
+libloading = "0.8"
+
+[build-dependencies]
+stdfunc = { path = "../stdfunc" }

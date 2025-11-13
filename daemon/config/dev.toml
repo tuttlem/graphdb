@@ -4,6 +4,7 @@ stdout = "/home/michael/src/db/graphdb/target/graphdb.log"
 stderr = "/home/michael/src/db/graphdb/target/graphdb.err"
 umask = 18         # 0o022 written in decimal
 log_level = "debug"
+plugin_dir = "../../lib"
 
 [storage]
 backend = "simple"

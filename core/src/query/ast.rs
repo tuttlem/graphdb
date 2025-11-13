@@ -227,6 +227,7 @@ pub enum ScalarFunction {
     Radians(Expression),
     Sin(Expression),
     Tan(Expression),
+    UserDefined(UserFunctionCall),
     ToBoolean {
         expr: Expression,
         null_on_unsupported: bool,
@@ -247,6 +248,12 @@ pub enum ScalarFunction {
         list: Expression,
         expression: Expression,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserFunctionCall {
+    pub name: String,
+    pub arguments: Vec<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

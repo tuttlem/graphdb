@@ -1,5 +1,6 @@
 use std::io;
 
+use function_api::FunctionError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -26,6 +27,14 @@ pub enum DaemonError {
     Query(String),
     #[error("http server error: {0}")]
     Http(#[from] hyper::Error),
+    #[error("plugin error: {0}")]
+    Plugin(String),
 }
 
 pub type Result<T> = std::result::Result<T, DaemonError>;
+
+impl From<FunctionError> for DaemonError {
+    fn from(value: FunctionError) -> Self {
+        DaemonError::Query(value.to_string())
+    }
+}

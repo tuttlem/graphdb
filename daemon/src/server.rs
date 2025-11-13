@@ -263,7 +263,8 @@ fn map_daemon_error(err: &DaemonError) -> (StatusCode, String) {
         | DaemonError::Config(_)
         | DaemonError::Toml(_)
         | DaemonError::Json(_)
-        | DaemonError::Http(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        | DaemonError::Http(_)
+        | DaemonError::Plugin(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
 

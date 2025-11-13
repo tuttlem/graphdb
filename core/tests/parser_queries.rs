@@ -245,6 +245,25 @@ fn parse_scalar_functions() {
 }
 
 #[test]
+fn parse_user_defined_scalar_function() {
+    let input = "MATCH (n:Person) RETURN customFunc(n.age, 2) AS result;";
+    let queries = parse_queries(input).expect("custom function parsed");
+    match &queries[0] {
+        Query::Select(select) => match &select.returns[0].expression {
+            Expression::Function(func) => match func.as_ref() {
+                FunctionExpression::Scalar(ScalarFunction::UserDefined(call)) => {
+                    assert_eq!(call.name, "customFunc");
+                    assert_eq!(call.arguments.len(), 2);
+                }
+                other => panic!("unexpected expression {other:?}"),
+            },
+            other => panic!("unexpected expression {other:?}"),
+        },
+        other => panic!("unexpected query {other:?}"),
+    }
+}
+
+#[test]
 fn parse_math_functions() {
     let input = "MATCH (p:Person) RETURN abs(p.id) AS absVal, round(1.2, 1, 'HALF_EVEN') AS rounded, atan2(1.0, 2.0) AS angle;";
     let queries = parse_queries(input).expect("math functions parsed");

@@ -20,6 +20,7 @@ pub struct DaemonConfig {
     pub log_level: Option<String>,
     pub storage: StorageSettings,
     pub server: ServerSettings,
+    pub plugin_dir: Option<PathBuf>,
 }
 
 impl Default for DaemonConfig {
@@ -34,6 +35,7 @@ impl Default for DaemonConfig {
             log_level: Some(String::from("info")),
             storage: StorageSettings::default(),
             server: ServerSettings::default(),
+            plugin_dir: Some(PathBuf::from("lib")),
         }
     }
 }
@@ -166,6 +168,10 @@ impl DaemonConfig {
         &self.server
     }
 
+    pub fn plugin_dir(&self) -> Option<&Path> {
+        self.plugin_dir.as_deref()
+    }
+
     fn normalize_paths(&mut self, base: &Path) {
         if self.working_directory.is_relative() {
             self.working_directory = base.join(&self.working_directory);
@@ -177,6 +183,7 @@ impl DaemonConfig {
         normalize_optional_path(&mut self.stderr, base);
         self.storage.normalize(base);
         self.server.normalize(base);
+        normalize_optional_path(&mut self.plugin_dir, base);
     }
 }
 

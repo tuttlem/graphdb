@@ -654,13 +654,13 @@ fn aggregate_expression(input: &str) -> IResult<AggregateExpression> {
 
 fn function_expression(input: &str) -> IResult<FunctionExpression> {
     alt((
-        scalar_function_expression,
         list_predicate_function("all", ListPredicateKind::All),
         list_predicate_function("any", ListPredicateKind::Any),
         list_predicate_function("none", ListPredicateKind::None),
         list_predicate_function("single", ListPredicateKind::Single),
         is_empty_function,
         exists_function,
+        scalar_function_expression,
     ))(input)
 }
 
@@ -673,6 +673,7 @@ fn scalar_function_expression(input: &str) -> IResult<FunctionExpression> {
             scalar_function_math_numeric,
             scalar_function_math_logarithmic,
             scalar_function_math_trigonometric,
+            custom_scalar_function,
         )),
         FunctionExpression::Scalar,
     )(input)
@@ -1082,6 +1083,20 @@ fn tan_function(input: &str) -> IResult<ScalarFunction> {
     let (input, _) = ws(tag_no_case("tan"))(input)?;
     let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
     Ok((input, ScalarFunction::Tan(expr)))
+}
+
+fn custom_scalar_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, name) = ws(identifier)(input)?;
+    let (input, _) = ws(char('('))(input)?;
+    let (input, arguments) = separated_list0(ws(char(',')), non_aggregate_expression)(input)?;
+    let (input, _) = ws(char(')'))(input)?;
+    Ok((
+        input,
+        ScalarFunction::UserDefined(UserFunctionCall {
+            name: name.to_string(),
+            arguments,
+        }),
+    ))
 }
 
 fn keys_function(input: &str) -> IResult<ScalarFunction> {
@@ -1533,7 +1548,7 @@ fn path_match_stmt(origin: &str) -> IResult<Query> {
         None => {
             return Err(nom::Err::Error(VerboseError {
                 errors: vec![(origin, VerboseErrorKind::Context("missing path binding"))],
-            }))
+            }));
         }
     };
 

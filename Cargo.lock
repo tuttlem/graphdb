@@ -140,9 +140,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "common",
+ "function-api",
  "futures-util",
  "graphdb-core",
  "hyper",
+ "libloading",
  "log",
  "nix",
  "rand",
@@ -151,6 +153,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "stdfunc",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -213,6 +216,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "function-api"
+version = "0.1.0"
+dependencies = [
+ "graphdb-core",
+ "once_cell",
 ]
 
 [[package]]
@@ -431,6 +442,16 @@ name = "libc"
 version = "0.2.177"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -884,6 +905,13 @@ checksum = "17129e116933cf371d018bb80ae557e889637989d8638274fb25622827b03881"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "stdfunc"
+version = "0.1.0"
+dependencies = [
+ "function-api",
 ]
 
 [[package]]

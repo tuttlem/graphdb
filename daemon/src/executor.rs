@@ -25,6 +25,9 @@ use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
 
 use crate::error::DaemonError;
+use function_api as functions;
+#[cfg(test)]
+use function_api::{FunctionArity, FunctionError, FunctionSpec};
 
 #[derive(Debug, Default, Serialize)]
 pub struct ExecutionReport {
@@ -1010,6 +1013,14 @@ fn scalar_function_label(func: &ScalarFunction) -> String {
         ScalarFunction::Radians(expr) => format!("radians({})", expression_label(expr)),
         ScalarFunction::Sin(expr) => format!("sin({})", expression_label(expr)),
         ScalarFunction::Tan(expr) => format!("tan({})", expression_label(expr)),
+        ScalarFunction::UserDefined(call) => {
+            let args = call
+                .arguments
+                .iter()
+                .map(expression_label)
+                .collect::<Vec<_>>();
+            format!("{}({})", call.name, args.join(", "))
+        }
         ScalarFunction::Reduce {
             accumulator,
             variable,
@@ -2242,6 +2253,21 @@ fn evaluate_scalar_function<B: StorageBackend>(
             apply_numeric_float_function(db, row, expr, query_timestamp, "tan()", |value| {
                 value.tan()
             })
+        }
+        ScalarFunction::UserDefined(call) => {
+            let mut evaluated_args = Vec::with_capacity(call.arguments.len());
+            for argument in &call.arguments {
+                evaluated_args.push(evaluate_expression_to_scalar(
+                    db,
+                    row,
+                    argument,
+                    query_timestamp,
+                )?);
+            }
+            let value = functions::registry()
+                .call(&call.name, &evaluated_args)
+                .map_err(DaemonError::from)?;
+            Ok(FieldValue::Scalar(value))
         }
         ScalarFunction::Reduce {
             accumulator,
@@ -5316,6 +5342,46 @@ mod scalar_function_tests {
         assert!(close("radVal", PI));
         assert!(close("sinVal", 0.5));
         assert!(close("tanVal", (0.25f64).tan()));
+    }
+
+    #[test]
+    fn user_defined_functions_execute() {
+        let registry = functions::registry();
+        if let Err(err) = registry.register(FunctionSpec::new(
+            "doubleValue",
+            FunctionArity::Exact(1),
+            |args| match args.first() {
+                Some(Value::Integer(i)) => Ok(Value::Integer(i * 2)),
+                Some(Value::Float(f)) => Ok(Value::Float(f * 2.0)),
+                Some(_) => Err(FunctionError::execution(
+                    "doubleValue expects INTEGER or FLOAT",
+                )),
+                None => Err(FunctionError::execution(
+                    "doubleValue expects at least one argument",
+                )),
+            },
+        )) {
+            if !matches!(err, FunctionError::AlreadyRegistered(_)) {
+                panic!("failed to register custom function: {err}");
+            }
+        }
+
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"MATCH (p:Person {name: "Meg Ryan"})
+            RETURN doubleValue(21) AS doubled,
+                   doubleValue(1.5) AS doubledFloat;"#,
+        );
+        let row = &report.result_rows[0];
+        assert_eq!(row.get("doubled").and_then(|v| v.as_i64()), Some(42));
+        assert!(
+            row.get("doubledFloat")
+                .and_then(|v| v.as_f64())
+                .map(|f| (f - 3.0).abs() < 1e-9)
+                .unwrap_or(false)
+        );
     }
 
     #[test]
