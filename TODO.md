@@ -4,6 +4,7 @@
 * [x] Add performance (latency) data to logging (local telemetry only)
 * [x] Improve HTTP request logging with trace IDs & correlation across client/daemon
 * [x] Further CYPHER coverage (MATCH/WHERE/WITH/RETURN chaining, aggregates)
+* [ ] Remove SELECT from the parser (there is no SELECT in Cypher)
 * [ ] Add path algorithms: weighted shortest path, A*, Yen's k-shortest
 * [ ] Implement query planner + execution engine beyond naive scans
 * [ ] Introduce transactions + ACID semantics for storage backends
@@ -36,9 +37,9 @@
 * [x] Scalar functions
 * [ ] Aggregation functions
 * [ ] List functions
-* [ ] Math functions (numeric)
-* [ ] Math functions (logarithmic)
-* [ ] Math functions (trig)
+* [x] Math functions (numeric)
+* [x] Math functions (logarithmic)
+* [x] Math functions (trig)
 * [ ] Spatial functions
 * [ ] Data load
 * [ ] Data unload

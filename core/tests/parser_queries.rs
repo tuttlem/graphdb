@@ -245,6 +245,51 @@ fn parse_scalar_functions() {
 }
 
 #[test]
+fn parse_math_functions() {
+    let input = "SELECT MATCH (p:Person) RETURN abs(p.id) AS absVal, round(1.2, 1, 'HALF_EVEN') AS rounded, atan2(1.0, 2.0) AS angle;";
+    let queries = parse_queries(input).expect("math functions parsed");
+    match &queries[0] {
+        Query::Select(select) => {
+            assert_eq!(select.returns.len(), 3);
+            match &select.returns[0].expression {
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::Scalar(ScalarFunction::Abs(expr)) => {
+                        assert!(matches!(expr, Expression::Field(_)));
+                    }
+                    other => panic!("unexpected expression {other:?}"),
+                },
+                other => panic!("unexpected expression {other:?}"),
+            }
+            match &select.returns[1].expression {
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::Scalar(ScalarFunction::Round {
+                        value: _,
+                        precision,
+                        mode,
+                    }) => {
+                        assert!(precision.is_some());
+                        assert!(mode.is_some());
+                    }
+                    other => panic!("unexpected expression {other:?}"),
+                },
+                other => panic!("unexpected expression {other:?}"),
+            }
+            match &select.returns[2].expression {
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::Scalar(ScalarFunction::Atan2 { y, x }) => {
+                        assert!(matches!(y, Expression::Literal(_)));
+                        assert!(matches!(x, Expression::Literal(_)));
+                    }
+                    other => panic!("unexpected expression {other:?}"),
+                },
+                other => panic!("unexpected expression {other:?}"),
+            }
+        }
+        other => panic!("unexpected query {other:?}"),
+    }
+}
+
+#[test]
 fn parse_list_scalar_functions() {
     let input = "SELECT MATCH (p:Person) RETURN range(0,10,2) AS nums, reverse([1,2,3]) AS rev, keys(p) AS propKeys;";
     let queries = parse_queries(input).unwrap();
