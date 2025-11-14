@@ -1,5 +1,7 @@
 mod list;
 mod math;
+mod predicate;
+mod scalar;
 mod string;
 mod util;
 
@@ -16,6 +18,8 @@ pub(crate) use cstr;
 static ALL_FUNCTIONS: Lazy<Vec<PluginFunctionSpec>> = Lazy::new(|| {
     let mut specs = Vec::new();
     specs.extend_from_slice(math::FUNCTIONS);
+    specs.extend_from_slice(scalar::FUNCTIONS);
+    specs.extend_from_slice(predicate::FUNCTIONS);
     specs.extend_from_slice(string::FUNCTIONS);
     specs.extend_from_slice(list::FUNCTIONS);
     specs

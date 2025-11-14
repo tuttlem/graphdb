@@ -198,6 +198,73 @@ pub(crate) enum RoundMode {
     HalfEven,
 }
 
+pub(crate) fn convert_to_boolean(
+    value: &Value,
+    null_on_unsupported: bool,
+) -> Result<Value, String> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        Value::Boolean(b) => Value::Boolean(*b),
+        Value::Integer(i) => Value::Boolean(*i != 0),
+        Value::Float(f) => Value::Boolean(*f != 0.0),
+        Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" => Value::Boolean(true),
+            "false" => Value::Boolean(false),
+            _ => Value::Null,
+        },
+        other => {
+            if null_on_unsupported {
+                Value::Null
+            } else {
+                return Err(format!("toBoolean() does not support value {:?}", other));
+            }
+        }
+    })
+}
+
+pub(crate) fn convert_to_float(value: &Value, null_on_unsupported: bool) -> Result<Value, String> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        Value::Float(f) => Value::Float(*f),
+        Value::Integer(i) => Value::Float(*i as f64),
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(parsed) => Value::Float(parsed),
+            Err(_) => Value::Null,
+        },
+        other => {
+            if null_on_unsupported {
+                Value::Null
+            } else {
+                return Err(format!("toFloat() does not support value {:?}", other));
+            }
+        }
+    })
+}
+
+pub(crate) fn convert_to_integer(
+    value: &Value,
+    null_on_unsupported: bool,
+) -> Result<Value, String> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        Value::Integer(i) => Value::Integer(*i),
+        Value::Float(f) => Value::Integer(*f as i64),
+        Value::Boolean(true) => Value::Integer(1),
+        Value::Boolean(false) => Value::Integer(0),
+        Value::String(s) => match s.parse::<i64>() {
+            Ok(parsed) => Value::Integer(parsed),
+            Err(_) => Value::Null,
+        },
+        other => {
+            if null_on_unsupported {
+                Value::Null
+            } else {
+                return Err(format!("toInteger() does not support value {:?}", other));
+            }
+        }
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum HalfTieStrategy {
     AwayFromZero,

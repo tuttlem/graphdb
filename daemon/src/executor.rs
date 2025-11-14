@@ -20,7 +20,6 @@ use graphdb_core::{
 };
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
-use uuid::Uuid;
 
 use crate::error::DaemonError;
 use function_api as functions;
@@ -1370,78 +1369,6 @@ fn map_from_attributes(attrs: &HashMap<String, AttributeValue>) -> Value {
     Value::Map(map)
 }
 
-fn convert_to_boolean(value: Value, null_on_unsupported: bool) -> Result<Value, DaemonError> {
-    Ok(match value {
-        Value::Null => Value::Null,
-        Value::Boolean(b) => Value::Boolean(b),
-        Value::Integer(i) => Value::Boolean(i != 0),
-        Value::Float(f) => Value::Boolean(f != 0.0),
-        Value::String(s) => {
-            let lower = s.to_ascii_lowercase();
-            match lower.as_str() {
-                "true" => Value::Boolean(true),
-                "false" => Value::Boolean(false),
-                _ => Value::Null,
-            }
-        }
-        other => {
-            if null_on_unsupported {
-                Value::Null
-            } else {
-                return Err(DaemonError::Query(format!(
-                    "toBoolean() does not support value {:?}",
-                    other
-                )));
-            }
-        }
-    })
-}
-
-fn convert_to_float(value: Value, null_on_unsupported: bool) -> Result<Value, DaemonError> {
-    Ok(match value {
-        Value::Null => Value::Null,
-        Value::Float(f) => Value::Float(f),
-        Value::Integer(i) => Value::Float(i as f64),
-        Value::String(s) => match s.parse::<f64>() {
-            Ok(parsed) => Value::Float(parsed),
-            Err(_) => Value::Null,
-        },
-        other => {
-            if null_on_unsupported {
-                Value::Null
-            } else {
-                return Err(DaemonError::Query(format!(
-                    "toFloat() does not support value {:?}",
-                    other
-                )));
-            }
-        }
-    })
-}
-
-fn convert_to_integer(value: Value, null_on_unsupported: bool) -> Result<Value, DaemonError> {
-    Ok(match value {
-        Value::Null => Value::Null,
-        Value::Integer(i) => Value::Integer(i),
-        Value::Float(f) => Value::Integer(f as i64),
-        Value::Boolean(true) => Value::Integer(1),
-        Value::Boolean(false) => Value::Integer(0),
-        Value::String(s) => match s.parse::<i64>() {
-            Ok(parsed) => Value::Integer(parsed),
-            Err(_) => Value::Null,
-        },
-        other => {
-            if null_on_unsupported {
-                Value::Null
-            } else {
-                return Err(DaemonError::Query(format!(
-                    "toInteger() does not support value {:?}",
-                    other
-                )));
-            }
-        }
-    })
-}
 fn apply_binary_operator(
     operator: BinaryOperator,
     left: Value,
@@ -1482,20 +1409,6 @@ fn subtract_values(left: Value, right: Value) -> Result<Value, DaemonError> {
         _ => Err(DaemonError::Query(
             "subtraction requires numeric operands".into(),
         )),
-    }
-}
-
-fn scalar_to_integer(value: Value, context: &str) -> Result<Option<i64>, DaemonError> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Integer(i) => Ok(Some(i)),
-        Value::Float(f) => Ok(Some(f as i64)),
-        Value::Boolean(true) => Ok(Some(1)),
-        Value::Boolean(false) => Ok(Some(0)),
-        other => Err(DaemonError::Query(format!(
-            "{} expects integer input, received {:?}",
-            context, other
-        ))),
     }
 }
 
@@ -1587,60 +1500,29 @@ fn evaluate_scalar_function<B: StorageBackend>(
             }
         }
         ScalarFunction::Range { start, end, step } => {
-            let start_value = evaluate_expression_to_scalar(db, row, start, query_timestamp)?;
-            let end_value = evaluate_expression_to_scalar(db, row, end, query_timestamp)?;
-            let step_value = match step {
-                Some(expr) => Some(evaluate_expression_to_scalar(
+            let mut args = Vec::with_capacity(3);
+            args.push(evaluate_expression_to_scalar(
+                db,
+                row,
+                start,
+                query_timestamp,
+            )?);
+            args.push(evaluate_expression_to_scalar(
+                db,
+                row,
+                end,
+                query_timestamp,
+            )?);
+            if let Some(expr) = step {
+                args.push(evaluate_expression_to_scalar(
                     db,
                     row,
                     expr,
                     query_timestamp,
-                )?),
-                None => None,
-            };
-
-            let start = match scalar_to_integer(start_value, "range start")? {
-                Some(value) => value,
-                None => return Ok(FieldValue::Scalar(Value::Null)),
-            };
-            let end = match scalar_to_integer(end_value, "range end")? {
-                Some(value) => value,
-                None => return Ok(FieldValue::Scalar(Value::Null)),
-            };
-            let step = match step_value {
-                Some(value) => match scalar_to_integer(value, "range step")? {
-                    Some(v) => v,
-                    None => return Ok(FieldValue::Scalar(Value::Null)),
-                },
-                None => 1,
-            };
-            if step == 0 {
-                return Err(DaemonError::Query("range() step cannot be 0".into()));
+                )?);
             }
-            let ascending = start <= end;
-            if (ascending && step < 0) || (!ascending && step > 0) {
-                return Ok(FieldValue::Scalar(Value::List(Vec::new())));
-            }
-            let mut values = Vec::new();
-            let mut current = start;
-            if step > 0 {
-                while current <= end {
-                    values.push(Value::Integer(current));
-                    current = match current.checked_add(step) {
-                        Some(next) => next,
-                        None => break,
-                    };
-                }
-            } else {
-                while current >= end {
-                    values.push(Value::Integer(current));
-                    current = match current.checked_add(step) {
-                        Some(next) => next,
-                        None => break,
-                    };
-                }
-            }
-            Ok(FieldValue::Scalar(Value::List(values)))
+            let value = call_standard_function("range", args)?;
+            Ok(FieldValue::Scalar(value))
         }
         ScalarFunction::Reverse(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
@@ -1736,9 +1618,10 @@ fn evaluate_scalar_function<B: StorageBackend>(
             };
             Ok(FieldValue::Scalar(map))
         }
-        ScalarFunction::RandomUuid => Ok(FieldValue::Scalar(Value::String(
-            Uuid::new_v4().to_string(),
-        ))),
+        ScalarFunction::RandomUuid => {
+            let value = call_standard_function("randomUUID", Vec::new())?;
+            Ok(FieldValue::Scalar(value))
+        }
         ScalarFunction::Size(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
             let result = call_standard_function_unary("size", value)?;
@@ -1749,7 +1632,10 @@ fn evaluate_scalar_function<B: StorageBackend>(
             let result = call_standard_function_unary("length", value)?;
             Ok(FieldValue::Scalar(result))
         }
-        ScalarFunction::Timestamp => Ok(FieldValue::Scalar(Value::Integer(query_timestamp))),
+        ScalarFunction::Timestamp => {
+            let value = call_standard_function("timestamp", vec![Value::Integer(query_timestamp)])?;
+            Ok(FieldValue::Scalar(value))
+        }
         ScalarFunction::UserDefined(call) => {
             let mut evaluated_args = Vec::with_capacity(call.arguments.len());
             for argument in &call.arguments {
@@ -1786,30 +1672,39 @@ fn evaluate_scalar_function<B: StorageBackend>(
             null_on_unsupported,
         } => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            Ok(FieldValue::Scalar(convert_to_boolean(
-                value,
-                *null_on_unsupported,
-            )?))
+            let name = if *null_on_unsupported {
+                "toBooleanOrNull"
+            } else {
+                "toBoolean"
+            };
+            let result = call_standard_function_unary(name, value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToFloat {
             expr,
             null_on_unsupported,
         } => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            Ok(FieldValue::Scalar(convert_to_float(
-                value,
-                *null_on_unsupported,
-            )?))
+            let name = if *null_on_unsupported {
+                "toFloatOrNull"
+            } else {
+                "toFloat"
+            };
+            let result = call_standard_function_unary(name, value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToInteger {
             expr,
             null_on_unsupported,
         } => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            Ok(FieldValue::Scalar(convert_to_integer(
-                value,
-                *null_on_unsupported,
-            )?))
+            let name = if *null_on_unsupported {
+                "toIntegerOrNull"
+            } else {
+                "toInteger"
+            };
+            let result = call_standard_function_unary(name, value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Type(field) => {
             let relationship = resolve_relationship_from_field(row, field)?;
@@ -1863,96 +1758,21 @@ fn evaluate_list_predicate_function(
     spec: &ListPredicateFunction,
 ) -> Result<Value, DaemonError> {
     let list_value = list_expression_value(row, &spec.list)?;
-    match list_value {
-        Value::Null => Ok(Value::Null),
-        Value::List(items) => match spec.kind {
-            ListPredicateKind::All => {
-                let mut saw_null = false;
-                for item in items.iter() {
-                    match evaluate_list_predicate(item, &spec.predicate)? {
-                        Some(true) => {}
-                        Some(false) => return Ok(Value::Boolean(false)),
-                        None => saw_null = true,
-                    }
-                }
-                if saw_null {
-                    Ok(Value::Null)
-                } else {
-                    Ok(Value::Boolean(true))
-                }
-            }
-            ListPredicateKind::Any => {
-                let mut saw_null = false;
-                for item in items.iter() {
-                    match evaluate_list_predicate(item, &spec.predicate)? {
-                        Some(true) => return Ok(Value::Boolean(true)),
-                        Some(false) => {}
-                        None => saw_null = true,
-                    }
-                }
-                if saw_null {
-                    Ok(Value::Null)
-                } else {
-                    Ok(Value::Boolean(false))
-                }
-            }
-            ListPredicateKind::None => {
-                let mut saw_null = false;
-                for item in items.iter() {
-                    match evaluate_list_predicate(item, &spec.predicate)? {
-                        Some(true) => return Ok(Value::Boolean(false)),
-                        Some(false) => {}
-                        None => saw_null = true,
-                    }
-                }
-                if saw_null {
-                    Ok(Value::Null)
-                } else {
-                    Ok(Value::Boolean(true))
-                }
-            }
-            ListPredicateKind::Single => {
-                let mut true_count = 0;
-                let mut saw_null_without_true = false;
-                for item in items.iter() {
-                    match evaluate_list_predicate(item, &spec.predicate)? {
-                        Some(true) => {
-                            true_count += 1;
-                            if true_count > 1 {
-                                return Ok(Value::Boolean(false));
-                            }
-                        }
-                        Some(false) => {}
-                        None => {
-                            if true_count == 0 {
-                                saw_null_without_true = true;
-                            }
-                        }
-                    }
-                }
-                if true_count == 1 {
-                    Ok(Value::Boolean(true))
-                } else if true_count == 0 {
-                    if saw_null_without_true {
-                        Ok(Value::Null)
-                    } else {
-                        Ok(Value::Boolean(false))
-                    }
-                } else {
-                    Ok(Value::Boolean(false))
-                }
-            }
-        },
-        other => Err(DaemonError::Query(format!(
-            "{} expects LIST input, received {other:?}",
-            match spec.kind {
-                ListPredicateKind::All => "all",
-                ListPredicateKind::Any => "any",
-                ListPredicateKind::None => "none",
-                ListPredicateKind::Single => "single",
-            }
-        ))),
-    }
+    let list = match list_value {
+        Value::Null => return Ok(Value::Null),
+        Value::List(_) => list_value,
+        other => {
+            return Err(DaemonError::Query(format!(
+                "{} expects LIST input, received {other:?}",
+                list_predicate_function_name(spec.kind)
+            )));
+        }
+    };
+
+    let predicate_value = serialize_list_predicate(&spec.predicate);
+    let args = vec![list, predicate_value];
+    let result = call_standard_function(list_predicate_function_name(spec.kind), args)?;
+    Ok(result)
 }
 
 fn list_expression_value(row: &QueryRow, expr: &ListExpression) -> Result<Value, DaemonError> {
@@ -1962,6 +1782,36 @@ fn list_expression_value(row: &QueryRow, expr: &ListExpression) -> Result<Value,
             field_value_to_scalar(value)
         }
         ListExpression::Literal(value) => Ok(value.clone()),
+    }
+}
+
+fn list_predicate_function_name(kind: ListPredicateKind) -> &'static str {
+    match kind {
+        ListPredicateKind::All => "all",
+        ListPredicateKind::Any => "any",
+        ListPredicateKind::None => "none",
+        ListPredicateKind::Single => "single",
+    }
+}
+
+fn serialize_list_predicate(predicate: &ListPredicate) -> Value {
+    match predicate {
+        ListPredicate::Comparison { operator, value } => {
+            let mut map = HashMap::new();
+            map.insert("type".into(), Value::String("comparison".into()));
+            map.insert(
+                "operator".into(),
+                Value::String(operator_symbol(operator).into()),
+            );
+            map.insert("value".into(), value.clone());
+            Value::Map(map)
+        }
+        ListPredicate::IsNull { negated } => {
+            let mut map = HashMap::new();
+            map.insert("type".into(), Value::String("isNull".into()));
+            map.insert("negated".into(), Value::Boolean(*negated));
+            Value::Map(map)
+        }
     }
 }
 
@@ -2023,57 +1873,6 @@ fn field_value_type(value: &FieldValue) -> &'static str {
         FieldValue::Relationship(_) => "relationship",
         FieldValue::Path(_) => "path",
         FieldValue::List(_) => "list",
-    }
-}
-
-fn evaluate_list_predicate(
-    item: &Value,
-    predicate: &ListPredicate,
-) -> Result<Option<bool>, DaemonError> {
-    match predicate {
-        ListPredicate::Comparison { operator, value } => match operator {
-            ComparisonOperator::Equals => {
-                if matches!(item, Value::Null) || matches!(value, Value::Null) {
-                    Ok(None)
-                } else {
-                    Ok(Some(values_equal(item, value)))
-                }
-            }
-            ComparisonOperator::NotEquals => {
-                if matches!(item, Value::Null) || matches!(value, Value::Null) {
-                    Ok(None)
-                } else {
-                    Ok(Some(!values_equal(item, value)))
-                }
-            }
-            ComparisonOperator::GreaterThan
-            | ComparisonOperator::GreaterThanOrEqual
-            | ComparisonOperator::LessThan
-            | ComparisonOperator::LessThanOrEqual => {
-                if let Some(ordering) = compare_query_values(item, value) {
-                    let result = match operator {
-                        ComparisonOperator::GreaterThan => ordering == Ordering::Greater,
-                        ComparisonOperator::GreaterThanOrEqual => {
-                            ordering == Ordering::Greater || ordering == Ordering::Equal
-                        }
-                        ComparisonOperator::LessThan => ordering == Ordering::Less,
-                        ComparisonOperator::LessThanOrEqual => {
-                            ordering == Ordering::Less || ordering == Ordering::Equal
-                        }
-                        _ => false,
-                    };
-                    Ok(Some(result))
-                } else {
-                    Ok(None)
-                }
-            }
-            ComparisonOperator::IsNull => Ok(Some(matches!(item, Value::Null))),
-            ComparisonOperator::IsNotNull => Ok(Some(!matches!(item, Value::Null))),
-        },
-        ListPredicate::IsNull { negated } => {
-            let is_null = matches!(item, Value::Null);
-            Ok(Some(if *negated { !is_null } else { is_null }))
-        }
     }
 }
 

@@ -914,6 +914,7 @@ dependencies = [
  "function-api",
  "once_cell",
  "rand",
+ "uuid",
 ]
 
 [[package]]
