@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::attr::{AttributeContainer, AttributeValue};
+use common::value::{FieldValue, QueryPath};
 use graphdb_core::query::{
     AggregateExpression, AggregateFunction, BinaryOperator, ComparisonOperator, CreatePattern,
     CreateRelationship, ExistsFunction, Expression, FieldReference, FunctionExpression,
@@ -44,21 +45,6 @@ struct QueryRow {
     paths: HashMap<String, Option<QueryPath>>,
     lists: HashMap<String, Vec<FieldValue>>,
     scalars: HashMap<String, Value>,
-}
-
-#[derive(Clone)]
-struct QueryPath {
-    nodes: Vec<Node>,
-    edges: Vec<Edge>,
-}
-
-#[derive(Clone)]
-enum FieldValue {
-    Node(Node),
-    Relationship(Edge),
-    Path(QueryPath),
-    List(Vec<FieldValue>),
-    Scalar(Value),
 }
 
 #[derive(Debug, Serialize)]

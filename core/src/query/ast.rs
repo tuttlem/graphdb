@@ -1,15 +1,5 @@
+use common::value::Value;
 use std::collections::HashMap;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    String(String),
-    Integer(i64),
-    Float(f64),
-    Boolean(bool),
-    Null,
-    List(Vec<Value>),
-    Map(HashMap<String, Value>),
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Properties(pub HashMap<String, Value>);
