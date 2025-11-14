@@ -272,8 +272,9 @@ fn parse_math_functions() {
             assert_eq!(select.returns.len(), 3);
             match &select.returns[0].expression {
                 Expression::Function(func) => match func.as_ref() {
-                    FunctionExpression::Scalar(ScalarFunction::Abs(expr)) => {
-                        assert!(matches!(expr, Expression::Field(_)));
+                    FunctionExpression::Scalar(ScalarFunction::UserDefined(call)) => {
+                        assert_eq!(call.name.to_ascii_lowercase(), "abs");
+                        assert_eq!(call.arguments.len(), 1);
                     }
                     other => panic!("unexpected expression {other:?}"),
                 },
@@ -281,13 +282,9 @@ fn parse_math_functions() {
             }
             match &select.returns[1].expression {
                 Expression::Function(func) => match func.as_ref() {
-                    FunctionExpression::Scalar(ScalarFunction::Round {
-                        value: _,
-                        precision,
-                        mode,
-                    }) => {
-                        assert!(precision.is_some());
-                        assert!(mode.is_some());
+                    FunctionExpression::Scalar(ScalarFunction::UserDefined(call)) => {
+                        assert_eq!(call.name.to_ascii_lowercase(), "round");
+                        assert_eq!(call.arguments.len(), 3);
                     }
                     other => panic!("unexpected expression {other:?}"),
                 },
@@ -295,9 +292,9 @@ fn parse_math_functions() {
             }
             match &select.returns[2].expression {
                 Expression::Function(func) => match func.as_ref() {
-                    FunctionExpression::Scalar(ScalarFunction::Atan2 { y, x }) => {
-                        assert!(matches!(y, Expression::Literal(_)));
-                        assert!(matches!(x, Expression::Literal(_)));
+                    FunctionExpression::Scalar(ScalarFunction::UserDefined(call)) => {
+                        assert_eq!(call.name.to_ascii_lowercase(), "atan2");
+                        assert_eq!(call.arguments.len(), 2);
                     }
                     other => panic!("unexpected expression {other:?}"),
                 },

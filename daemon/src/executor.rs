@@ -1,6 +1,5 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::convert::TryFrom;
 use std::f64::consts::{E as E_CONST, PI};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +18,6 @@ use graphdb_core::{
     AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
     NodeId, RoleEntry, SimpleStorage, StorageBackend, UserEntry,
 };
-use rand::Rng;
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
@@ -974,45 +972,6 @@ fn scalar_function_label(func: &ScalarFunction) -> String {
         ScalarFunction::Size(expr) => format!("size({})", expression_label(expr)),
         ScalarFunction::Length(expr) => format!("length({})", expression_label(expr)),
         ScalarFunction::Timestamp => "timestamp()".into(),
-        ScalarFunction::Abs(expr) => format!("abs({})", expression_label(expr)),
-        ScalarFunction::Ceil(expr) => format!("ceil({})", expression_label(expr)),
-        ScalarFunction::Floor(expr) => format!("floor({})", expression_label(expr)),
-        ScalarFunction::IsNaN(expr) => format!("isNaN({})", expression_label(expr)),
-        ScalarFunction::Rand => "rand()".into(),
-        ScalarFunction::Round {
-            value,
-            precision,
-            mode,
-        } => {
-            let mut args = vec![expression_label(value)];
-            if let Some(precision_expr) = precision {
-                args.push(expression_label(precision_expr));
-                if let Some(mode_expr) = mode {
-                    args.push(expression_label(mode_expr));
-                }
-            }
-            format!("round({})", args.join(", "))
-        }
-        ScalarFunction::Sign(expr) => format!("sign({})", expression_label(expr)),
-        ScalarFunction::E => "e()".into(),
-        ScalarFunction::Exp(expr) => format!("exp({})", expression_label(expr)),
-        ScalarFunction::Log(expr) => format!("log({})", expression_label(expr)),
-        ScalarFunction::Log10(expr) => format!("log10({})", expression_label(expr)),
-        ScalarFunction::Sqrt(expr) => format!("sqrt({})", expression_label(expr)),
-        ScalarFunction::Acos(expr) => format!("acos({})", expression_label(expr)),
-        ScalarFunction::Asin(expr) => format!("asin({})", expression_label(expr)),
-        ScalarFunction::Atan(expr) => format!("atan({})", expression_label(expr)),
-        ScalarFunction::Atan2 { y, x } => {
-            format!("atan2({}, {})", expression_label(y), expression_label(x))
-        }
-        ScalarFunction::Cos(expr) => format!("cos({})", expression_label(expr)),
-        ScalarFunction::Cot(expr) => format!("cot({})", expression_label(expr)),
-        ScalarFunction::Degrees(expr) => format!("degrees({})", expression_label(expr)),
-        ScalarFunction::Haversin(expr) => format!("haversin({})", expression_label(expr)),
-        ScalarFunction::Pi => "pi()".into(),
-        ScalarFunction::Radians(expr) => format!("radians({})", expression_label(expr)),
-        ScalarFunction::Sin(expr) => format!("sin({})", expression_label(expr)),
-        ScalarFunction::Tan(expr) => format!("tan({})", expression_label(expr)),
         ScalarFunction::UserDefined(call) => {
             let args = call
                 .arguments
@@ -1483,193 +1442,6 @@ fn convert_to_integer(value: Value, null_on_unsupported: bool) -> Result<Value, 
         }
     })
 }
-
-const ROUND_EPSILON: f64 = 1e-12;
-
-fn apply_numeric_float_function<B, F>(
-    db: &Database<B>,
-    row: &QueryRow,
-    expr: &Expression,
-    query_timestamp: i64,
-    context: &str,
-    op: F,
-) -> Result<FieldValue, DaemonError>
-where
-    B: StorageBackend,
-    F: Fn(f64) -> f64,
-{
-    let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-    Ok(FieldValue::Scalar(match value {
-        Value::Null => Value::Null,
-        Value::Float(f) => Value::Float(op(f)),
-        Value::Integer(i) => Value::Float(op(i as f64)),
-        other => {
-            return Err(DaemonError::Query(format!(
-                "{} expects numeric input, received {:?}",
-                context, other
-            )));
-        }
-    }))
-}
-
-fn numeric_value_from_scalar(value: Value, context: &str) -> Result<f64, DaemonError> {
-    match value {
-        Value::Float(f) => Ok(f),
-        Value::Integer(i) => Ok(i as f64),
-        other => Err(DaemonError::Query(format!(
-            "{} expects numeric input, received {:?}",
-            context, other
-        ))),
-    }
-}
-
-fn integer_value_from_scalar(value: Value, context: &str) -> Result<i64, DaemonError> {
-    match value {
-        Value::Integer(i) => Ok(i),
-        Value::Float(f) if f.is_finite() && (f.fract().abs() <= ROUND_EPSILON) => {
-            if f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-                Ok(f.trunc() as i64)
-            } else {
-                Err(DaemonError::Query(format!(
-                    "{} is outside supported integer range",
-                    context
-                )))
-            }
-        }
-        other => Err(DaemonError::Query(format!(
-            "{} expects INTEGER input, received {:?}",
-            context, other
-        ))),
-    }
-}
-
-fn parse_round_mode(mode: &str) -> Result<RoundMode, DaemonError> {
-    match mode.trim().to_ascii_uppercase().as_str() {
-        "UP" => Ok(RoundMode::Up),
-        "DOWN" => Ok(RoundMode::Down),
-        "CEILING" => Ok(RoundMode::Ceiling),
-        "FLOOR" => Ok(RoundMode::Floor),
-        "HALF_UP" => Ok(RoundMode::HalfUp),
-        "HALF_DOWN" => Ok(RoundMode::HalfDown),
-        "HALF_EVEN" => Ok(RoundMode::HalfEven),
-        other => Err(DaemonError::Query(format!(
-            "round() mode '{other}' is not supported"
-        ))),
-    }
-}
-
-fn round_number(value: f64, precision: i64, mode: RoundMode) -> Result<f64, DaemonError> {
-    if !value.is_finite() {
-        return Ok(value);
-    }
-
-    let precision_i32 = i32::try_from(precision)
-        .map_err(|_| DaemonError::Query("round() precision out of range".into()))?;
-    if precision_i32 == i32::MIN {
-        return Err(DaemonError::Query("round() precision out of range".into()));
-    }
-
-    if precision_i32 >= 0 {
-        let factor = 10f64.powi(precision_i32);
-        let scaled = value * factor;
-        Ok(apply_round_mode(scaled, mode) / factor)
-    } else {
-        let power = precision_i32.abs();
-        let factor = 10f64.powi(power);
-        let scaled = value / factor;
-        Ok(apply_round_mode(scaled, mode) * factor)
-    }
-}
-
-fn apply_round_mode(value: f64, mode: RoundMode) -> f64 {
-    if !value.is_finite() {
-        return value;
-    }
-
-    match mode {
-        RoundMode::Up => {
-            if has_fractional_part(value) {
-                if value.is_sign_negative() {
-                    value.floor()
-                } else {
-                    value.ceil()
-                }
-            } else {
-                value
-            }
-        }
-        RoundMode::Down => value.trunc(),
-        RoundMode::Ceiling => value.ceil(),
-        RoundMode::Floor => value.floor(),
-        RoundMode::HalfUp => round_half(value, HalfTieStrategy::AwayFromZero),
-        RoundMode::HalfDown => round_half(value, HalfTieStrategy::TowardZero),
-        RoundMode::HalfEven => round_half(value, HalfTieStrategy::ToEven),
-    }
-}
-
-fn round_half(value: f64, strategy: HalfTieStrategy) -> f64 {
-    if !value.is_finite() {
-        return value;
-    }
-
-    let truncated = value.trunc();
-    let fraction = value - truncated;
-    let abs_fraction = fraction.abs();
-
-    if abs_fraction < 0.5 - ROUND_EPSILON {
-        return truncated;
-    }
-    if abs_fraction > 0.5 + ROUND_EPSILON {
-        return truncated + fraction.signum();
-    }
-
-    match strategy {
-        HalfTieStrategy::AwayFromZero => truncated + fraction.signum(),
-        HalfTieStrategy::TowardZero => truncated,
-        HalfTieStrategy::ToEven => {
-            let option_one = truncated;
-            let option_two = truncated + fraction.signum();
-            if is_even_integer(option_one) {
-                option_one
-            } else if is_even_integer(option_two) {
-                option_two
-            } else {
-                option_one
-            }
-        }
-    }
-}
-
-fn has_fractional_part(value: f64) -> bool {
-    (value.fract()).abs() > ROUND_EPSILON
-}
-
-fn is_even_integer(value: f64) -> bool {
-    if !value.is_finite() {
-        return false;
-    }
-    let truncated = value.trunc();
-    (value - truncated).abs() <= ROUND_EPSILON && ((truncated / 2.0).fract()).abs() <= ROUND_EPSILON
-}
-
-#[derive(Clone, Copy, Debug)]
-enum RoundMode {
-    Up,
-    Down,
-    Ceiling,
-    Floor,
-    HalfUp,
-    HalfDown,
-    HalfEven,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum HalfTieStrategy {
-    AwayFromZero,
-    TowardZero,
-    ToEven,
-}
-
 fn apply_binary_operator(
     operator: BinaryOperator,
     left: Value,
@@ -1713,26 +1485,6 @@ fn subtract_values(left: Value, right: Value) -> Result<Value, DaemonError> {
     }
 }
 
-fn convert_to_string(value: Value, null_on_unsupported: bool) -> Result<Value, DaemonError> {
-    Ok(match value {
-        Value::Null => Value::Null,
-        Value::String(s) => Value::String(s),
-        Value::Integer(i) => Value::String(i.to_string()),
-        Value::Float(f) => Value::String(f.to_string()),
-        Value::Boolean(b) => Value::String(b.to_string()),
-        other => {
-            if null_on_unsupported {
-                Value::Null
-            } else {
-                return Err(DaemonError::Query(format!(
-                    "toStringList() does not support value {:?}",
-                    other
-                )));
-            }
-        }
-    })
-}
-
 fn scalar_to_integer(value: Value, context: &str) -> Result<Option<i64>, DaemonError> {
     match value {
         Value::Null => Ok(None),
@@ -1747,32 +1499,14 @@ fn scalar_to_integer(value: Value, context: &str) -> Result<Option<i64>, DaemonE
     }
 }
 
-fn list_conversion_function<B, F>(
-    db: &Database<B>,
-    row: &QueryRow,
-    expr: &Expression,
-    query_timestamp: i64,
-    mapper: F,
-) -> Result<FieldValue, DaemonError>
-where
-    B: StorageBackend,
-    F: Fn(Value) -> Result<Value, DaemonError>,
-{
-    let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-    match value {
-        Value::Null => Ok(FieldValue::Scalar(Value::Null)),
-        Value::List(values) => {
-            let mut mapped = Vec::with_capacity(values.len());
-            for item in values {
-                mapped.push(mapper(item)?);
-            }
-            Ok(FieldValue::Scalar(Value::List(mapped)))
-        }
-        other => Err(DaemonError::Query(format!(
-            "function expects LIST input, received {:?}",
-            other
-        ))),
-    }
+fn call_standard_function(name: &str, args: Vec<Value>) -> Result<Value, DaemonError> {
+    functions::registry()
+        .call(name, &args)
+        .map_err(DaemonError::from)
+}
+
+fn call_standard_function_unary(name: &str, arg: Value) -> Result<Value, DaemonError> {
+    call_standard_function(name, vec![arg])
 }
 fn evaluate_scalar_function<B: StorageBackend>(
     db: &Database<B>,
@@ -1910,55 +1644,33 @@ fn evaluate_scalar_function<B: StorageBackend>(
         }
         ScalarFunction::Reverse(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            match value {
-                Value::Null => Ok(FieldValue::Scalar(Value::Null)),
-                Value::List(mut values) => {
-                    values.reverse();
-                    Ok(FieldValue::Scalar(Value::List(values)))
-                }
-                other => Err(DaemonError::Query(format!(
-                    "reverse() expects LIST input, received {:?}",
-                    other
-                ))),
-            }
+            let result = call_standard_function_unary("reverse", value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Tail(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            match value {
-                Value::Null => Ok(FieldValue::Scalar(Value::Null)),
-                Value::List(values) => {
-                    let tail = if values.is_empty() {
-                        Vec::new()
-                    } else {
-                        values.into_iter().skip(1).collect()
-                    };
-                    Ok(FieldValue::Scalar(Value::List(tail)))
-                }
-                other => Err(DaemonError::Query(format!(
-                    "tail() expects LIST input, received {:?}",
-                    other
-                ))),
-            }
+            let result = call_standard_function_unary("tail", value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToBooleanList(expr) => {
-            list_conversion_function(db, row, expr, query_timestamp, |value| {
-                convert_to_boolean(value, true)
-            })
+            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
+            let result = call_standard_function_unary("toBooleanList", value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToFloatList(expr) => {
-            list_conversion_function(db, row, expr, query_timestamp, |value| {
-                convert_to_float(value, true)
-            })
+            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
+            let result = call_standard_function_unary("toFloatList", value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToIntegerList(expr) => {
-            list_conversion_function(db, row, expr, query_timestamp, |value| {
-                convert_to_integer(value, true)
-            })
+            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
+            let result = call_standard_function_unary("toIntegerList", value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToStringList(expr) => {
-            list_conversion_function(db, row, expr, query_timestamp, |value| {
-                convert_to_string(value, true)
-            })
+            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
+            let result = call_standard_function_unary("toStringList", value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::StartNode(field) => {
             let relationship = resolve_relationship_from_field(row, field)?;
@@ -1986,20 +1698,12 @@ fn evaluate_scalar_function<B: StorageBackend>(
         }
         ScalarFunction::Head(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = match value {
-                Value::Null => Value::Null,
-                Value::List(values) => values.first().cloned().unwrap_or(Value::Null),
-                _ => return Err(DaemonError::Query("head() expects a LIST value".into())),
-            };
+            let result = call_standard_function_unary("head", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Last(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = match value {
-                Value::Null => Value::Null,
-                Value::List(values) => values.last().cloned().unwrap_or(Value::Null),
-                _ => return Err(DaemonError::Query("last() expects a LIST value".into())),
-            };
+            let result = call_standard_function_unary("last", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Id(field) => match resolve_field(row, field)? {
@@ -2037,223 +1741,15 @@ fn evaluate_scalar_function<B: StorageBackend>(
         ))),
         ScalarFunction::Size(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let size = match value {
-                Value::Null => Value::Null,
-                Value::List(values) => Value::Integer(values.len() as i64),
-                Value::String(s) => Value::Integer(s.chars().count() as i64),
-                _ => return Err(DaemonError::Query("size() expects a LIST or STRING".into())),
-            };
-            Ok(FieldValue::Scalar(size))
+            let result = call_standard_function_unary("size", value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Length(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let len = match value {
-                Value::Null => Value::Null,
-                Value::List(values) => Value::Integer(values.len() as i64),
-                _ => return Err(DaemonError::Query("length() expects a LIST value".into())),
-            };
-            Ok(FieldValue::Scalar(len))
+            let result = call_standard_function_unary("length", value)?;
+            Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Timestamp => Ok(FieldValue::Scalar(Value::Integer(query_timestamp))),
-        ScalarFunction::Abs(expr) => {
-            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = match value {
-                Value::Null => Value::Null,
-                Value::Integer(i) => Value::Integer(i.checked_abs().ok_or_else(|| {
-                    DaemonError::Query(
-                        "abs() cannot represent absolute value for minimum integer".into(),
-                    )
-                })?),
-                Value::Float(f) => Value::Float(f.abs()),
-                other => {
-                    return Err(DaemonError::Query(format!(
-                        "abs() expects numeric input, received {:?}",
-                        other
-                    )));
-                }
-            };
-            Ok(FieldValue::Scalar(result))
-        }
-        ScalarFunction::Ceil(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "ceil()", |value| {
-                value.ceil()
-            })
-        }
-        ScalarFunction::Floor(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "floor()", |value| {
-                value.floor()
-            })
-        }
-        ScalarFunction::IsNaN(expr) => {
-            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = match value {
-                Value::Null => Value::Null,
-                Value::Float(f) => Value::Boolean(f.is_nan()),
-                Value::Integer(_) => Value::Boolean(false),
-                other => {
-                    return Err(DaemonError::Query(format!(
-                        "isNaN() expects numeric input, received {:?}",
-                        other
-                    )));
-                }
-            };
-            Ok(FieldValue::Scalar(result))
-        }
-        ScalarFunction::Rand => {
-            let mut rng = rand::thread_rng();
-            Ok(FieldValue::Scalar(Value::Float(rng.r#gen::<f64>())))
-        }
-        ScalarFunction::Round {
-            value,
-            precision,
-            mode,
-        } => {
-            let raw_value = evaluate_expression_to_scalar(db, row, value, query_timestamp)?;
-            let number = match raw_value {
-                Value::Null => return Ok(FieldValue::Scalar(Value::Null)),
-                other => numeric_value_from_scalar(other, "round()")?,
-            };
-            let precision_value = match precision {
-                Some(expr) => {
-                    let raw_precision =
-                        evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-                    match raw_precision {
-                        Value::Null => return Ok(FieldValue::Scalar(Value::Null)),
-                        other => integer_value_from_scalar(other, "round() precision")?,
-                    }
-                }
-                None => 0,
-            };
-            let mode_value = match mode {
-                Some(expr) => {
-                    let raw_mode = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-                    match raw_mode {
-                        Value::Null => return Ok(FieldValue::Scalar(Value::Null)),
-                        Value::String(s) => parse_round_mode(&s)?,
-                        _other => {
-                            return Err(DaemonError::Query(
-                                "round() mode expects STRING input".into(),
-                            ));
-                        }
-                    }
-                }
-                None => RoundMode::Up,
-            };
-            let rounded = round_number(number, precision_value, mode_value)?;
-            Ok(FieldValue::Scalar(Value::Float(rounded)))
-        }
-        ScalarFunction::Sign(expr) => {
-            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = match value {
-                Value::Null => Value::Null,
-                Value::Integer(i) => Value::Integer(i.signum()),
-                Value::Float(f) => {
-                    if f.is_nan() {
-                        Value::Null
-                    } else if f > 0.0 {
-                        Value::Integer(1)
-                    } else if f < 0.0 {
-                        Value::Integer(-1)
-                    } else {
-                        Value::Integer(0)
-                    }
-                }
-                other => {
-                    return Err(DaemonError::Query(format!(
-                        "sign() expects numeric input, received {:?}",
-                        other
-                    )));
-                }
-            };
-            Ok(FieldValue::Scalar(result))
-        }
-        ScalarFunction::E => Ok(FieldValue::Scalar(Value::Float(E_CONST))),
-        ScalarFunction::Exp(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "exp()", |value| {
-                value.exp()
-            })
-        }
-        ScalarFunction::Log(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "log()", |value| {
-                value.ln()
-            })
-        }
-        ScalarFunction::Log10(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "log10()", |value| {
-                value.log10()
-            })
-        }
-        ScalarFunction::Sqrt(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "sqrt()", |value| {
-                value.sqrt()
-            })
-        }
-        ScalarFunction::Acos(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "acos()", |value| {
-                value.acos()
-            })
-        }
-        ScalarFunction::Asin(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "asin()", |value| {
-                value.asin()
-            })
-        }
-        ScalarFunction::Atan(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "atan()", |value| {
-                value.atan()
-            })
-        }
-        ScalarFunction::Atan2 { y, x } => {
-            let y_value = evaluate_expression_to_scalar(db, row, y, query_timestamp)?;
-            let y_number = match y_value {
-                Value::Null => return Ok(FieldValue::Scalar(Value::Null)),
-                other => numeric_value_from_scalar(other, "atan2()")?,
-            };
-            let x_value = evaluate_expression_to_scalar(db, row, x, query_timestamp)?;
-            let x_number = match x_value {
-                Value::Null => return Ok(FieldValue::Scalar(Value::Null)),
-                other => numeric_value_from_scalar(other, "atan2()")?,
-            };
-            Ok(FieldValue::Scalar(Value::Float(y_number.atan2(x_number))))
-        }
-        ScalarFunction::Cos(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "cos()", |value| {
-                value.cos()
-            })
-        }
-        ScalarFunction::Cot(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "cot()", |value| {
-                1.0 / value.tan()
-            })
-        }
-        ScalarFunction::Degrees(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "degrees()", |value| {
-                value.to_degrees()
-            })
-        }
-        ScalarFunction::Haversin(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "haversin()", |value| {
-                let half = value / 2.0;
-                let s = half.sin();
-                s * s
-            })
-        }
-        ScalarFunction::Pi => Ok(FieldValue::Scalar(Value::Float(PI))),
-        ScalarFunction::Radians(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "radians()", |value| {
-                value.to_radians()
-            })
-        }
-        ScalarFunction::Sin(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "sin()", |value| {
-                value.sin()
-            })
-        }
-        ScalarFunction::Tan(expr) => {
-            apply_numeric_float_function(db, row, expr, query_timestamp, "tan()", |value| {
-                value.tan()
-            })
-        }
         ScalarFunction::UserDefined(call) => {
             let mut evaluated_args = Vec::with_capacity(call.arguments.len());
             for argument in &call.arguments {
@@ -4727,8 +4223,20 @@ fn node_name(node: &Node) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use function_api::register_plugin_functions;
     use graphdb_core::storage::memory::InMemoryBackend;
     use std::collections::HashMap;
+    use std::sync::Once;
+    use stdfunc;
+
+    static REGISTER_STANDARD_FUNCTIONS: Once = Once::new();
+
+    pub(super) fn ensure_standard_functions_registered() {
+        REGISTER_STANDARD_FUNCTIONS.call_once(|| {
+            let registration = stdfunc::graphdb_register_functions();
+            register_plugin_functions(&registration).expect("register stdfunc plugin functions");
+        });
+    }
 
     #[test]
     fn executes_shortest_path_query() {
@@ -4804,6 +4312,10 @@ mod tests {
 }
 
 fn execute_script_for_test(db: &Database<InMemoryBackend>, script: &str) -> ExecutionReport {
+    #[cfg(test)]
+    {
+        tests::ensure_standard_functions_registered();
+    }
     execute_script(db, script).expect("execute script")
 }
 

@@ -10,8 +10,7 @@ use once_cell::sync::Lazy;
 pub type FunctionResult = Result<Value, FunctionError>;
 pub type FunctionHandler = Arc<dyn Fn(&[Value]) -> FunctionResult + Send + Sync + 'static>;
 
-#[allow(improper_ctypes_definitions)]
-pub type PluginCallback = unsafe extern "C" fn(*const Value, usize) -> Value;
+pub type PluginCallback = unsafe extern "C" fn(*const Value, usize, *mut Value) -> bool;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionArity {
@@ -117,6 +116,22 @@ pub fn registry() -> &'static FunctionRegistry {
     &FUNCTION_REGISTRY
 }
 
+static LAST_PLUGIN_ERROR: Lazy<RwLock<Option<String>>> = Lazy::new(|| RwLock::new(None));
+
+pub fn set_last_error(message: impl Into<String>) {
+    if let Ok(mut guard) = LAST_PLUGIN_ERROR.write() {
+        *guard = Some(message.into());
+    }
+}
+
+pub fn take_last_error() -> Option<String> {
+    LAST_PLUGIN_ERROR
+        .write()
+        .ok()
+        .and_then(|mut guard| guard.take())
+}
+
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct PluginFunctionSpec {
     pub name: *const c_char,
@@ -196,6 +211,7 @@ unsafe fn register_plugin_function(spec: &PluginFunctionSpec) -> Result<(), Func
     let min_arity = spec.min_arity;
     let max_arity = spec.max_arity;
     let callback = spec.callback;
+    let function_name = name.clone();
     let handler = move |args: &[Value]| -> FunctionResult {
         if args.len() < min_arity {
             return Err(FunctionError::InvalidArity {
@@ -212,7 +228,15 @@ unsafe fn register_plugin_function(spec: &PluginFunctionSpec) -> Result<(), Func
                 });
             }
         }
-        Ok(unsafe { callback(args.as_ptr(), args.len()) })
+        let mut output = Value::Null;
+        let success = unsafe { callback(args.as_ptr(), args.len(), &mut output as *mut Value) };
+        if success {
+            Ok(output)
+        } else {
+            Err(FunctionError::Execution(take_last_error().unwrap_or_else(
+                || format!("plugin function '{function_name}' failed"),
+            )))
+        }
     };
 
     registry().register(FunctionSpec::new(name, arity_for_registration, handler))

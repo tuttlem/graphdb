@@ -209,7 +209,7 @@ The query engine includes a broad set of Cypher-style helpers:
 
 - **Predicate** – `all`, `any`, `none`, `single`, `isEmpty`, and pattern `exists(...)` all behave like their Cypher equivalents (e.g. `all([])` is vacuously `true`, `any([])` is `false`, nulls propagate when no decisive value exists).
 - **Scalar/List** – `coalesce`, `keys`, `labels`, `head`, `last`, `tail`, `reverse`, `range`, `startNode`, `endNode`, `id`, `type`, `properties`, `randomUUID`, `size`, `length`, `timestamp`, the conversion helpers `toBoolean`, `toBooleanOrNull`, `toBooleanList`, `toFloat`, `toFloatOrNull`, `toFloatList`, `toInteger`, `toIntegerOrNull`, `toIntegerList`, `toStringList`, plus `relationships`, `nodes`, and `reduce`.
-- **Mathematical** – numeric helpers (`abs`, `ceil`, `floor`, `isNaN`, `rand`, `round(value [, precision, mode])`, `sign`), logarithmic functions (`e`, `exp`, `log`, `log10`, `sqrt`), and the full trigonometric family (`acos`, `asin`, `atan`, `atan2`, `cos`, `cot`, `degrees`, `haversin`, `pi`, `radians`, `sin`, `tan`). `round()` defaults to `mode = 'UP'` like Cypher and accepts the same rounding modes (`UP`, `DOWN`, `CEILING`, `FLOOR`, `HALF_UP`, `HALF_DOWN`, `HALF_EVEN`).
+- **Mathematical** – the bundled `stdfunc` plugin provides the numeric helpers (`abs`, `ceil`, `floor`, `isNaN`, `rand`, `round(value [, precision, mode])`, `sign`), logarithmic functions (`e`, `exp`, `log`, `log10`, `sqrt`), and the full trigonometric family (`acos`, `asin`, `atan`, `atan2`, `cos`, `cot`, `degrees`, `haversin`, `pi`, `radians`, `sin`, `tan`). `round()` defaults to `mode = 'UP'` like Cypher and accepts the same rounding modes (`UP`, `DOWN`, `CEILING`, `FLOOR`, `HALF_UP`, `HALF_DOWN`, `HALF_EVEN`).
 
 
 Example:
@@ -270,8 +270,17 @@ config file) for shared libraries and calls an export named
 `graphdb_register_functions`. This lets you ship optional function packs
 without rebuilding the main binary.
 
-The workspace includes a sample plugin crate, `stdfunc`, which exposes a
-`hello()` function to Cypher:
+The workspace includes a bundled plugin crate, `stdfunc`, which is organised
+into `math`, `string`, and `list` modules. The math module exports the numeric
+helper functions (`abs`, `ceil`, `floor`, `isNaN`, `rand`, `round`, `sign`),
+logarithmic helpers (`e`, `exp`, `log`, `log10`, `sqrt`), the full
+trigonometric family (`acos`, `asin`, `atan`, `atan2`, `cos`, `cot`,
+`degrees`, `haversin`, `pi`, `radians`, `sin`, `tan`), plus a simple
+`hello()` function for smoke testing. The string module currently implements
+`size()` (supporting both lists and strings to match Cypher semantics), while
+the list module covers the core structural helpers (`reverse`, `tail`, `head`,
+`last`, `length`) and the conversion family (`toBooleanList`, `toFloatList`,
+`toIntegerList`, `toStringList`):
 
 ```bash
 cargo build -p stdfunc
@@ -288,7 +297,9 @@ RETURN hello() AS greeting;
 
 Plugins register their functions by calling into the same `function-api`
 registry shown above, so authoring external packs feels identical to adding a
-built-in helper.
+built-in helper. If you remove the bundled `stdfunc` library from `./lib`, the
+numeric helpers listed earlier will disappear until you load a replacement
+plugin.
 
 > Tip: building the workspace (`cargo build` or `cargo test`) automatically
 > refreshes `./lib` with the latest `stdfunc` artifact, so the plugin is always
@@ -359,6 +370,10 @@ client_dir = "../client/dist"   # optional SPA bundle served by the daemon
 #cert_path = "./cert.pem"
 #key_path = "./key.pem"
 ```
+
+`plugin_dir` is resolved relative to the configuration file. For example, when
+using `daemon/config/dev.toml`, set `plugin_dir = "../../lib"` so the daemon
+finds the bundled `stdfunc` library in the workspace root.
 
 ### Storage Backends
 

@@ -8,3 +8,5 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 function-api = { path = "../function-api" }
+rand = "0.8"
+once_cell = "1.19"

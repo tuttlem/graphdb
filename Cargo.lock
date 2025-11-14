@@ -912,6 +912,8 @@ name = "stdfunc"
 version = "0.1.0"
 dependencies = [
  "function-api",
+ "once_cell",
+ "rand",
 ]
 
 [[package]]

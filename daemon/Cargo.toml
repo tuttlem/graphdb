@@ -36,3 +36,6 @@ libloading = "0.8"
 
 [build-dependencies]
 stdfunc = { path = "../stdfunc" }
+
+[dev-dependencies]
+stdfunc = { path = "../stdfunc" }
