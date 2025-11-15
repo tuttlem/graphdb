@@ -445,6 +445,25 @@ fn parse_call_procedure() {
 }
 
 #[test]
+fn parse_call_path_procedure_with_map_literal() {
+    let input =
+        "CALL path.dijkstra({ sourceNode: \"00000000-0000-0000-0000-000000000001\" }) YIELD totalCost;";
+    let queries = parse_queries(input).expect("path procedure");
+    match &queries[0] {
+        Query::CallProcedure { procedure } => match procedure {
+            Procedure::User(call) => {
+                assert_eq!(call.name, "path.dijkstra");
+                assert_eq!(call.arguments.len(), 1);
+                let yields = call.yield_items.as_ref().expect("yield clause");
+                assert_eq!(yields, &vec!["totalCost".to_string()]);
+            }
+            other => panic!("unexpected procedure {other:?}"),
+        },
+        other => panic!("unexpected query {other:?}"),
+    }
+}
+
+#[test]
 fn parse_shortest_path_query() {
     let input = r#"
 MATCH (start:Person {name: "Meg"}), (end:Person {name: "Kevin"})

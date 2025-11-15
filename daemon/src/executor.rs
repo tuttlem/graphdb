@@ -1,5 +1,5 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::f64::consts::{E as E_CONST, PI};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2988,58 +2988,83 @@ fn execute_procedure<B: StorageBackend>(
             };
             Ok(ProcedureResult { name, rows })
         }
-        Procedure::User(call) => execute_user_procedure(db, call),
+        Procedure::User(call) => {
+            if call.name.eq_ignore_ascii_case("path.dijkstra") {
+                let args = evaluate_procedure_arguments(db, &call)?;
+                execute_path_dijkstra(db, args, &call)
+            } else {
+                execute_user_procedure(db, call)
+            }
+        }
     }
+}
+
+fn evaluate_procedure_arguments<B: StorageBackend>(
+    db: &Database<B>,
+    call: &UserProcedureCall,
+) -> Result<Vec<FieldValue>, DaemonError> {
+    let row = QueryRow::default();
+    let timestamp = current_timestamp_millis();
+    let mut values = Vec::with_capacity(call.arguments.len());
+    for argument in &call.arguments {
+        values.push(evaluate_expression(db, &row, argument, timestamp)?);
+    }
+    Ok(values)
 }
 
 fn execute_user_procedure<B: StorageBackend>(
     db: &Database<B>,
     call: UserProcedureCall,
 ) -> Result<ProcedureResult, DaemonError> {
-    let row = QueryRow::default();
-    let timestamp = current_timestamp_millis();
-    let mut evaluated_args = Vec::with_capacity(call.arguments.len());
-    for argument in &call.arguments {
-        evaluated_args.push(evaluate_expression(db, &row, argument, timestamp)?);
-    }
+    let evaluated_args = evaluate_procedure_arguments(db, &call)?;
 
     let mut ctx = StandardProcedureContext { _db: db };
     let (available_columns, stream) = functions::procedures()
         .call(&call.name, &evaluated_args, &mut ctx)
         .map_err(DaemonError::from)?;
+    let rows: Vec<_> = stream.collect();
 
-    let desired_columns = if let Some(yield_items) = &call.yield_items {
-        for column in yield_items {
+    procedure_rows_to_result(call.name, available_columns, rows, call.yield_items)
+}
+
+fn procedure_rows_to_result(
+    name: String,
+    available_columns: Vec<String>,
+    rows: Vec<HashMap<String, FieldValue>>,
+    yield_items: Option<Vec<String>>,
+) -> Result<ProcedureResult, DaemonError> {
+    let columns = if let Some(items) = yield_items {
+        for column in &items {
             if !available_columns
                 .iter()
-                .any(|available| available == column)
+                .any(|candidate| candidate == column)
             {
                 return Err(DaemonError::Query(format!(
                     "procedure '{}' does not yield column '{}'",
-                    call.name, column
+                    name, column
                 )));
             }
         }
-        yield_items.clone()
+        items
     } else {
         available_columns.clone()
     };
 
-    let mut rows = Vec::new();
-    for mut row_map in stream {
-        let mut json_row = serde_json::Map::new();
-        for column in &desired_columns {
-            let value = row_map
+    let mut json_rows = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        let mut json_map = serde_json::Map::new();
+        for column in &columns {
+            let value = row
                 .remove(column)
                 .unwrap_or_else(|| FieldValue::Scalar(Value::Null));
-            json_row.insert(column.clone(), field_value_to_json(&value)?);
+            json_map.insert(column.clone(), field_value_to_json(&value)?);
         }
-        rows.push(JsonValue::Object(json_row));
+        json_rows.push(JsonValue::Object(json_map));
     }
 
     Ok(ProcedureResult {
-        name: call.name,
-        rows,
+        name,
+        rows: json_rows,
     })
 }
 
@@ -3190,6 +3215,400 @@ fn compute_aggregate(rows: &[QueryRow], expr: &AggregateExpression) -> Result<Va
             Ok(Value::Float(population_std_dev(&values)))
         }
     }
+}
+
+fn execute_path_dijkstra<B: StorageBackend>(
+    db: &Database<B>,
+    args: Vec<FieldValue>,
+    call: &UserProcedureCall,
+) -> Result<ProcedureResult, DaemonError> {
+    let config = parse_dijkstra_config(args)?;
+    let rows = run_dijkstra(db, &config)?;
+    let available_columns = vec![
+        "index".to_string(),
+        "sourceNode".to_string(),
+        "targetNode".to_string(),
+        "totalCost".to_string(),
+        "nodeIds".to_string(),
+        "costs".to_string(),
+    ];
+    procedure_rows_to_result(
+        call.name.clone(),
+        available_columns,
+        rows,
+        call.yield_items.clone(),
+    )
+}
+
+fn parse_dijkstra_config(args: Vec<FieldValue>) -> Result<DijkstraConfig, DaemonError> {
+    if args.is_empty() {
+        return Err(DaemonError::Query(
+            "path.dijkstra expects at least a configuration argument".into(),
+        ));
+    }
+
+    let config_field = match args.len() {
+        1 => args.into_iter().next().unwrap(),
+        2 => args.into_iter().nth(1).unwrap(),
+        _ => {
+            return Err(DaemonError::Query(
+                "path.dijkstra expects one or two arguments".into(),
+            ));
+        }
+    };
+
+    let config_value = field_value_to_scalar(config_field)?;
+    let map = match config_value {
+        Value::Map(map) => map,
+        _ => {
+            return Err(DaemonError::Query(
+                "path.dijkstra configuration must be a map".into(),
+            ));
+        }
+    };
+
+    let source_value = map
+        .get("sourceNode")
+        .ok_or_else(|| DaemonError::Query("path.dijkstra requires sourceNode".into()))?;
+    let source = parse_node_id(source_value)?;
+
+    let target = if let Some(value) = map.get("targetNode") {
+        Some(parse_node_id(value)?)
+    } else {
+        None
+    };
+
+    let weight_property = map
+        .get("relationshipWeightProperty")
+        .map(|value| match value {
+            Value::String(s) => Ok(s.clone()),
+            Value::Null => Ok(String::new()),
+            _ => Err(DaemonError::Query(
+                "relationshipWeightProperty must be STRING".into(),
+            )),
+        })
+        .transpose()?;
+    let weight_property = weight_property.filter(|s| !s.is_empty());
+
+    let relationship_types = map
+        .get("relationshipTypes")
+        .map(|value| match value {
+            Value::List(values) => {
+                let mut types = HashSet::new();
+                for entry in values {
+                    match entry {
+                        Value::String(name) => {
+                            types.insert(name.clone());
+                        }
+                        _ => {
+                            return Err(DaemonError::Query(
+                                "relationshipTypes must be list of STRING".into(),
+                            ));
+                        }
+                    }
+                }
+                Ok(types)
+            }
+            _ => Err(DaemonError::Query(
+                "relationshipTypes must be a list".into(),
+            )),
+        })
+        .transpose()?;
+
+    let direction = if let Some(value) = map.get("direction") {
+        match value {
+            Value::String(s) => match s.to_ascii_uppercase().as_str() {
+                "OUTGOING" => Ok(DijkstraDirection::Outgoing),
+                "INCOMING" => Ok(DijkstraDirection::Incoming),
+                "BOTH" => Ok(DijkstraDirection::Both),
+                _ => Err(DaemonError::Query(
+                    "direction must be OUTGOING, INCOMING, or BOTH".into(),
+                )),
+            },
+            _ => Err(DaemonError::Query("direction must be STRING".into())),
+        }?
+    } else {
+        DijkstraDirection::Outgoing
+    };
+
+    Ok(DijkstraConfig {
+        source,
+        target,
+        weight_property,
+        relationship_types,
+        direction,
+    })
+}
+
+fn run_dijkstra<B: StorageBackend>(
+    db: &Database<B>,
+    config: &DijkstraConfig,
+) -> Result<Vec<HashMap<String, FieldValue>>, DaemonError> {
+    let mut distances = HashMap::new();
+    distances.insert(config.source, 0.0);
+    let mut predecessors: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    heap.push(QueueEntry {
+        node: config.source,
+        cost: 0.0,
+    });
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+
+    while let Some(entry) = heap.pop() {
+        if visited.contains(&entry.node) {
+            continue;
+        }
+        visited.insert(entry.node);
+        order.push(entry.node);
+
+        if config.target == Some(entry.node) {
+            break;
+        }
+
+        let neighbors = neighbors_for_node(db, entry.node, config)?;
+        for neighbor in neighbors {
+            let next_cost = entry.cost + neighbor.weight;
+            if next_cost.is_nan() || next_cost.is_infinite() || next_cost < 0.0 {
+                return Err(DaemonError::Query(
+                    "path.dijkstra encountered invalid relationship weights".into(),
+                ));
+            }
+            let current_best = distances
+                .get(&neighbor.node)
+                .copied()
+                .unwrap_or(f64::INFINITY);
+            if next_cost < current_best - f64::EPSILON {
+                distances.insert(neighbor.node, next_cost);
+                predecessors.insert(neighbor.node, entry.node);
+                heap.push(QueueEntry {
+                    node: neighbor.node,
+                    cost: next_cost,
+                });
+            }
+        }
+    }
+
+    let targets: Vec<NodeId> = if let Some(target) = config.target {
+        if distances.contains_key(&target) {
+            vec![target]
+        } else {
+            Vec::new()
+        }
+    } else {
+        order
+            .into_iter()
+            .filter(|node| *node != config.source && distances.contains_key(node))
+            .collect()
+    };
+
+    let mut rows = Vec::with_capacity(targets.len());
+    for (index, node_id) in targets.into_iter().enumerate() {
+        let (path_nodes, path_costs) =
+            reconstruct_path(node_id, config.source, &predecessors, &distances)?;
+        let mut row = HashMap::new();
+        row.insert(
+            "index".into(),
+            FieldValue::Scalar(Value::Integer(index as i64)),
+        );
+        row.insert(
+            "sourceNode".into(),
+            FieldValue::Scalar(Value::String(config.source.to_string())),
+        );
+        row.insert(
+            "targetNode".into(),
+            FieldValue::Scalar(Value::String(node_id.to_string())),
+        );
+        row.insert(
+            "totalCost".into(),
+            FieldValue::Scalar(Value::Float(*distances.get(&node_id).unwrap_or(&0.0))),
+        );
+        let node_values = path_nodes
+            .iter()
+            .map(|id| Value::String(id.to_string()))
+            .collect();
+        row.insert(
+            "nodeIds".into(),
+            FieldValue::Scalar(Value::List(node_values)),
+        );
+        let cost_values = path_costs.iter().map(|cost| Value::Float(*cost)).collect();
+        row.insert("costs".into(), FieldValue::Scalar(Value::List(cost_values)));
+        rows.push(row);
+    }
+
+    Ok(rows)
+}
+
+fn neighbors_for_node<B: StorageBackend>(
+    db: &Database<B>,
+    node_id: NodeId,
+    config: &DijkstraConfig,
+) -> Result<Vec<NeighborInfo>, DaemonError> {
+    let edges = db.edges_for_node(node_id)?;
+    let mut neighbors = Vec::new();
+    for edge in edges {
+        match config.direction {
+            DijkstraDirection::Outgoing => {
+                if edge.source() == node_id {
+                    if relationship_allowed(&edge, &config.relationship_types) {
+                        let weight = edge_weight(&edge, config.weight_property.as_deref())?;
+                        neighbors.push(NeighborInfo {
+                            node: edge.target(),
+                            weight,
+                        });
+                    }
+                }
+            }
+            DijkstraDirection::Incoming => {
+                if edge.target() == node_id {
+                    if relationship_allowed(&edge, &config.relationship_types) {
+                        let weight = edge_weight(&edge, config.weight_property.as_deref())?;
+                        neighbors.push(NeighborInfo {
+                            node: edge.source(),
+                            weight,
+                        });
+                    }
+                }
+            }
+            DijkstraDirection::Both => {
+                if edge.source() == node_id {
+                    if relationship_allowed(&edge, &config.relationship_types) {
+                        let weight = edge_weight(&edge, config.weight_property.as_deref())?;
+                        neighbors.push(NeighborInfo {
+                            node: edge.target(),
+                            weight,
+                        });
+                    }
+                }
+                if edge.target() == node_id {
+                    if relationship_allowed(&edge, &config.relationship_types) {
+                        let weight = edge_weight(&edge, config.weight_property.as_deref())?;
+                        neighbors.push(NeighborInfo {
+                            node: edge.source(),
+                            weight,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(neighbors)
+}
+
+fn relationship_allowed(edge: &Edge, allowed_types: &Option<HashSet<String>>) -> bool {
+    if let Some(types) = allowed_types {
+        let label = edge.attribute("__label").and_then(|value| match value {
+            AttributeValue::String(s) => Some(s.as_str()),
+            _ => None,
+        });
+        if let Some(label) = label {
+            types.contains(label)
+        } else {
+            false
+        }
+    } else {
+        true
+    }
+}
+
+fn edge_weight(edge: &Edge, property: Option<&str>) -> Result<f64, DaemonError> {
+    if let Some(prop) = property {
+        match edge.attribute(prop) {
+            Some(AttributeValue::Float(value)) => Ok(*value),
+            Some(AttributeValue::Integer(value)) => Ok(*value as f64),
+            Some(AttributeValue::String(value)) => value
+                .parse::<f64>()
+                .map_err(|_| DaemonError::Query("relationship weight must be numeric".into())),
+            Some(_) => Err(DaemonError::Query(
+                "relationship weight must be numeric".into(),
+            )),
+            None => Err(DaemonError::Query(format!(
+                "relationship is missing property '{}'",
+                prop
+            ))),
+        }
+    } else {
+        Ok(1.0)
+    }
+}
+
+fn reconstruct_path(
+    target: NodeId,
+    source: NodeId,
+    predecessors: &HashMap<NodeId, NodeId>,
+    distances: &HashMap<NodeId, f64>,
+) -> Result<(Vec<NodeId>, Vec<f64>), DaemonError> {
+    let mut nodes = Vec::new();
+    let mut current = target;
+    nodes.push(current);
+    while current != source {
+        current = *predecessors
+            .get(&current)
+            .ok_or_else(|| DaemonError::Query("failed to reconstruct shortest path".into()))?;
+        nodes.push(current);
+    }
+    nodes.reverse();
+
+    let mut costs = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        let cost = if *node == source {
+            0.0
+        } else {
+            *distances
+                .get(node)
+                .ok_or_else(|| DaemonError::Query("missing cost for path node".into()))?
+        };
+        costs.push(cost);
+    }
+
+    Ok((nodes, costs))
+}
+
+#[derive(Clone, Copy)]
+struct NeighborInfo {
+    node: NodeId,
+    weight: f64,
+}
+
+#[derive(Clone, Copy)]
+struct QueueEntry {
+    node: NodeId,
+    cost: f64,
+}
+
+impl PartialEq for QueueEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node && (self.cost - other.cost).abs() < f64::EPSILON
+    }
+}
+
+impl Eq for QueueEntry {}
+
+impl PartialOrd for QueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueueEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.cost.total_cmp(&self.cost)
+    }
+}
+
+struct DijkstraConfig {
+    source: NodeId,
+    target: Option<NodeId>,
+    weight_property: Option<String>,
+    relationship_types: Option<HashSet<String>>,
+    direction: DijkstraDirection,
+}
+
+#[derive(Clone, Copy)]
+enum DijkstraDirection {
+    Outgoing,
+    Incoming,
+    Both,
 }
 
 fn percentile_values(

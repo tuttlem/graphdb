@@ -159,6 +159,7 @@ fn value_literal(input: &str) -> IResult<Value> {
 
 fn primitive_value_literal(input: &str) -> IResult<Value> {
     alt((
+        map_literal,
         string_literal,
         array_literal,
         bool_literal,
@@ -176,6 +177,24 @@ fn array_literal(input: &str) -> IResult<Value> {
             ws(char(']')),
         ),
         Value::List,
+    )(input)
+}
+
+fn map_literal(input: &str) -> IResult<Value> {
+    let entry = separated_pair(property_key, ws(char(':')), value_literal);
+    map(
+        delimited(
+            ws(char('{')),
+            separated_list0(ws(char(',')), entry),
+            ws(char('}')),
+        ),
+        |pairs| {
+            let mut map = HashMap::new();
+            for (key, value) in pairs {
+                map.insert(key.to_string(), value);
+            }
+            Value::Map(map)
+        },
     )(input)
 }
 
@@ -1295,6 +1314,7 @@ fn literal_expression(input: &str) -> IResult<Expression> {
 
 fn literal_value(input: &str) -> IResult<Value> {
     alt((
+        map_literal,
         string_literal,
         array_literal,
         bool_literal,
