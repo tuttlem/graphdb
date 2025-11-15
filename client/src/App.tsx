@@ -10,6 +10,13 @@ type GraphNode = {
   attributes: Record<string, AttributeValue>;
 };
 
+type GraphEdge = {
+  id: string;
+  start: string;
+  end: string;
+  label?: string;
+};
+
 type ProcedureRow = Record<string, AttributeValue>;
 
 type ProcedureResult = {
@@ -65,6 +72,11 @@ type ResultEntry = {
   result: QuerySuccess;
 };
 
+type GraphData = {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+};
+
 const MAX_FEED_ENTRIES = 10;
 
 const formatCellValue = (value: unknown) => {
@@ -112,6 +124,204 @@ const buildRowsTable = (rows: Record<string, unknown>[]) => {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+};
+
+const toGraphNode = (value: unknown): GraphNode | null => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const candidate = value as Partial<GraphNode>;
+  if (typeof candidate.id === 'string' && Array.isArray(candidate.labels) && candidate.attributes && typeof candidate.attributes === 'object') {
+    return candidate as GraphNode;
+  }
+  return null;
+};
+
+const toGraphEdge = (value: unknown): GraphEdge | null => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const candidate = value as Record<string, unknown>;
+  const start = typeof candidate.start === 'string'
+    ? candidate.start
+    : typeof candidate.from === 'string'
+      ? candidate.from
+      : typeof candidate.source === 'string'
+        ? candidate.source
+        : null;
+  const end = typeof candidate.end === 'string'
+    ? candidate.end
+    : typeof candidate.to === 'string'
+      ? candidate.to
+      : typeof candidate.target === 'string'
+        ? candidate.target
+        : null;
+  if (!start || !end) {
+    return null;
+  }
+  const label = typeof candidate.label === 'string'
+    ? candidate.label
+    : typeof candidate.type === 'string'
+      ? candidate.type
+      : undefined;
+  const id = typeof candidate.id === 'string' ? candidate.id : `${start}->${end}-${label ?? 'rel'}`;
+  return { id, start, end, label };
+};
+
+const extractGraphDataFromRow = (row: Record<string, unknown>, rowIndex: number): GraphData | null => {
+  const nodesMap = new Map<string, GraphNode>();
+  const edgesMap = new Map<string, GraphEdge>();
+
+  const inspectValue = (value: unknown) => {
+    const node = toGraphNode(value);
+    if (node) {
+      nodesMap.set(node.id, node);
+      return;
+    }
+    const edge = toGraphEdge(value);
+    if (edge) {
+      edgesMap.set(edge.id, edge);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(inspectValue);
+      return;
+    }
+    if (value && typeof value === 'object') {
+      const obj = value as Record<string, unknown>;
+      if (Array.isArray(obj.nodes)) {
+        obj.nodes.forEach(inspectValue);
+      }
+      if (Array.isArray(obj.edges)) {
+        obj.edges.forEach(inspectValue);
+      }
+      if (Array.isArray(obj.relationships)) {
+        obj.relationships.forEach(inspectValue);
+      }
+    }
+  };
+
+  Object.values(row).forEach(inspectValue);
+
+  const nodes = Array.from(nodesMap.values());
+  if (!nodes.length) {
+    return null;
+  }
+
+  let edges = Array.from(edgesMap.values());
+  if (!edges.length && nodes.length > 1) {
+    edges = nodes.slice(1).map((node, idx) => ({
+      id: `auto-${rowIndex}-${node.id}`,
+      start: nodes[idx].id,
+      end: node.id,
+    }));
+  }
+
+  return { nodes, edges };
+};
+
+const RowsSectionContent = ({ rows }: { rows: Record<string, unknown>[] }) => {
+  const graphPreviews = rows
+    .map((row, idx) => ({ graph: extractGraphDataFromRow(row, idx), idx }))
+    .filter((entry) => entry.graph !== null) as { graph: GraphData; idx: number }[];
+
+  return (
+    <div className="rows-section-content">
+      {buildRowsTable(rows)}
+      {graphPreviews.length > 0 && (
+        <div className="row-graphs">
+          {graphPreviews.map(({ graph, idx }) => (
+            <RowGraphPreview key={`row-graph-${idx}`} rowIndex={idx} graph={graph} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+type RowGraphPreviewProps = {
+  rowIndex: number;
+  graph: GraphData;
+};
+
+const RowGraphPreview = ({ rowIndex, graph }: RowGraphPreviewProps) => {
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(graph.nodes[0]?.id ?? null);
+  const width = 320;
+  const height = 220;
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const radius = Math.min(width, height) / 2 - 30;
+
+  const positionedNodes = graph.nodes.map((node, idx) => {
+    if (graph.nodes.length === 1) {
+      return { node, x: centerX, y: centerY };
+    }
+    const angle = (2 * Math.PI * idx) / graph.nodes.length;
+    const x = centerX + radius * Math.cos(angle);
+    const y = centerY + radius * Math.sin(angle);
+    return { node, x, y };
+  });
+
+  const nodePositionMap = new Map(positionedNodes.map(({ node, x, y }) => [node.id, { x, y }]));
+  const selectedNode = selectedNodeId ? graph.nodes.find((node) => node.id === selectedNodeId) ?? null : null;
+
+  return (
+    <div className="row-graph-preview">
+      <div className="row-graph-header">Graph view for row {rowIndex + 1}</div>
+      <div className="graph-visual">
+        <div className="graph-canvas">
+          <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Graph preview">
+            <defs>
+              <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth">
+                <path d="M0,0 L0,6 L6,3 z" fill="rgba(255,255,255,0.5)" />
+              </marker>
+            </defs>
+            {graph.edges.map((edge) => {
+              const start = nodePositionMap.get(edge.start);
+              const end = nodePositionMap.get(edge.end);
+              if (!start || !end) {
+                return null;
+              }
+              return (
+                <line
+                  key={edge.id}
+                  className="graph-edge"
+                  x1={start.x}
+                  y1={start.y}
+                  x2={end.x}
+                  y2={end.y}
+                  markerEnd="url(#arrow)"
+                />
+              );
+            })}
+            {positionedNodes.map(({ node, x, y }) => {
+              const primaryLabel = node.labels?.[0] ?? 'Node';
+              const isSelected = node.id === selectedNodeId;
+              return (
+                <g key={node.id} className={`graph-node${isSelected ? ' selected' : ''}`} onClick={() => setSelectedNodeId(node.id)}>
+                  <circle cx={x} cy={y} r={20}>
+                    <title>{node.id}</title>
+                  </circle>
+                  <text x={x} y={y + 4}>{primaryLabel}</text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+        <div className="graph-node-detail">
+          {selectedNode ? (
+            <>
+              <h4>{selectedNode.labels?.[0] ?? 'Node'}</h4>
+              <p className="mono small">{selectedNode.id}</p>
+              <pre>{JSON.stringify(selectedNode.attributes, null, 2)}</pre>
+            </>
+          ) : (
+            <p className="muted">Click a node to inspect its attributes.</p>
+          )}
+        </div>
+      </div>
     </div>
   );
 };
@@ -184,7 +394,7 @@ const buildResultSections = (entryId: string, result: QuerySuccess): ResultSecti
       id: `${entryId}-rows`,
       title: 'Rows',
       variant: 'rows',
-      content: buildRowsTable(result.rows),
+      content: <RowsSectionContent rows={result.rows} />,
     });
   }
 

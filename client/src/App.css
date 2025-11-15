@@ -164,6 +164,8 @@ button.pill {
   border: 1px solid #2a2f45;
   color: inherit;
   cursor: pointer;
+  width: 100%;
+  text-align: left;
 }
 
 .result-entry-query code {
@@ -193,6 +195,91 @@ button.pill {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+
+.rows-section-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.row-graphs {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.row-graph-preview {
+  border: 1px solid #1f2333;
+  border-radius: 12px;
+  padding: 1rem;
+  background: #0d101c;
+}
+
+.row-graph-header {
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+}
+
+.graph-visual {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.graph-canvas {
+  flex: 1;
+  min-width: 260px;
+}
+
+.graph-canvas svg {
+  width: 100%;
+  height: 220px;
+}
+
+.graph-node-detail {
+  min-width: 220px;
+  flex: 1;
+  background: #05060c;
+  border-radius: 10px;
+  border: 1px solid #1b1f2b;
+  padding: 0.75rem;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.graph-node-detail h4 {
+  margin: 0 0 0.35rem;
+}
+
+.graph-node-detail pre {
+  margin: 0;
+}
+
+.graph-node {
+  cursor: pointer;
+}
+
+.graph-node circle {
+  fill: #5865f2;
+  stroke: rgba(255, 255, 255, 0.8);
+  stroke-width: 1.5;
+}
+
+.graph-node.selected circle {
+  stroke-width: 3;
+  stroke: #fff;
+}
+
+.graph-node text {
+  fill: #fff;
+  font-size: 0.75rem;
+  text-anchor: middle;
+}
+
+.graph-edge {
+  stroke: rgba(255, 255, 255, 0.25);
+  stroke-width: 1.5;
 }
 
 .result-block-title {
@@ -334,6 +421,10 @@ button.pill {
 
 .mono {
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+.small {
+  font-size: 0.85rem;
 }
 
 pre {
