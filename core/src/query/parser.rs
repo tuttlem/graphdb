@@ -1346,23 +1346,52 @@ fn numeric_literal(input: &str) -> IResult<f64> {
 
 fn call_stmt(input: &str) -> IResult<Query> {
     let (input, _) = ws(tag_no_case("CALL"))(input)?;
-    let (input, _) = ws(tag_no_case("GRAPHDB"))(input)?;
-    let (input, _) = ws(char('.'))(input)?;
-    let (input, proc_ident) = ws(identifier)(input)?;
-    let procedure = GraphDbProcedure::from_identifier(proc_ident).ok_or_else(|| {
-        nom::Err::Failure(VerboseError {
-            errors: vec![(proc_ident, VerboseErrorKind::Context("unknown procedure"))],
-        })
-    })?;
-    let (input, _) = ws(char('('))(input)?;
-    let (input, _) = ws(char(')'))(input)?;
+    if let Ok((input, _)) = ws(tag_no_case("GRAPHDB"))(input) {
+        let (input, _) = ws(char('.'))(input)?;
+        let (input, proc_ident) = ws(identifier)(input)?;
+        let procedure = GraphDbProcedure::from_identifier(proc_ident).ok_or_else(|| {
+            nom::Err::Failure(VerboseError {
+                errors: vec![(proc_ident, VerboseErrorKind::Context("unknown procedure"))],
+            })
+        })?;
+        let (input, _) = ws(char('('))(input)?;
+        let (input, _) = ws(char(')'))(input)?;
+
+        return Ok((
+            input,
+            Query::CallProcedure {
+                procedure: Procedure::GraphDb(procedure),
+            },
+        ));
+    }
+
+    let (input, name_parts) = separated_list1(ws(char('.')), identifier)(input)?;
+    let name = name_parts.join(".");
+    let (input, arguments) = delimited(
+        ws(char('(')),
+        separated_list0(ws(char(',')), non_aggregate_expression),
+        ws(char(')')),
+    )(input)?;
+    let (input, yield_items) = opt(yield_clause)(input)?;
 
     Ok((
         input,
         Query::CallProcedure {
-            procedure: Procedure::GraphDb(procedure),
+            procedure: Procedure::User(UserProcedureCall {
+                name,
+                arguments,
+                yield_items,
+            }),
         },
     ))
+}
+
+fn yield_clause(input: &str) -> IResult<Vec<String>> {
+    let (input, _) = ws(tag_no_case("YIELD"))(input)?;
+    separated_list1(
+        ws(char(',')),
+        map(ws(identifier), |ident| ident.to_string()),
+    )(input)
 }
 
 fn path_match_stmt(origin: &str) -> IResult<Query> {

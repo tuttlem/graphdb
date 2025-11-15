@@ -1,6 +1,6 @@
 use std::io;
 
-use function_api::FunctionError;
+use function_api::{FunctionError, ProcedureError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -35,6 +35,12 @@ pub type Result<T> = std::result::Result<T, DaemonError>;
 
 impl From<FunctionError> for DaemonError {
     fn from(value: FunctionError) -> Self {
+        DaemonError::Query(value.to_string())
+    }
+}
+
+impl From<ProcedureError> for DaemonError {
+    fn from(value: ProcedureError) -> Self {
         DaemonError::Query(value.to_string())
     }
 }

@@ -52,6 +52,7 @@ const SAMPLE_QUERIES = [
   'MATCH (n:Person) RETURN n;',
   'CALL graphdb.nodeClasses();',
   'CALL graphdb.roles();',
+  'CALL std.lines("hello world from graphdb") YIELD word;',
 ];
 
 function App() {
@@ -114,21 +115,28 @@ function App() {
   }, [result?.selected_nodes]);
 
   const renderedRows = useMemo(() => {
-    if (!result?.rows || result.rows.length === 0) {
+    const directRows = result?.rows ?? [];
+    const procedureRows = result?.procedures?.flatMap((procedure) =>
+      procedure.rows.map((row) => ({ __procedure: procedure.name, ...row }))
+    ) ?? [];
+    const displayRows = directRows.length > 0 ? directRows : procedureRows;
+
+    if (!displayRows.length) {
       return (
-        <p className="muted">No rows returned.</p>
+        <p className="muted">No rows returned. (Procedure output is shown below when available.)</p>
       );
     }
+
     return (
       <ul className="messages">
-        {result.rows.map((row, idx) => (
+        {displayRows.map((row, idx) => (
           <li key={idx}>
             <pre>{JSON.stringify(row, null, 2)}</pre>
           </li>
         ))}
       </ul>
     );
-  }, [result?.rows]);
+  }, [result?.rows, result?.procedures]);
 
   const renderedPlan = useMemo(() => {
     if (!result?.plan_summary) {

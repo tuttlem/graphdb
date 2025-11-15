@@ -149,7 +149,7 @@ npm run build
 ```
 
 The UI lets you issue arbitrary statements, view returned nodes, inspect
-procedure results (for catalog calls), and replay recent queries.
+procedure results (including user procedures such as `CALL std.lines(...) YIELD word;`), and replay recent queries.
 
 The catalog keeps a per-table epoch counter along with a global epoch. The
 `CatalogCache` (`Database::catalog_cache()`) provides a read-through cache: when

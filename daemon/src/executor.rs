@@ -12,8 +12,8 @@ use graphdb_core::query::{
     GraphDbProcedure, ListExpression, ListPredicate, ListPredicateFunction, ListPredicateKind,
     MatchPattern, NodePattern, PathFilter, PathLength, PathMatchQuery, PathPattern, PathQueryMode,
     PathReturn, PredicateFilter, Procedure, Projection, Properties, Query, RelationshipDirection,
-    RelationshipMatch, RelationshipPattern, ScalarFunction, SelectMatchClause, SelectQuery, Value,
-    ValueOperand, WithClause, parse_queries,
+    RelationshipMatch, RelationshipPattern, ScalarFunction, SelectMatchClause, SelectQuery,
+    UserProcedureCall, Value, ValueOperand, WithClause, parse_queries,
 };
 use graphdb_core::{
     AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
@@ -23,9 +23,11 @@ use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::DaemonError;
-use function_api::{self as functions, ExpressionHandle, FunctionContext, FunctionError};
+use function_api::{
+    self as functions, ExpressionHandle, FunctionContext, FunctionError, ProcedureContext,
+};
 #[cfg(test)]
-use function_api::{FunctionArity, FunctionSpec};
+use function_api::{FunctionArity, FunctionSpec, ProcedureRow, ProcedureSpec};
 
 #[derive(Debug, Default, Serialize)]
 pub struct ExecutionReport {
@@ -1501,6 +1503,12 @@ impl<'a, B: StorageBackend> FunctionContext for StandardFunctionContext<'a, B> {
             .map_err(|err| FunctionError::execution(err.to_string()))
     }
 }
+
+struct StandardProcedureContext<'a, B: StorageBackend> {
+    _db: &'a Database<B>,
+}
+
+impl<'a, B: StorageBackend> ProcedureContext for StandardProcedureContext<'a, B> {}
 fn evaluate_scalar_function<B: StorageBackend>(
     db: &Database<B>,
     row: &QueryRow,
@@ -2945,41 +2953,94 @@ fn execute_procedure<B: StorageBackend>(
     db: &Database<B>,
     procedure: Procedure,
 ) -> Result<ProcedureResult, DaemonError> {
-    let name = procedure.canonical_name().to_string();
-    let rows = match procedure {
-        Procedure::GraphDb(graph_proc) => match graph_proc {
-            GraphDbProcedure::NodeClasses => {
-                let entries = db
-                    .catalog()
-                    .list_node_classes()
-                    .map_err(graphdb_core::DatabaseError::from)?;
-                node_class_rows(entries)
+    match procedure {
+        Procedure::GraphDb(graph_proc) => {
+            let name = graph_proc.canonical_name().to_string();
+            let rows = match graph_proc {
+                GraphDbProcedure::NodeClasses => {
+                    let entries = db
+                        .catalog()
+                        .list_node_classes()
+                        .map_err(graphdb_core::DatabaseError::from)?;
+                    node_class_rows(entries)
+                }
+                GraphDbProcedure::EdgeClasses => {
+                    let entries = db
+                        .catalog()
+                        .list_edge_classes()
+                        .map_err(graphdb_core::DatabaseError::from)?;
+                    edge_class_rows(entries)
+                }
+                GraphDbProcedure::Users => {
+                    let entries = db
+                        .catalog()
+                        .list_users()
+                        .map_err(graphdb_core::DatabaseError::from)?;
+                    user_rows(entries)
+                }
+                GraphDbProcedure::Roles => {
+                    let entries = db
+                        .catalog()
+                        .list_roles()
+                        .map_err(graphdb_core::DatabaseError::from)?;
+                    role_rows(entries)
+                }
+            };
+            Ok(ProcedureResult { name, rows })
+        }
+        Procedure::User(call) => execute_user_procedure(db, call),
+    }
+}
+
+fn execute_user_procedure<B: StorageBackend>(
+    db: &Database<B>,
+    call: UserProcedureCall,
+) -> Result<ProcedureResult, DaemonError> {
+    let row = QueryRow::default();
+    let timestamp = current_timestamp_millis();
+    let mut evaluated_args = Vec::with_capacity(call.arguments.len());
+    for argument in &call.arguments {
+        evaluated_args.push(evaluate_expression(db, &row, argument, timestamp)?);
+    }
+
+    let mut ctx = StandardProcedureContext { _db: db };
+    let (available_columns, stream) = functions::procedures()
+        .call(&call.name, &evaluated_args, &mut ctx)
+        .map_err(DaemonError::from)?;
+
+    let desired_columns = if let Some(yield_items) = &call.yield_items {
+        for column in yield_items {
+            if !available_columns
+                .iter()
+                .any(|available| available == column)
+            {
+                return Err(DaemonError::Query(format!(
+                    "procedure '{}' does not yield column '{}'",
+                    call.name, column
+                )));
             }
-            GraphDbProcedure::EdgeClasses => {
-                let entries = db
-                    .catalog()
-                    .list_edge_classes()
-                    .map_err(graphdb_core::DatabaseError::from)?;
-                edge_class_rows(entries)
-            }
-            GraphDbProcedure::Users => {
-                let entries = db
-                    .catalog()
-                    .list_users()
-                    .map_err(graphdb_core::DatabaseError::from)?;
-                user_rows(entries)
-            }
-            GraphDbProcedure::Roles => {
-                let entries = db
-                    .catalog()
-                    .list_roles()
-                    .map_err(graphdb_core::DatabaseError::from)?;
-                role_rows(entries)
-            }
-        },
+        }
+        yield_items.clone()
+    } else {
+        available_columns.clone()
     };
 
-    Ok(ProcedureResult { name, rows })
+    let mut rows = Vec::new();
+    for mut row_map in stream {
+        let mut json_row = serde_json::Map::new();
+        for column in &desired_columns {
+            let value = row_map
+                .remove(column)
+                .unwrap_or_else(|| FieldValue::Scalar(Value::Null));
+            json_row.insert(column.clone(), field_value_to_json(&value)?);
+        }
+        rows.push(JsonValue::Object(json_row));
+    }
+
+    Ok(ProcedureResult {
+        name: call.name,
+        rows,
+    })
 }
 
 fn compute_aggregate(rows: &[QueryRow], expr: &AggregateExpression) -> Result<Value, DaemonError> {
@@ -4089,11 +4150,52 @@ mod tests {
     use stdfunc;
 
     static REGISTER_STANDARD_FUNCTIONS: Once = Once::new();
+    static REGISTER_TEST_PROCEDURES: Once = Once::new();
 
     pub(super) fn ensure_standard_functions_registered() {
         REGISTER_STANDARD_FUNCTIONS.call_once(|| {
             let registration = stdfunc::graphdb_register_functions();
             register_plugin_functions(&registration).expect("register stdfunc plugin functions");
+        });
+    }
+
+    pub(super) fn ensure_test_procedures_registered() {
+        REGISTER_TEST_PROCEDURES.call_once(|| {
+            functions::procedures()
+                .register(ProcedureSpec::new(
+                    "test.range",
+                    FunctionArity::Exact(2),
+                    vec!["value"],
+                    |args, _| {
+                        let start = match &args[0] {
+                            FieldValue::Scalar(Value::Integer(i)) => *i,
+                            other => {
+                                return Err(function_api::ProcedureError::execution(format!(
+                                    "expected integer start, got {:?}",
+                                    other
+                                )));
+                            }
+                        };
+                        let end = match &args[1] {
+                            FieldValue::Scalar(Value::Integer(i)) => *i,
+                            other => {
+                                return Err(function_api::ProcedureError::execution(format!(
+                                    "expected integer end, got {:?}",
+                                    other
+                                )));
+                            }
+                        };
+                        let mut rows = Vec::new();
+                        for value in start..=end {
+                            let mut row = ProcedureRow::new();
+                            row.insert("value".into(), FieldValue::Scalar(Value::Integer(value)));
+                            rows.push(row);
+                        }
+                        Ok(Box::new(function_api::VecProcedureStream::new(rows))
+                            as Box<dyn function_api::ProcedureStream>)
+                    },
+                ))
+                .expect("register test procedure");
         });
     }
 
@@ -4924,6 +5026,42 @@ mod scalar_function_tests {
             .and_then(|v| v.as_str())
             .expect("combined string");
         assert_eq!(combined, "123");
+    }
+
+    #[test]
+    fn call_user_defined_procedure() {
+        crate::executor::tests::ensure_standard_functions_registered();
+        crate::executor::tests::ensure_test_procedures_registered();
+        let db = Database::new(InMemoryBackend::new());
+        let report = execute_script_for_test(&db, "CALL test.range(1,3) YIELD value;");
+        let values: Vec<_> = report
+            .procedures
+            .last()
+            .expect("procedure result")
+            .rows
+            .iter()
+            .filter_map(|row| row.get("value").and_then(|v| v.as_i64()))
+            .collect();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn call_stdfunc_lines_procedure() {
+        crate::executor::tests::ensure_standard_functions_registered();
+        let db = Database::new(InMemoryBackend::new());
+        let report = execute_script_for_test(
+            &db,
+            "CALL std.lines('hello world from graphdb') YIELD word;",
+        );
+        let words: Vec<_> = report
+            .procedures
+            .last()
+            .expect("procedure result")
+            .rows
+            .iter()
+            .filter_map(|row| row.get("word").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(words, vec!["hello", "world", "from", "graphdb"]);
     }
 
     #[test]

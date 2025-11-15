@@ -18,6 +18,27 @@ pub type ContextFunctionHandler =
 pub type PluginCallback = unsafe extern "C" fn(*const FieldValue, usize, *mut FieldValue) -> bool;
 pub type PluginContextCallback =
     unsafe extern "C" fn(*const FieldValue, usize, *mut FieldValue, *mut HostContext) -> bool;
+pub type ProcedureRowCallback = unsafe extern "C" fn(*mut c_void, *const FieldValue, usize) -> bool;
+pub type PluginProcedureCallback = unsafe extern "C" fn(
+    *const FieldValue,
+    usize,
+    *mut HostContext,
+    ProcedureRowCallback,
+    *mut c_void,
+) -> bool;
+
+pub trait ProcedureContext {}
+
+pub type ProcedureRow = HashMap<String, FieldValue>;
+
+pub trait ProcedureStream: Iterator<Item = ProcedureRow> + Send {}
+
+impl<T> ProcedureStream for T where T: Iterator<Item = ProcedureRow> + Send {}
+
+pub type ProcedureResult = Result<Box<dyn ProcedureStream>, ProcedureError>;
+pub type ProcedureHandler = Arc<
+    dyn Fn(&[FieldValue], &mut dyn ProcedureContext) -> ProcedureResult + Send + Sync + 'static,
+>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionArity {
@@ -196,12 +217,193 @@ pub fn take_last_error() -> Option<String> {
         .and_then(|mut guard| guard.take())
 }
 
+pub struct ProcedureSpec {
+    pub name: String,
+    pub arity: FunctionArity,
+    pub outputs: Vec<String>,
+    pub handler: ProcedureHandler,
+}
+
+impl ProcedureSpec {
+    pub fn new(
+        name: impl Into<String>,
+        arity: FunctionArity,
+        outputs: Vec<&str>,
+        handler: impl Fn(&[FieldValue], &mut dyn ProcedureContext) -> ProcedureResult
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            arity,
+            outputs: outputs.into_iter().map(|s| s.to_string()).collect(),
+            handler: Arc::new(handler),
+        }
+    }
+}
+
+struct RegisteredProcedure {
+    arity: FunctionArity,
+    outputs: Vec<String>,
+    handler: ProcedureHandler,
+}
+
+#[derive(Default)]
+pub struct ProcedureRegistry {
+    procedures: RwLock<HashMap<String, RegisteredProcedure>>,
+}
+
+impl ProcedureRegistry {
+    pub fn new() -> Self {
+        Self {
+            procedures: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn register(&self, spec: ProcedureSpec) -> Result<(), ProcedureError> {
+        let mut guard = self
+            .procedures
+            .write()
+            .expect("procedure registry poisoned");
+        let key = spec.name.to_ascii_lowercase();
+        if guard.contains_key(&key) {
+            return Err(ProcedureError::AlreadyRegistered(spec.name));
+        }
+        guard.insert(
+            key,
+            RegisteredProcedure {
+                arity: spec.arity,
+                outputs: spec.outputs,
+                handler: spec.handler,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn call(
+        &self,
+        name: &str,
+        args: &[FieldValue],
+        ctx: &mut dyn ProcedureContext,
+    ) -> Result<(Vec<String>, Box<dyn ProcedureStream>), ProcedureError> {
+        let guard = self.procedures.read().expect("procedure registry poisoned");
+        let key = name.to_ascii_lowercase();
+        let entry = guard
+            .get(&key)
+            .ok_or_else(|| ProcedureError::NotFound(name.to_string()))?;
+        entry
+            .arity
+            .validate(args.len())
+            .map_err(ProcedureError::from_function_error)?;
+        let stream = (entry.handler)(args, ctx)?;
+        Ok((entry.outputs.clone(), stream))
+    }
+}
+
+static PROCEDURE_REGISTRY: Lazy<ProcedureRegistry> = Lazy::new(ProcedureRegistry::new);
+
+pub fn procedures() -> &'static ProcedureRegistry {
+    &PROCEDURE_REGISTRY
+}
+
+pub struct VecProcedureStream {
+    rows: Vec<ProcedureRow>,
+    index: usize,
+}
+
+impl VecProcedureStream {
+    pub fn new(rows: Vec<ProcedureRow>) -> Self {
+        Self { rows, index: 0 }
+    }
+}
+
+impl Iterator for VecProcedureStream {
+    type Item = ProcedureRow;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.rows.len() {
+            None
+        } else {
+            let row = self.rows[self.index].clone();
+            self.index += 1;
+            Some(row)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ProcedureError {
+    AlreadyRegistered(String),
+    NotFound(String),
+    InvalidArity {
+        expected: FunctionArity,
+        received: usize,
+    },
+    Execution(String),
+    InvalidName,
+    ContextNotSupported(String),
+}
+
+impl ProcedureError {
+    pub fn execution(message: impl Into<String>) -> Self {
+        ProcedureError::Execution(message.into())
+    }
+
+    fn from_function_error(err: FunctionError) -> Self {
+        match err {
+            FunctionError::InvalidArity { expected, received } => {
+                ProcedureError::InvalidArity { expected, received }
+            }
+            FunctionError::ContextNotSupported(name) => ProcedureError::ContextNotSupported(name),
+            other => ProcedureError::Execution(other.to_string()),
+        }
+    }
+}
+
+impl fmt::Display for ProcedureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProcedureError::AlreadyRegistered(name) => {
+                write!(f, "procedure '{name}' is already registered")
+            }
+            ProcedureError::NotFound(name) => write!(f, "procedure '{name}' is not registered"),
+            ProcedureError::InvalidArity { expected, received } => {
+                write!(
+                    f,
+                    "invalid argument count: expected {expected}, received {received}"
+                )
+            }
+            ProcedureError::Execution(message) => write!(f, "{message}"),
+            ProcedureError::InvalidName => write!(f, "procedure name must be valid UTF-8"),
+            ProcedureError::ContextNotSupported(name) => {
+                write!(
+                    f,
+                    "procedure '{name}' requires context, which is not supported"
+                )
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct PluginFunctionSpec {
     pub name: *const c_char,
     pub callback: PluginCallback,
     pub context_callback: Option<PluginContextCallback>,
+    pub min_arity: usize,
+    pub max_arity: isize,
+    pub flags: u32,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct PluginProcedureSpec {
+    pub name: *const c_char,
+    pub callback: PluginProcedureCallback,
+    pub outputs: *const *const c_char,
+    pub output_len: usize,
     pub min_arity: usize,
     pub max_arity: isize,
     pub flags: u32,
@@ -223,25 +425,44 @@ pub struct HostContextVTable {
 }
 
 pub const PLUGIN_FLAG_REQUIRES_CONTEXT: u32 = 0x1;
+pub const PLUGIN_PROCEDURE_FLAG_REQUIRES_CONTEXT: u32 = 0x1;
 
 #[repr(C)]
 pub struct PluginRegistration {
     pub functions: *const PluginFunctionSpec,
-    pub len: usize,
+    pub function_len: usize,
+    pub procedures: *const PluginProcedureSpec,
+    pub procedure_len: usize,
 }
 
 unsafe impl Send for PluginFunctionSpec {}
 unsafe impl Sync for PluginFunctionSpec {}
+unsafe impl Send for PluginProcedureSpec {}
+unsafe impl Sync for PluginProcedureSpec {}
 unsafe impl Send for PluginRegistration {}
 unsafe impl Sync for PluginRegistration {}
 
 impl PluginRegistration {
-    pub const fn new(functions: *const PluginFunctionSpec, len: usize) -> Self {
-        Self { functions, len }
+    pub const fn new(
+        functions: *const PluginFunctionSpec,
+        function_len: usize,
+        procedures: *const PluginProcedureSpec,
+        procedure_len: usize,
+    ) -> Self {
+        Self {
+            functions,
+            function_len,
+            procedures,
+            procedure_len,
+        }
     }
 
     pub unsafe fn as_slice(&self) -> &[PluginFunctionSpec] {
-        unsafe { std::slice::from_raw_parts(self.functions, self.len) }
+        unsafe { std::slice::from_raw_parts(self.functions, self.function_len) }
+    }
+
+    pub unsafe fn procedure_slice(&self) -> &[PluginProcedureSpec] {
+        unsafe { std::slice::from_raw_parts(self.procedures, self.procedure_len) }
     }
 }
 
@@ -279,10 +500,66 @@ impl PluginFunctionSpec {
     }
 }
 
+impl PluginProcedureSpec {
+    pub unsafe fn name(&self) -> Result<&str, ProcedureError> {
+        if self.name.is_null() {
+            return Err(ProcedureError::InvalidName);
+        }
+        unsafe { CStr::from_ptr(self.name) }
+            .to_str()
+            .map_err(|_| ProcedureError::InvalidName)
+    }
+
+    pub fn arity(&self) -> Result<FunctionArity, ProcedureError> {
+        if self.max_arity < 0 {
+            Ok(FunctionArity::Variadic {
+                min: self.min_arity,
+            })
+        } else {
+            let max = self.max_arity as usize;
+            if max == self.min_arity {
+                Ok(FunctionArity::Exact(max))
+            } else if max >= self.min_arity {
+                Ok(FunctionArity::Variadic {
+                    min: self.min_arity,
+                })
+            } else {
+                Err(ProcedureError::InvalidArity {
+                    expected: FunctionArity::Exact(self.min_arity),
+                    received: max,
+                })
+            }
+        }
+    }
+
+    pub unsafe fn outputs(&self) -> Result<Vec<String>, ProcedureError> {
+        if self.outputs.is_null() && self.output_len > 0 {
+            return Err(ProcedureError::InvalidName);
+        }
+        let mut result = Vec::with_capacity(self.output_len);
+        for idx in 0..self.output_len {
+            let ptr = unsafe { *self.outputs.add(idx) };
+            if ptr.is_null() {
+                return Err(ProcedureError::InvalidName);
+            }
+            let column = unsafe { CStr::from_ptr(ptr) }
+                .to_str()
+                .map_err(|_| ProcedureError::InvalidName)?
+                .to_string();
+            result.push(column);
+        }
+        Ok(result)
+    }
+}
+
 pub fn register_plugin_functions(registration: &PluginRegistration) -> Result<(), FunctionError> {
     unsafe {
         for spec in registration.as_slice() {
             register_plugin_function(spec)?;
+        }
+        for spec in registration.procedure_slice() {
+            register_plugin_procedure(spec)
+                .map_err(|err| FunctionError::execution(err.to_string()))?;
         }
     }
     Ok(())
@@ -380,6 +657,91 @@ unsafe fn register_plugin_function(spec: &PluginFunctionSpec) -> Result<(), Func
         arity: arity_for_registration,
         handler: FunctionKind::Simple(Arc::new(handler)),
     })
+}
+
+unsafe fn register_plugin_procedure(spec: &PluginProcedureSpec) -> Result<(), ProcedureError> {
+    let name = unsafe { spec.name()? }.to_owned();
+    let arity = spec.arity()?;
+    let arity_for_registration = arity.clone();
+    let min_arity = spec.min_arity;
+    let max_arity = spec.max_arity;
+    let outputs = unsafe { spec.outputs()? };
+    let handler_outputs = outputs.clone();
+    let callback = spec.callback;
+    if (spec.flags & PLUGIN_PROCEDURE_FLAG_REQUIRES_CONTEXT) != 0 {
+        return Err(ProcedureError::ContextNotSupported(name.clone()));
+    }
+    let function_name = name.clone();
+    let handler = move |args: &[FieldValue], _ctx: &mut dyn ProcedureContext| -> ProcedureResult {
+        if args.len() < min_arity {
+            return Err(ProcedureError::InvalidArity {
+                expected: arity.clone(),
+                received: args.len(),
+            });
+        }
+        if max_arity >= 0 {
+            let max = max_arity as usize;
+            if args.len() > max {
+                return Err(ProcedureError::InvalidArity {
+                    expected: arity.clone(),
+                    received: args.len(),
+                });
+            }
+        }
+
+        let mut collector = ProcedureRowCollector {
+            columns: handler_outputs.clone(),
+            rows: Vec::new(),
+        };
+        let success = unsafe {
+            callback(
+                args.as_ptr(),
+                args.len(),
+                std::ptr::null_mut(),
+                procedure_row_sink,
+                &mut collector as *mut _ as *mut c_void,
+            )
+        };
+        if success {
+            Ok(Box::new(VecProcedureStream::new(collector.rows)))
+        } else {
+            Err(ProcedureError::Execution(take_last_error().unwrap_or_else(
+                || format!("plugin procedure '{function_name}' failed"),
+            )))
+        }
+    };
+
+    procedures().register(ProcedureSpec {
+        name,
+        arity: arity_for_registration,
+        outputs,
+        handler: Arc::new(handler),
+    })
+}
+
+struct ProcedureRowCollector {
+    columns: Vec<String>,
+    rows: Vec<ProcedureRow>,
+}
+
+unsafe extern "C" fn procedure_row_sink(
+    data: *mut c_void,
+    values: *const FieldValue,
+    len: usize,
+) -> bool {
+    let collector = unsafe { &mut *(data as *mut ProcedureRowCollector) };
+    let columns = &collector.columns;
+    if len != columns.len() {
+        set_last_error("procedure row column count mismatch");
+        return false;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(values, len) };
+    let mut row = ProcedureRow::new();
+    for (idx, value) in slice.iter().enumerate() {
+        row.insert(columns[idx].clone(), value.clone());
+    }
+    collector.rows.push(row);
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -543,5 +905,65 @@ mod tests {
             FieldValue::Scalar(Value::Integer(sum)) => assert_eq!(sum, 3),
             other => panic!("unexpected result: {:?}", other),
         }
+    }
+
+    struct DummyProcedureContext;
+
+    impl ProcedureContext for DummyProcedureContext {}
+
+    #[test]
+    fn registers_and_invokes_procedure() {
+        let registry = ProcedureRegistry::new();
+        registry
+            .register(ProcedureSpec::new(
+                "range",
+                FunctionArity::Exact(2),
+                vec!["value"],
+                |args, _| {
+                    let start = match &args[0] {
+                        FieldValue::Scalar(Value::Integer(i)) => *i,
+                        other => {
+                            return Err(ProcedureError::execution(format!(
+                                "expected integer start, got {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    let end = match &args[1] {
+                        FieldValue::Scalar(Value::Integer(i)) => *i,
+                        other => {
+                            return Err(ProcedureError::execution(format!(
+                                "expected integer end, got {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    let mut rows = Vec::new();
+                    for value in start..=end {
+                        let mut row = ProcedureRow::new();
+                        row.insert("value".into(), FieldValue::Scalar(Value::Integer(value)));
+                        rows.push(row);
+                    }
+                    Ok(Box::new(VecProcedureStream::new(rows)) as Box<dyn ProcedureStream>)
+                },
+            ))
+            .expect("register procedure");
+
+        let args = vec![
+            FieldValue::Scalar(Value::Integer(1)),
+            FieldValue::Scalar(Value::Integer(3)),
+        ];
+        let mut ctx = DummyProcedureContext;
+        let (columns, stream) = registry
+            .call("range", &args, &mut ctx)
+            .expect("call procedure");
+        assert_eq!(columns, vec!["value".to_string()]);
+        let collected: Vec<_> = stream
+            .map(|row| match row.get("value") {
+                Some(FieldValue::Scalar(Value::Integer(i))) => *i,
+                other => panic!("unexpected row value: {:?}", other),
+            })
+            .collect();
+        assert_eq!(collected, vec![1, 2, 3]);
     }
 }

@@ -288,6 +288,7 @@ pub enum AggregateFunction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Procedure {
     GraphDb(GraphDbProcedure),
+    User(UserProcedureCall),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -302,8 +303,16 @@ impl Procedure {
     pub fn canonical_name(&self) -> &'static str {
         match self {
             Procedure::GraphDb(proc) => proc.canonical_name(),
+            Procedure::User(_) => "user",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserProcedureCall {
+    pub name: String,
+    pub arguments: Vec<Expression>,
+    pub yield_items: Option<Vec<String>>,
 }
 
 impl GraphDbProcedure {
