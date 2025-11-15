@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 graphdb-core = { path = "../core" }
+common = { path = "../common" }
 once_cell = "1.19"

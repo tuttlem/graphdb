@@ -145,6 +145,19 @@ fn interpret_escapes(raw: &str) -> String {
 }
 
 fn value_literal(input: &str) -> IResult<Value> {
+    match primitive_value_literal(input) {
+        Ok(result) => Ok(result),
+        Err(nom::Err::Error(_)) => {
+            let (input, _) = ws(char('('))(input)?;
+            let (input, value) = value_literal(input)?;
+            let (input, _) = ws(char(')'))(input)?;
+            Ok((input, value))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn primitive_value_literal(input: &str) -> IResult<Value> {
     alt((
         string_literal,
         array_literal,
@@ -439,6 +452,7 @@ fn comparison_operator(input: &str) -> IResult<ComparisonOperator> {
 fn match_return_stmt(input: &str) -> IResult<Query> {
     let (input, explain_kw) = opt(ws(tag_no_case("EXPLAIN")))(input)?;
     let explain = explain_kw.is_some();
+    let (input, initial_with) = opt(with_clause)(input)?;
     let (input, match_clauses) = parse_select_match_clauses(input)?;
     let (input, condition_terms) = opt(|input| {
         let (input, _) = ws(tag_no_case("WHERE"))(input)?;
@@ -463,6 +477,7 @@ fn match_return_stmt(input: &str) -> IResult<Query> {
     Ok((
         input,
         Query::Select(SelectQuery {
+            initial_with,
             match_clauses,
             conditions,
             predicates,
@@ -487,12 +502,32 @@ fn parse_select_match_clauses(mut input: &str) -> IResult<Vec<SelectMatchClause>
     }
 
     if clauses.is_empty() {
+        if next_keyword_is(input, "WITH") || next_keyword_is(input, "RETURN") {
+            return Ok((input, clauses));
+        }
         return Err(nom::Err::Error(VerboseError {
-            errors: vec![(input, VerboseErrorKind::Context("MATCH clause is required"))],
+            errors: vec![(
+                input,
+                VerboseErrorKind::Context("MATCH clause or WITH clause is required"),
+            )],
         }));
     }
 
     Ok((input, clauses))
+}
+
+fn next_keyword_is(input: &str, keyword: &str) -> bool {
+    let trimmed = input.trim_start();
+    if trimmed.len() < keyword.len() {
+        return false;
+    }
+    if !trimmed[..keyword.len()].eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+    match trimmed[keyword.len()..].chars().next() {
+        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => false,
+        _ => true,
+    }
 }
 
 fn parse_single_match_clause(input: &str) -> IResult<SelectMatchClause> {
@@ -612,6 +647,11 @@ fn non_aggregate_term(input: &str) -> IResult<Expression> {
     if let Ok((rest, literal)) = literal_expression(input) {
         return Ok((rest, literal));
     }
+    if let Ok((rest, expr)) =
+        delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)
+    {
+        return Ok((rest, expr));
+    }
     let (rest, field) = field_reference(input)?;
     Ok((rest, Expression::Field(field)))
 }
@@ -719,6 +759,8 @@ fn scalar_function_group_three(input: &str) -> IResult<ScalarFunction> {
         to_float_or_null_function,
         to_integer_function,
         to_integer_or_null_function,
+        to_string_function,
+        to_string_or_null_function,
         type_function,
     ))(input)
 }
@@ -861,6 +903,30 @@ fn to_integer_or_null_function(input: &str) -> IResult<ScalarFunction> {
     Ok((
         input,
         ScalarFunction::ToInteger {
+            expr,
+            null_on_unsupported: true,
+        },
+    ))
+}
+
+fn to_string_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toString"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((
+        input,
+        ScalarFunction::ToString {
+            expr,
+            null_on_unsupported: false,
+        },
+    ))
+}
+
+fn to_string_or_null_function(input: &str) -> IResult<ScalarFunction> {
+    let (input, _) = ws(tag_no_case("toStringOrNull"))(input)?;
+    let (input, expr) = delimited(ws(char('(')), non_aggregate_expression, ws(char(')')))(input)?;
+    Ok((
+        input,
+        ScalarFunction::ToString {
             expr,
             null_on_unsupported: true,
         },

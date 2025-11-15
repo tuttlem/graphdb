@@ -1,16 +1,23 @@
+#![allow(improper_ctypes_definitions)]
+
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 use std::sync::{Arc, RwLock};
 
+pub use common::value::{FieldValue, QueryPath};
 pub use graphdb_core::query::Value;
 use once_cell::sync::Lazy;
 
-pub type FunctionResult = Result<Value, FunctionError>;
-pub type FunctionHandler = Arc<dyn Fn(&[Value]) -> FunctionResult + Send + Sync + 'static>;
+pub type FunctionResult = Result<FieldValue, FunctionError>;
+pub type FunctionHandler = Arc<dyn Fn(&[FieldValue]) -> FunctionResult + Send + Sync + 'static>;
+pub type ContextFunctionHandler =
+    Arc<dyn Fn(&[FieldValue], &mut dyn FunctionContext) -> FunctionResult + Send + Sync + 'static>;
 
-pub type PluginCallback = unsafe extern "C" fn(*const Value, usize, *mut Value) -> bool;
+pub type PluginCallback = unsafe extern "C" fn(*const FieldValue, usize, *mut FieldValue) -> bool;
+pub type PluginContextCallback =
+    unsafe extern "C" fn(*const FieldValue, usize, *mut FieldValue, *mut HostContext) -> bool;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionArity {
@@ -45,30 +52,73 @@ impl FunctionArity {
     }
 }
 
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExpressionHandle(pub u32);
+
+pub trait FunctionContext {
+    fn query_timestamp(&self) -> i64;
+    fn bind_alias(&mut self, alias: &str, value: FieldValue) -> Result<(), FunctionError>;
+    fn unbind_alias(&mut self, alias: &str) -> Result<(), FunctionError>;
+    fn evaluate_expression(
+        &mut self,
+        handle: ExpressionHandle,
+    ) -> Result<FieldValue, FunctionError>;
+}
+
 #[derive(Clone)]
 pub struct FunctionSpec {
     pub name: String,
     pub arity: FunctionArity,
-    pub handler: FunctionHandler,
+    pub handler: FunctionKind,
+}
+
+#[derive(Clone)]
+pub enum FunctionKind {
+    Simple(FunctionHandler),
+    Context(ContextFunctionHandler),
 }
 
 impl FunctionSpec {
     pub fn new(
         name: impl Into<String>,
         arity: FunctionArity,
-        handler: impl Fn(&[Value]) -> FunctionResult + Send + Sync + 'static,
+        handler: impl Fn(&[FieldValue]) -> FunctionResult + Send + Sync + 'static,
     ) -> Self {
         Self {
             name: name.into(),
             arity,
-            handler: Arc::new(handler),
+            handler: FunctionKind::Simple(Arc::new(handler)),
+        }
+    }
+
+    pub fn with_context(
+        name: impl Into<String>,
+        arity: FunctionArity,
+        handler: impl Fn(&[FieldValue], &mut dyn FunctionContext) -> FunctionResult
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            arity,
+            handler: FunctionKind::Context(Arc::new(handler)),
         }
     }
 }
 
 struct RegisteredFunction {
     arity: FunctionArity,
-    handler: FunctionHandler,
+    handler: FunctionKind,
+}
+
+struct ContextBridge<'a> {
+    ctx: &'a mut dyn FunctionContext,
+}
+
+unsafe fn bridge_from_ptr<'a>(data: *mut c_void) -> &'a mut ContextBridge<'a> {
+    unsafe { &mut *(data as *mut ContextBridge) }
 }
 
 #[derive(Default)]
@@ -99,14 +149,29 @@ impl FunctionRegistry {
         Ok(())
     }
 
-    pub fn call(&self, name: &str, args: &[Value]) -> FunctionResult {
+    pub fn call(&self, name: &str, args: &[FieldValue]) -> FunctionResult {
+        self.call_with_context(name, args, None)
+    }
+
+    pub fn call_with_context(
+        &self,
+        name: &str,
+        args: &[FieldValue],
+        ctx: Option<&mut dyn FunctionContext>,
+    ) -> FunctionResult {
         let guard = self.functions.read().expect("function registry poisoned");
         let key = name.to_ascii_lowercase();
         let entry = guard
             .get(&key)
             .ok_or_else(|| FunctionError::NotFound(name.to_string()))?;
         entry.arity.validate(args.len())?;
-        (entry.handler)(args)
+        match (&entry.handler, ctx) {
+            (FunctionKind::Simple(handler), _) => handler(args),
+            (FunctionKind::Context(handler), Some(context)) => handler(args, context),
+            (FunctionKind::Context(_), None) => {
+                Err(FunctionError::ContextRequired(name.to_string()))
+            }
+        }
     }
 }
 
@@ -136,9 +201,28 @@ pub fn take_last_error() -> Option<String> {
 pub struct PluginFunctionSpec {
     pub name: *const c_char,
     pub callback: PluginCallback,
+    pub context_callback: Option<PluginContextCallback>,
     pub min_arity: usize,
     pub max_arity: isize,
+    pub flags: u32,
 }
+
+#[repr(C)]
+pub struct HostContext {
+    pub data: *mut c_void,
+    pub vtable: *const HostContextVTable,
+}
+
+#[repr(C)]
+pub struct HostContextVTable {
+    pub query_timestamp: unsafe extern "C" fn(*mut c_void) -> i64,
+    pub bind_alias: unsafe extern "C" fn(*mut c_void, *const c_char, FieldValue) -> bool,
+    pub unbind_alias: unsafe extern "C" fn(*mut c_void, *const c_char) -> bool,
+    pub evaluate_expression:
+        unsafe extern "C" fn(*mut c_void, ExpressionHandle, *mut FieldValue) -> bool,
+}
+
+pub const PLUGIN_FLAG_REQUIRES_CONTEXT: u32 = 0x1;
 
 #[repr(C)]
 pub struct PluginRegistration {
@@ -210,9 +294,60 @@ unsafe fn register_plugin_function(spec: &PluginFunctionSpec) -> Result<(), Func
     let arity_for_registration = arity.clone();
     let min_arity = spec.min_arity;
     let max_arity = spec.max_arity;
+    if (spec.flags & PLUGIN_FLAG_REQUIRES_CONTEXT) != 0 {
+        let callback = spec
+            .context_callback
+            .ok_or_else(|| FunctionError::ContextNotSupported(name.clone()))?;
+        let function_name = name.clone();
+        let handler = move |args: &[FieldValue], ctx: &mut dyn FunctionContext| -> FunctionResult {
+            if args.len() < min_arity {
+                return Err(FunctionError::InvalidArity {
+                    expected: arity.clone(),
+                    received: args.len(),
+                });
+            }
+            if max_arity >= 0 {
+                let max = max_arity as usize;
+                if args.len() > max {
+                    return Err(FunctionError::InvalidArity {
+                        expected: arity.clone(),
+                        received: args.len(),
+                    });
+                }
+            }
+            let mut output = FieldValue::Scalar(Value::Null);
+            let mut bridge = ContextBridge { ctx };
+            let mut host_ctx = HostContext {
+                data: (&mut bridge as *mut ContextBridge<'_>) as *mut c_void,
+                vtable: &HOST_CONTEXT_VTABLE,
+            };
+            let success = unsafe {
+                callback(
+                    args.as_ptr(),
+                    args.len(),
+                    &mut output as *mut FieldValue,
+                    &mut host_ctx,
+                )
+            };
+            if success {
+                Ok(output)
+            } else {
+                Err(FunctionError::Execution(take_last_error().unwrap_or_else(
+                    || format!("plugin function '{function_name}' failed"),
+                )))
+            }
+        };
+
+        return registry().register(FunctionSpec {
+            name,
+            arity: arity_for_registration,
+            handler: FunctionKind::Context(Arc::new(handler)),
+        });
+    }
+
     let callback = spec.callback;
     let function_name = name.clone();
-    let handler = move |args: &[Value]| -> FunctionResult {
+    let handler = move |args: &[FieldValue]| -> FunctionResult {
         if args.len() < min_arity {
             return Err(FunctionError::InvalidArity {
                 expected: arity.clone(),
@@ -228,8 +363,9 @@ unsafe fn register_plugin_function(spec: &PluginFunctionSpec) -> Result<(), Func
                 });
             }
         }
-        let mut output = Value::Null;
-        let success = unsafe { callback(args.as_ptr(), args.len(), &mut output as *mut Value) };
+        let mut output = FieldValue::Scalar(Value::Null);
+        let success =
+            unsafe { callback(args.as_ptr(), args.len(), &mut output as *mut FieldValue) };
         if success {
             Ok(output)
         } else {
@@ -239,7 +375,11 @@ unsafe fn register_plugin_function(spec: &PluginFunctionSpec) -> Result<(), Func
         }
     };
 
-    registry().register(FunctionSpec::new(name, arity_for_registration, handler))
+    registry().register(FunctionSpec {
+        name,
+        arity: arity_for_registration,
+        handler: FunctionKind::Simple(Arc::new(handler)),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +392,8 @@ pub enum FunctionError {
     },
     Execution(String),
     InvalidName,
+    ContextRequired(String),
+    ContextNotSupported(String),
 }
 
 impl FunctionError {
@@ -275,6 +417,85 @@ impl fmt::Display for FunctionError {
             }
             FunctionError::Execution(message) => write!(f, "{message}"),
             FunctionError::InvalidName => write!(f, "function name must be valid UTF-8"),
+            FunctionError::ContextRequired(name) => {
+                write!(f, "function '{name}' requires execution context")
+            }
+            FunctionError::ContextNotSupported(name) => {
+                write!(
+                    f,
+                    "function '{name}' requires context, which is not supported"
+                )
+            }
+        }
+    }
+}
+
+static HOST_CONTEXT_VTABLE: HostContextVTable = HostContextVTable {
+    query_timestamp: host_query_timestamp,
+    bind_alias: host_bind_alias,
+    unbind_alias: host_unbind_alias,
+    evaluate_expression: host_evaluate_expression,
+};
+
+unsafe extern "C" fn host_query_timestamp(data: *mut c_void) -> i64 {
+    let bridge = unsafe { bridge_from_ptr(data) };
+    bridge.ctx.query_timestamp()
+}
+
+unsafe extern "C" fn host_bind_alias(
+    data: *mut c_void,
+    alias: *const c_char,
+    value: FieldValue,
+) -> bool {
+    let bridge = unsafe { bridge_from_ptr(data) };
+    match unsafe { CStr::from_ptr(alias) }.to_str() {
+        Ok(name) => match bridge.ctx.bind_alias(name, value) {
+            Ok(()) => true,
+            Err(err) => {
+                set_last_error(err.to_string());
+                false
+            }
+        },
+        Err(_) => {
+            set_last_error("alias must be valid UTF-8");
+            false
+        }
+    }
+}
+
+unsafe extern "C" fn host_unbind_alias(data: *mut c_void, alias: *const c_char) -> bool {
+    let bridge = unsafe { bridge_from_ptr(data) };
+    match unsafe { CStr::from_ptr(alias) }.to_str() {
+        Ok(name) => match bridge.ctx.unbind_alias(name) {
+            Ok(()) => true,
+            Err(err) => {
+                set_last_error(err.to_string());
+                false
+            }
+        },
+        Err(_) => {
+            set_last_error("alias must be valid UTF-8");
+            false
+        }
+    }
+}
+
+unsafe extern "C" fn host_evaluate_expression(
+    data: *mut c_void,
+    handle: ExpressionHandle,
+    out: *mut FieldValue,
+) -> bool {
+    let bridge = unsafe { bridge_from_ptr(data) };
+    match bridge.ctx.evaluate_expression(handle) {
+        Ok(value) => {
+            if let Some(slot) = unsafe { out.as_mut() } {
+                *slot = value;
+            }
+            true
+        }
+        Err(err) => {
+            set_last_error(err.to_string());
+            false
         }
     }
 }
@@ -300,15 +521,27 @@ mod tests {
                 "add",
                 FunctionArity::Exact(2),
                 |args| match args {
-                    [Value::Integer(a), Value::Integer(b)] => Ok(Value::Integer(a + b)),
+                    [
+                        FieldValue::Scalar(Value::Integer(a)),
+                        FieldValue::Scalar(Value::Integer(b)),
+                    ] => Ok(FieldValue::Scalar(Value::Integer(a + b))),
                     _ => Err(FunctionError::execution("expected two integers")),
                 },
             ))
             .expect("register function");
 
         let result = registry
-            .call("add", &[Value::Integer(1), Value::Integer(2)])
+            .call(
+                "add",
+                &[
+                    FieldValue::Scalar(Value::Integer(1)),
+                    FieldValue::Scalar(Value::Integer(2)),
+                ],
+            )
             .expect("call add");
-        assert_eq!(result, Value::Integer(3));
+        match result {
+            FieldValue::Scalar(Value::Integer(sum)) => assert_eq!(sum, 3),
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 }

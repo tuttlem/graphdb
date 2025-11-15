@@ -1,11 +1,12 @@
-use function_api::{PluginFunctionSpec, Value};
+use function_api::{FieldValue, PluginFunctionSpec, Value};
 use rand::Rng;
 use std::f64::consts::{E as E_CONST, PI as PI_CONST};
 
 use crate::cstr;
 use crate::util::{
-    RoundMode, args_slice, expect_arg_count, handle_result, integer_value_from_scalar,
-    numeric_value_from_scalar, parse_round_mode, plugin_spec, round_number, write_value,
+    RoundMode, apply_scalar_fn, args_slice, expect_value_arg_count, handle_result,
+    integer_value_from_scalar, numeric_value_from_scalar, parse_round_mode, plugin_spec,
+    round_number, scalar_field,
 };
 
 pub(crate) const FUNCTIONS: &[PluginFunctionSpec] = &FUNCTION_TABLE;
@@ -38,110 +39,248 @@ const FUNCTION_TABLE: [PluginFunctionSpec; 25] = [
     plugin_spec(cstr!("tan"), tan_callback, 1, 1),
 ];
 
-unsafe extern "C" fn hello_callback(_: *const Value, _: usize, out: *mut Value) -> bool {
-    write_value(out, Value::String("hello from stdfunc".into()));
-    true
+unsafe extern "C" fn hello_callback(_: *const FieldValue, _: usize, out: *mut FieldValue) -> bool {
+    handle_result(
+        Ok(scalar_field(Value::String("hello from stdfunc".into()))),
+        out,
+    )
 }
 
-unsafe extern "C" fn abs_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(abs_impl(args_slice(args, len)), out)
+unsafe extern "C" fn abs_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(apply_scalar_fn(args_slice(args, len), "abs", abs_impl), out)
 }
 
-unsafe extern "C" fn ceil_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(ceil_impl(args_slice(args, len)), out)
+unsafe extern "C" fn ceil_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "ceil", ceil_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn floor_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(floor_impl(args_slice(args, len)), out)
+unsafe extern "C" fn floor_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "floor", floor_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn isnan_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(is_nan_impl(args_slice(args, len)), out)
+unsafe extern "C" fn isnan_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "isNaN", is_nan_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn rand_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(rand_impl(args_slice(args, len)), out)
+unsafe extern "C" fn rand_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "rand", rand_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn round_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(round_impl(args_slice(args, len)), out)
+unsafe extern "C" fn round_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "round", round_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn sign_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(sign_impl(args_slice(args, len)), out)
+unsafe extern "C" fn sign_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "sign", sign_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn e_callback(_: *const Value, _: usize, out: *mut Value) -> bool {
-    write_value(out, Value::Float(E_CONST));
-    true
+unsafe extern "C" fn e_callback(_: *const FieldValue, _: usize, out: *mut FieldValue) -> bool {
+    handle_result(Ok(scalar_field(Value::Float(E_CONST))), out)
 }
 
-unsafe extern "C" fn exp_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(exp_impl(args_slice(args, len)), out)
+unsafe extern "C" fn exp_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(apply_scalar_fn(args_slice(args, len), "exp", exp_impl), out)
 }
 
-unsafe extern "C" fn log_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(log_impl(args_slice(args, len)), out)
+unsafe extern "C" fn log_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(apply_scalar_fn(args_slice(args, len), "log", log_impl), out)
 }
 
-unsafe extern "C" fn log10_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(log10_impl(args_slice(args, len)), out)
+unsafe extern "C" fn log10_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "log10", log10_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn sqrt_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(sqrt_impl(args_slice(args, len)), out)
+unsafe extern "C" fn sqrt_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "sqrt", sqrt_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn acos_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(acos_impl(args_slice(args, len)), out)
+unsafe extern "C" fn acos_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "acos", acos_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn asin_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(asin_impl(args_slice(args, len)), out)
+unsafe extern "C" fn asin_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "asin", asin_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn atan_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(atan_impl(args_slice(args, len)), out)
+unsafe extern "C" fn atan_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "atan", atan_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn atan2_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(atan2_impl(args_slice(args, len)), out)
+unsafe extern "C" fn atan2_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "atan2", atan2_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn cos_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(cos_impl(args_slice(args, len)), out)
+unsafe extern "C" fn cos_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(apply_scalar_fn(args_slice(args, len), "cos", cos_impl), out)
 }
 
-unsafe extern "C" fn cot_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(cot_impl(args_slice(args, len)), out)
+unsafe extern "C" fn cot_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(apply_scalar_fn(args_slice(args, len), "cot", cot_impl), out)
 }
 
-unsafe extern "C" fn degrees_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(degrees_impl(args_slice(args, len)), out)
+unsafe extern "C" fn degrees_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "degrees", degrees_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn haversin_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(haversin_impl(args_slice(args, len)), out)
+unsafe extern "C" fn haversin_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "haversin", haversin_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn pi_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(pi_impl(args_slice(args, len)), out)
+unsafe extern "C" fn pi_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(apply_scalar_fn(args_slice(args, len), "pi", pi_impl), out)
 }
 
-unsafe extern "C" fn radians_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(radians_impl(args_slice(args, len)), out)
+unsafe extern "C" fn radians_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(
+        apply_scalar_fn(args_slice(args, len), "radians", radians_impl),
+        out,
+    )
 }
 
-unsafe extern "C" fn sin_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(sin_impl(args_slice(args, len)), out)
+unsafe extern "C" fn sin_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(apply_scalar_fn(args_slice(args, len), "sin", sin_impl), out)
 }
 
-unsafe extern "C" fn tan_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
-    handle_result(tan_impl(args_slice(args, len)), out)
+unsafe extern "C" fn tan_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
+    handle_result(apply_scalar_fn(args_slice(args, len), "tan", tan_impl), out)
 }
 
 fn abs_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "abs")?;
+    expect_value_arg_count(args, 1, "abs")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         Value::Integer(i) => match i.checked_abs() {
@@ -154,7 +293,7 @@ fn abs_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn ceil_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "ceil")?;
+    expect_value_arg_count(args, 1, "ceil")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -164,7 +303,7 @@ fn ceil_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn floor_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "floor")?;
+    expect_value_arg_count(args, 1, "floor")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -174,7 +313,7 @@ fn floor_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn is_nan_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "isNaN")?;
+    expect_value_arg_count(args, 1, "isNaN")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         Value::Float(f) => Ok(Value::Boolean(f.is_nan())),
@@ -230,7 +369,7 @@ fn round_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn sign_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "sign")?;
+    expect_value_arg_count(args, 1, "sign")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         Value::Integer(i) => Ok(Value::Integer(i.signum())),
@@ -253,7 +392,7 @@ fn sign_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn exp_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "exp")?;
+    expect_value_arg_count(args, 1, "exp")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -263,7 +402,7 @@ fn exp_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn log_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "log")?;
+    expect_value_arg_count(args, 1, "log")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -273,7 +412,7 @@ fn log_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn log10_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "log10")?;
+    expect_value_arg_count(args, 1, "log10")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -283,7 +422,7 @@ fn log10_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn sqrt_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "sqrt")?;
+    expect_value_arg_count(args, 1, "sqrt")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -293,7 +432,7 @@ fn sqrt_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn acos_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "acos")?;
+    expect_value_arg_count(args, 1, "acos")?;
     let value = &args[0];
     if matches!(value, Value::Null) {
         return Ok(Value::Null);
@@ -303,7 +442,7 @@ fn acos_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn asin_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "asin")?;
+    expect_value_arg_count(args, 1, "asin")?;
     let value = &args[0];
     if matches!(value, Value::Null) {
         return Ok(Value::Null);
@@ -313,7 +452,7 @@ fn asin_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn atan_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "atan")?;
+    expect_value_arg_count(args, 1, "atan")?;
     let value = &args[0];
     if matches!(value, Value::Null) {
         return Ok(Value::Null);
@@ -323,7 +462,7 @@ fn atan_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn atan2_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 2, "atan2")?;
+    expect_value_arg_count(args, 2, "atan2")?;
     if args.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
@@ -333,7 +472,7 @@ fn atan2_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn cos_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "cos")?;
+    expect_value_arg_count(args, 1, "cos")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -343,7 +482,7 @@ fn cos_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn cot_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "cot")?;
+    expect_value_arg_count(args, 1, "cot")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -353,7 +492,7 @@ fn cot_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn degrees_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "degrees")?;
+    expect_value_arg_count(args, 1, "degrees")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -363,7 +502,7 @@ fn degrees_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn haversin_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "haversin")?;
+    expect_value_arg_count(args, 1, "haversin")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => {
@@ -383,7 +522,7 @@ fn pi_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn radians_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "radians")?;
+    expect_value_arg_count(args, 1, "radians")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -393,7 +532,7 @@ fn radians_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn sin_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "sin")?;
+    expect_value_arg_count(args, 1, "sin")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(
@@ -403,7 +542,7 @@ fn sin_impl(args: &[Value]) -> Result<Value, String> {
 }
 
 fn tan_impl(args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 1, "tan")?;
+    expect_value_arg_count(args, 1, "tan")?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
         other => Ok(Value::Float(

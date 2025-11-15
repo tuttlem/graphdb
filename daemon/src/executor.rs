@@ -23,9 +23,9 @@ use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::DaemonError;
-use function_api as functions;
+use function_api::{self as functions, ExpressionHandle, FunctionContext, FunctionError};
 #[cfg(test)]
-use function_api::{FunctionArity, FunctionError, FunctionSpec};
+use function_api::{FunctionArity, FunctionSpec};
 
 #[derive(Debug, Default, Serialize)]
 pub struct ExecutionReport {
@@ -181,8 +181,10 @@ fn execute_select<B: StorageBackend>(
     query: SelectQuery,
     ctx: &mut ExecutionReport,
 ) -> Result<(), DaemonError> {
-    if query.match_clauses.is_empty() {
-        return Err(DaemonError::Query("MATCH clause is required".into()));
+    if query.match_clauses.is_empty() && query.with.is_none() && query.initial_with.is_none() {
+        return Err(DaemonError::Query(
+            "MATCH clause or WITH clause is required".into(),
+        ));
     }
 
     let plan = build_logical_plan(&query);
@@ -205,6 +207,15 @@ fn execute_select<B: StorageBackend>(
     }
 
     let mut rows = vec![QueryRow::default()];
+    if let Some(initial_with) = query.initial_with.as_ref() {
+        rows = apply_with_clause(db, rows, initial_with, query_timestamp)?;
+        if rows.is_empty() {
+            ctx.result_rows.clear();
+            ctx.selected_nodes.clear();
+            ctx.messages.push("WITH clause produced 0 rows".into());
+            return Ok(());
+        }
+    }
     let conditions_by_alias = group_conditions_by_alias(&query.conditions);
 
     for clause in &plan.clauses {
@@ -307,7 +318,7 @@ fn build_logical_plan(query: &SelectQuery) -> LogicalPlan {
         total_clauses: clauses.len(),
         optional_clauses: clauses.iter().filter(|c| c.optional).count(),
         filter_count: query.conditions.len() + query.predicates.len(),
-        has_with_clause: query.with.is_some(),
+        has_with_clause: query.with.is_some() || query.initial_with.is_some(),
         return_count: query.returns.len(),
     };
 
@@ -1000,6 +1011,16 @@ fn scalar_function_label(func: &ScalarFunction) -> String {
                 format!("toInteger({})", expression_label(expr))
             }
         }
+        ScalarFunction::ToString {
+            expr,
+            null_on_unsupported,
+        } => {
+            if *null_on_unsupported {
+                format!("toStringOrNull({})", expression_label(expr))
+            } else {
+                format!("toString({})", expression_label(expr))
+            }
+        }
         ScalarFunction::Type(field) => format!("type({})", field_label(field)),
     }
 }
@@ -1376,6 +1397,10 @@ fn add_values(left: Value, right: Value) -> Result<Value, DaemonError> {
         (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(a as f64 + b)),
         (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a + b as f64)),
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+        (Value::String(mut a), Value::String(b)) => {
+            a.push_str(&b);
+            Ok(Value::String(a))
+        }
         _ => Err(DaemonError::Query(
             "addition requires numeric operands".into(),
         )),
@@ -1398,14 +1423,83 @@ fn subtract_values(left: Value, right: Value) -> Result<Value, DaemonError> {
     }
 }
 
-fn call_standard_function(name: &str, args: Vec<Value>) -> Result<Value, DaemonError> {
+fn call_standard_function(name: &str, args: Vec<FieldValue>) -> Result<FieldValue, DaemonError> {
     functions::registry()
         .call(name, &args)
         .map_err(DaemonError::from)
 }
 
-fn call_standard_function_unary(name: &str, arg: Value) -> Result<Value, DaemonError> {
-    call_standard_function(name, vec![arg])
+fn call_standard_function_scalar(name: &str, args: Vec<FieldValue>) -> Result<Value, DaemonError> {
+    let value = call_standard_function(name, args)?;
+    field_value_to_scalar(value)
+}
+
+fn call_standard_function_scalar_unary(name: &str, arg: Value) -> Result<Value, DaemonError> {
+    call_standard_function_scalar(name, vec![FieldValue::Scalar(arg)])
+}
+
+fn call_standard_function_with_context<B: StorageBackend>(
+    name: &str,
+    args: Vec<FieldValue>,
+    ctx: &mut StandardFunctionContext<'_, B>,
+) -> Result<FieldValue, DaemonError> {
+    functions::registry()
+        .call_with_context(name, &args, Some(ctx))
+        .map_err(DaemonError::from)
+}
+
+struct StandardFunctionContext<'a, B: StorageBackend> {
+    db: &'a Database<B>,
+    row: QueryRow,
+    query_timestamp: i64,
+    expressions: HashMap<ExpressionHandle, Expression>,
+    next_handle: u32,
+}
+
+impl<'a, B: StorageBackend> StandardFunctionContext<'a, B> {
+    fn new(db: &'a Database<B>, row: &QueryRow, query_timestamp: i64) -> Self {
+        Self {
+            db,
+            row: row.clone(),
+            query_timestamp,
+            expressions: HashMap::new(),
+            next_handle: 1,
+        }
+    }
+
+    fn register_expression(&mut self, expr: &Expression) -> ExpressionHandle {
+        let handle = ExpressionHandle(self.next_handle);
+        self.next_handle = self.next_handle.wrapping_add(1);
+        self.expressions.insert(handle, expr.clone());
+        handle
+    }
+}
+
+impl<'a, B: StorageBackend> FunctionContext for StandardFunctionContext<'a, B> {
+    fn query_timestamp(&self) -> i64 {
+        self.query_timestamp
+    }
+
+    fn bind_alias(&mut self, alias: &str, value: FieldValue) -> Result<(), FunctionError> {
+        bind_reduce_alias(&mut self.row, alias, &value);
+        Ok(())
+    }
+
+    fn unbind_alias(&mut self, alias: &str) -> Result<(), FunctionError> {
+        clear_alias_bindings(&mut self.row, alias);
+        Ok(())
+    }
+
+    fn evaluate_expression(
+        &mut self,
+        handle: ExpressionHandle,
+    ) -> Result<FieldValue, FunctionError> {
+        let expr = self.expressions.get(&handle).ok_or_else(|| {
+            FunctionError::execution(format!("invalid expression handle {}", handle.0))
+        })?;
+        evaluate_expression(self.db, &self.row, expr, self.query_timestamp)
+            .map_err(|err| FunctionError::execution(err.to_string()))
+    }
 }
 fn evaluate_scalar_function<B: StorageBackend>(
     db: &Database<B>,
@@ -1486,58 +1580,58 @@ fn evaluate_scalar_function<B: StorageBackend>(
             }
         }
         ScalarFunction::Range { start, end, step } => {
-            let mut args = Vec::with_capacity(3);
-            args.push(evaluate_expression_to_scalar(
+            let mut args: Vec<FieldValue> = Vec::with_capacity(3);
+            args.push(FieldValue::Scalar(evaluate_expression_to_scalar(
                 db,
                 row,
                 start,
                 query_timestamp,
-            )?);
-            args.push(evaluate_expression_to_scalar(
+            )?));
+            args.push(FieldValue::Scalar(evaluate_expression_to_scalar(
                 db,
                 row,
                 end,
                 query_timestamp,
-            )?);
+            )?));
             if let Some(expr) = step {
-                args.push(evaluate_expression_to_scalar(
+                args.push(FieldValue::Scalar(evaluate_expression_to_scalar(
                     db,
                     row,
                     expr,
                     query_timestamp,
-                )?);
+                )?));
             }
             let value = call_standard_function("range", args)?;
-            Ok(FieldValue::Scalar(value))
+            Ok(value)
         }
         ScalarFunction::Reverse(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("reverse", value)?;
+            let result = call_standard_function_scalar_unary("reverse", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Tail(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("tail", value)?;
+            let result = call_standard_function_scalar_unary("tail", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToBooleanList(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("toBooleanList", value)?;
+            let result = call_standard_function_scalar_unary("toBooleanList", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToFloatList(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("toFloatList", value)?;
+            let result = call_standard_function_scalar_unary("toFloatList", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToIntegerList(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("toIntegerList", value)?;
+            let result = call_standard_function_scalar_unary("toIntegerList", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToStringList(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("toStringList", value)?;
+            let result = call_standard_function_scalar_unary("toStringList", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::StartNode(field) => {
@@ -1566,12 +1660,12 @@ fn evaluate_scalar_function<B: StorageBackend>(
         }
         ScalarFunction::Head(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("head", value)?;
+            let result = call_standard_function_scalar_unary("head", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Last(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("last", value)?;
+            let result = call_standard_function_scalar_unary("last", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Id(field) => match resolve_field(row, field)? {
@@ -1605,37 +1699,35 @@ fn evaluate_scalar_function<B: StorageBackend>(
             Ok(FieldValue::Scalar(map))
         }
         ScalarFunction::RandomUuid => {
-            let value = call_standard_function("randomUUID", Vec::new())?;
+            let value = call_standard_function_scalar("randomUUID", Vec::new())?;
             Ok(FieldValue::Scalar(value))
         }
         ScalarFunction::Size(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("size", value)?;
+            let result = call_standard_function_scalar_unary("size", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Length(expr) => {
             let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
-            let result = call_standard_function_unary("length", value)?;
+            let result = call_standard_function_scalar_unary("length", value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Timestamp => {
-            let value = call_standard_function("timestamp", vec![Value::Integer(query_timestamp)])?;
+            let value = call_standard_function_scalar(
+                "timestamp",
+                vec![FieldValue::Scalar(Value::Integer(query_timestamp))],
+            )?;
             Ok(FieldValue::Scalar(value))
         }
         ScalarFunction::UserDefined(call) => {
             let mut evaluated_args = Vec::with_capacity(call.arguments.len());
             for argument in &call.arguments {
-                evaluated_args.push(evaluate_expression_to_scalar(
-                    db,
-                    row,
-                    argument,
-                    query_timestamp,
-                )?);
+                evaluated_args.push(evaluate_expression(db, row, argument, query_timestamp)?);
             }
             let value = functions::registry()
                 .call(&call.name, &evaluated_args)
                 .map_err(DaemonError::from)?;
-            Ok(FieldValue::Scalar(value))
+            Ok(value)
         }
         ScalarFunction::Reduce {
             accumulator,
@@ -1643,16 +1735,21 @@ fn evaluate_scalar_function<B: StorageBackend>(
             variable,
             list,
             expression,
-        } => evaluate_reduce_function(
-            db,
-            row,
-            accumulator,
-            initial,
-            variable,
-            list,
-            expression,
-            query_timestamp,
-        ),
+        } => {
+            let mut ctx = StandardFunctionContext::new(db, row, query_timestamp);
+            let initial_handle = ctx.register_expression(initial);
+            let list_handle = ctx.register_expression(list);
+            let expression_handle = ctx.register_expression(expression);
+            let mut args = Vec::with_capacity(5);
+            args.push(FieldValue::Scalar(Value::String(accumulator.clone())));
+            args.push(FieldValue::Scalar(Value::String(variable.clone())));
+            args.push(FieldValue::Scalar(Value::Integer(initial_handle.0 as i64)));
+            args.push(FieldValue::Scalar(Value::Integer(list_handle.0 as i64)));
+            args.push(FieldValue::Scalar(Value::Integer(
+                expression_handle.0 as i64,
+            )));
+            call_standard_function_with_context("reduce", args, &mut ctx)
+        }
         ScalarFunction::ToBoolean {
             expr,
             null_on_unsupported,
@@ -1663,7 +1760,7 @@ fn evaluate_scalar_function<B: StorageBackend>(
             } else {
                 "toBoolean"
             };
-            let result = call_standard_function_unary(name, value)?;
+            let result = call_standard_function_scalar_unary(name, value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToFloat {
@@ -1676,7 +1773,7 @@ fn evaluate_scalar_function<B: StorageBackend>(
             } else {
                 "toFloat"
             };
-            let result = call_standard_function_unary(name, value)?;
+            let result = call_standard_function_scalar_unary(name, value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::ToInteger {
@@ -1689,7 +1786,20 @@ fn evaluate_scalar_function<B: StorageBackend>(
             } else {
                 "toInteger"
             };
-            let result = call_standard_function_unary(name, value)?;
+            let result = call_standard_function_scalar_unary(name, value)?;
+            Ok(FieldValue::Scalar(result))
+        }
+        ScalarFunction::ToString {
+            expr,
+            null_on_unsupported,
+        } => {
+            let value = evaluate_expression_to_scalar(db, row, expr, query_timestamp)?;
+            let name = if *null_on_unsupported {
+                "toStringOrNull"
+            } else {
+                "toString"
+            };
+            let result = call_standard_function_scalar_unary(name, value)?;
             Ok(FieldValue::Scalar(result))
         }
         ScalarFunction::Type(field) => {
@@ -1711,34 +1821,6 @@ fn evaluate_scalar_function<B: StorageBackend>(
     }
 }
 
-fn evaluate_reduce_function<B: StorageBackend>(
-    db: &Database<B>,
-    row: &QueryRow,
-    accumulator_alias: &str,
-    initial: &Expression,
-    variable_alias: &str,
-    list_expr: &Expression,
-    expression: &Expression,
-    query_timestamp: i64,
-) -> Result<FieldValue, DaemonError> {
-    let mut accumulator = evaluate_expression_to_scalar(db, row, initial, query_timestamp)?;
-    let list_value = evaluate_expression(db, row, list_expr, query_timestamp)?;
-    let items = match normalize_list_items(list_value)? {
-        Some(items) => items,
-        None => return Ok(FieldValue::Scalar(Value::Null)),
-    };
-
-    let mut scoped_row = row.clone();
-    for item in items {
-        bind_reduce_alias(&mut scoped_row, variable_alias, &item);
-        let acc_field = FieldValue::Scalar(accumulator.clone());
-        bind_reduce_alias(&mut scoped_row, accumulator_alias, &acc_field);
-        accumulator = evaluate_expression_to_scalar(db, &scoped_row, expression, query_timestamp)?;
-    }
-
-    Ok(FieldValue::Scalar(accumulator))
-}
-
 fn evaluate_list_predicate_function(
     row: &QueryRow,
     spec: &ListPredicateFunction,
@@ -1756,9 +1838,12 @@ fn evaluate_list_predicate_function(
     };
 
     let predicate_value = serialize_list_predicate(&spec.predicate);
-    let args = vec![list, predicate_value];
+    let args = vec![
+        FieldValue::Scalar(list),
+        FieldValue::Scalar(predicate_value),
+    ];
     let result = call_standard_function(list_predicate_function_name(spec.kind), args)?;
-    Ok(result)
+    field_value_to_scalar(result)
 }
 
 fn list_expression_value(row: &QueryRow, expr: &ListExpression) -> Result<Value, DaemonError> {
@@ -1811,27 +1896,16 @@ fn value_operand_value(row: &QueryRow, operand: &ValueOperand) -> Result<Value, 
     }
 }
 
-fn normalize_list_items(value: FieldValue) -> Result<Option<Vec<FieldValue>>, DaemonError> {
-    match value {
-        FieldValue::Scalar(Value::Null) => Ok(None),
-        FieldValue::Scalar(Value::List(values)) => {
-            Ok(Some(values.into_iter().map(FieldValue::Scalar).collect()))
-        }
-        FieldValue::List(items) => Ok(Some(items)),
-        other => Err(DaemonError::Query(format!(
-            "reduce() expects LIST input, received {}",
-            field_value_type(&other)
-        ))),
-    }
-}
-
-fn bind_reduce_alias(row: &mut QueryRow, alias: &str, value: &FieldValue) {
+fn clear_alias_bindings(row: &mut QueryRow, alias: &str) {
     row.nodes.remove(alias);
     row.relationships.remove(alias);
     row.paths.remove(alias);
     row.lists.remove(alias);
     row.scalars.remove(alias);
+}
 
+fn bind_reduce_alias(row: &mut QueryRow, alias: &str, value: &FieldValue) {
+    clear_alias_bindings(row, alias);
     match value {
         FieldValue::Node(node) => {
             row.nodes.insert(alias.to_string(), Some(node.clone()));
@@ -4648,8 +4722,12 @@ mod scalar_function_tests {
             "doubleValue",
             FunctionArity::Exact(1),
             |args| match args.first() {
-                Some(Value::Integer(i)) => Ok(Value::Integer(i * 2)),
-                Some(Value::Float(f)) => Ok(Value::Float(f * 2.0)),
+                Some(FieldValue::Scalar(Value::Integer(i))) => {
+                    Ok(FieldValue::Scalar(Value::Integer(i * 2)))
+                }
+                Some(FieldValue::Scalar(Value::Float(f))) => {
+                    Ok(FieldValue::Scalar(Value::Float(f * 2.0)))
+                }
                 Some(_) => Err(FunctionError::execution(
                     "doubleValue expects INTEGER or FLOAT",
                 )),
@@ -4816,6 +4894,36 @@ mod scalar_function_tests {
             .and_then(|v| v.as_i64())
             .expect("reduce result");
         assert!(score > 0);
+    }
+
+    #[test]
+    fn reduce_with_literal_list_only_using_with_clause() {
+        let db = Database::new(InMemoryBackend::new());
+        let report = execute_script_for_test(
+            &db,
+            r#"WITH [28, 41, 37] AS ages
+            RETURN reduce(total = 0, amount IN ages | total + amount) AS totalAge;"#,
+        );
+        let total = report.result_rows[0]
+            .get("totalAge")
+            .and_then(|v| v.as_i64())
+            .expect("reduce total");
+        assert_eq!(total, 106);
+    }
+
+    #[test]
+    fn reduce_concatenates_strings_with_to_string() {
+        let db = Database::new(InMemoryBackend::new());
+        let report = execute_script_for_test(
+            &db,
+            r#"WITH [1,2,3] AS ids
+            RETURN reduce(text = '', id IN ids | text + toString(id)) AS combined;"#,
+        );
+        let combined = report.result_rows[0]
+            .get("combined")
+            .and_then(|v| v.as_str())
+            .expect("combined string");
+        assert_eq!(combined, "123");
     }
 
     #[test]

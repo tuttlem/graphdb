@@ -1,8 +1,10 @@
-use function_api::{PluginFunctionSpec, Value};
+use function_api::{FieldValue, PluginFunctionSpec, Value};
 use std::cmp::Ordering;
 
 use crate::cstr;
-use crate::util::{args_slice, expect_arg_count, handle_result, plugin_spec};
+use crate::util::{
+    apply_scalar_fn, args_slice, expect_value_arg_count, handle_result, plugin_spec,
+};
 
 pub(crate) const FUNCTIONS: &[PluginFunctionSpec] = &FUNCTION_TABLE;
 
@@ -13,36 +15,60 @@ const FUNCTION_TABLE: [PluginFunctionSpec; 4] = [
     plugin_spec(cstr!("single"), single_callback, 2, 2),
 ];
 
-unsafe extern "C" fn all_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
+unsafe extern "C" fn all_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
     handle_result(
-        list_predicate_impl(ListPredicateKind::All, args_slice(args, len)),
+        apply_scalar_fn(args_slice(args, len), "all", |values| {
+            list_predicate_impl(ListPredicateKind::All, values)
+        }),
         out,
     )
 }
 
-unsafe extern "C" fn any_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
+unsafe extern "C" fn any_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
     handle_result(
-        list_predicate_impl(ListPredicateKind::Any, args_slice(args, len)),
+        apply_scalar_fn(args_slice(args, len), "any", |values| {
+            list_predicate_impl(ListPredicateKind::Any, values)
+        }),
         out,
     )
 }
 
-unsafe extern "C" fn none_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
+unsafe extern "C" fn none_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
     handle_result(
-        list_predicate_impl(ListPredicateKind::None, args_slice(args, len)),
+        apply_scalar_fn(args_slice(args, len), "none", |values| {
+            list_predicate_impl(ListPredicateKind::None, values)
+        }),
         out,
     )
 }
 
-unsafe extern "C" fn single_callback(args: *const Value, len: usize, out: *mut Value) -> bool {
+unsafe extern "C" fn single_callback(
+    args: *const FieldValue,
+    len: usize,
+    out: *mut FieldValue,
+) -> bool {
     handle_result(
-        list_predicate_impl(ListPredicateKind::Single, args_slice(args, len)),
+        apply_scalar_fn(args_slice(args, len), "single", |values| {
+            list_predicate_impl(ListPredicateKind::Single, values)
+        }),
         out,
     )
 }
 
 fn list_predicate_impl(kind: ListPredicateKind, args: &[Value]) -> Result<Value, String> {
-    expect_arg_count(args, 2, kind.name())?;
+    expect_value_arg_count(args, 2, kind.name())?;
     let list = &args[0];
     let spec = parse_predicate_spec(&args[1])?;
 

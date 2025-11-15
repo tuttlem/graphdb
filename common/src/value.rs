@@ -14,13 +14,13 @@ pub enum Value {
     Map(HashMap<String, Value>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct QueryPath {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum FieldValue {
     Node(Node),
     Relationship(Edge),

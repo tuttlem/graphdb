@@ -35,8 +35,8 @@
 * [ ] Notebook-style docs/examples for common Cypher patterns
 * [x] Predicate functions
 * [x] Scalar functions
-* [ ] Aggregation functions
-* [ ] List functions
+* [x] Aggregation functions
+* [x] List functions
 * [x] Math functions (numeric)
 * [x] Math functions (logarithmic)
 * [x] Math functions (trig)

@@ -222,6 +222,7 @@ dependencies = [
 name = "function-api"
 version = "0.1.0"
 dependencies = [
+ "common",
  "graphdb-core",
  "once_cell",
 ]

@@ -1,15 +1,19 @@
-use function_api::{PluginFunctionSpec, Value, set_last_error};
+use function_api::{
+    ExpressionHandle, FieldValue, HostContext, HostContextVTable, PLUGIN_FLAG_REQUIRES_CONTEXT,
+    PluginContextCallback, PluginFunctionSpec, Value, set_last_error, take_last_error,
+};
 use std::convert::TryFrom;
-use std::os::raw::c_char;
+use std::ffi::CString;
+use std::os::raw::{c_char, c_void};
 use std::slice;
 
 pub(crate) const ROUND_EPSILON: f64 = 1e-12;
 
-pub(crate) fn args_slice<'a>(args: *const Value, len: usize) -> &'a [Value] {
+pub(crate) fn args_slice<'a>(args: *const FieldValue, len: usize) -> &'a [FieldValue] {
     unsafe { slice::from_raw_parts(args, len) }
 }
 
-pub(crate) fn write_value(out: *mut Value, value: Value) {
+pub(crate) fn write_value(out: *mut FieldValue, value: FieldValue) {
     unsafe {
         if let Some(slot) = out.as_mut() {
             *slot = value;
@@ -17,7 +21,7 @@ pub(crate) fn write_value(out: *mut Value, value: Value) {
     }
 }
 
-pub(crate) fn handle_result(result: Result<Value, String>, out: *mut Value) -> bool {
+pub(crate) fn handle_result(result: Result<FieldValue, String>, out: *mut FieldValue) -> bool {
     match result {
         Ok(value) => {
             write_value(out, value);
@@ -30,7 +34,23 @@ pub(crate) fn handle_result(result: Result<Value, String>, out: *mut Value) -> b
     }
 }
 
-pub(crate) fn expect_arg_count(args: &[Value], expected: usize, name: &str) -> Result<(), String> {
+pub(crate) fn expect_arg_count(
+    args: &[FieldValue],
+    expected: usize,
+    name: &str,
+) -> Result<(), String> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(format!("{}() expects {} argument(s)", name, expected))
+    }
+}
+
+pub(crate) fn expect_value_arg_count(
+    args: &[Value],
+    expected: usize,
+    name: &str,
+) -> Result<(), String> {
     if args.len() == expected {
         Ok(())
     } else {
@@ -47,9 +67,140 @@ pub(crate) const fn plugin_spec(
     PluginFunctionSpec {
         name: name.as_ptr() as *const c_char,
         callback,
+        context_callback: None,
         min_arity: min,
         max_arity: max,
+        flags: 0,
     }
+}
+
+unsafe extern "C" fn unused_plugin_callback(
+    _args: *const FieldValue,
+    _len: usize,
+    _out: *mut FieldValue,
+) -> bool {
+    set_last_error("function requires execution context");
+    false
+}
+
+pub(crate) const fn context_plugin_spec(
+    name: &'static [u8],
+    callback: PluginContextCallback,
+    min: usize,
+    max: isize,
+) -> PluginFunctionSpec {
+    PluginFunctionSpec {
+        name: name.as_ptr() as *const c_char,
+        callback: unused_plugin_callback,
+        context_callback: Some(callback),
+        min_arity: min,
+        max_arity: max,
+        flags: PLUGIN_FLAG_REQUIRES_CONTEXT,
+    }
+}
+
+pub(crate) fn scalar_field(value: Value) -> FieldValue {
+    FieldValue::Scalar(value)
+}
+
+pub(crate) fn scalar_result(result: Result<Value, String>) -> Result<FieldValue, String> {
+    result.map(FieldValue::Scalar)
+}
+
+pub(crate) fn expect_scalar<'a>(field: &'a FieldValue, name: &str) -> Result<&'a Value, String> {
+    match field {
+        FieldValue::Scalar(value) => Ok(value),
+        _ => Err(format!("{}() expects scalar input", name)),
+    }
+}
+
+pub(crate) fn field_value_type(value: &FieldValue) -> &'static str {
+    match value {
+        FieldValue::Scalar(_) => "scalar",
+        FieldValue::Node(_) => "node",
+        FieldValue::Relationship(_) => "relationship",
+        FieldValue::Path(_) => "path",
+        FieldValue::List(_) => "list",
+    }
+}
+
+pub(crate) fn field_value_to_scalar_owned(value: FieldValue, name: &str) -> Result<Value, String> {
+    match value {
+        FieldValue::Scalar(inner) => Ok(inner),
+        other => Err(format!(
+            "{} expects scalar input, received {}",
+            name,
+            field_value_type(&other)
+        )),
+    }
+}
+
+pub(crate) fn string_from_field(field: &FieldValue, name: &str) -> Result<String, String> {
+    match expect_scalar(field, name)? {
+        Value::String(value) => Ok(value.clone()),
+        other => Err(format!(
+            "{} expects STRING input, received {:?}",
+            name, other
+        )),
+    }
+}
+
+pub(crate) fn expression_handle_from_field(
+    field: &FieldValue,
+    name: &str,
+) -> Result<ExpressionHandle, String> {
+    let value = expect_scalar(field, name)?;
+    match value {
+        Value::Integer(raw) => {
+            if *raw < 0 {
+                Err(format!("{} expects non-negative INTEGER handle", name))
+            } else {
+                u32::try_from(*raw)
+                    .map(ExpressionHandle)
+                    .map_err(|_| format!("{} handle value is too large", name))
+            }
+        }
+        other => Err(format!(
+            "{} expects INTEGER handle, received {:?}",
+            name, other
+        )),
+    }
+}
+
+pub(crate) fn normalize_list_items(
+    value: FieldValue,
+    function: &str,
+) -> Result<Option<Vec<FieldValue>>, String> {
+    match value {
+        FieldValue::Scalar(Value::Null) => Ok(None),
+        FieldValue::Scalar(Value::List(values)) => {
+            Ok(Some(values.into_iter().map(FieldValue::Scalar).collect()))
+        }
+        FieldValue::List(items) => Ok(Some(items)),
+        other => Err(format!(
+            "{}() expects LIST input, received {}",
+            function,
+            field_value_type(&other)
+        )),
+    }
+}
+
+pub(crate) fn apply_scalar_fn<F>(
+    args: &[FieldValue],
+    name: &str,
+    func: F,
+) -> Result<FieldValue, String>
+where
+    F: Fn(&[Value]) -> Result<Value, String>,
+{
+    let mut values = Vec::with_capacity(args.len());
+    for field in args {
+        match field {
+            FieldValue::Scalar(value) => values.push(value.clone()),
+            _ => return Err(format!("{}() expects scalar input", name)),
+        }
+    }
+    func(&values).map(FieldValue::Scalar)
 }
 
 pub(crate) fn numeric_value_from_scalar(value: &Value, context: &str) -> Result<f64, String> {
@@ -263,6 +414,68 @@ pub(crate) fn convert_to_integer(
             }
         }
     })
+}
+
+pub(crate) fn convert_to_string(value: &Value, null_on_unsupported: bool) -> Result<Value, String> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        Value::String(s) => Value::String(s.clone()),
+        Value::Integer(i) => Value::String(i.to_string()),
+        Value::Float(f) => Value::String(f.to_string()),
+        Value::Boolean(b) => Value::String(b.to_string()),
+        other => {
+            if null_on_unsupported {
+                Value::Null
+            } else {
+                return Err(format!("toStringList() does not support value {:?}", other));
+            }
+        }
+    })
+}
+
+fn context_parts<'a>(
+    ctx: *mut HostContext,
+    function: &str,
+) -> Result<(*mut c_void, &'a HostContextVTable), String> {
+    let host = unsafe { ctx.as_mut() }
+        .ok_or_else(|| format!("{}() requires execution context", function))?;
+    let vtable = unsafe { host.vtable.as_ref() }
+        .ok_or_else(|| format!("{}() is missing execution context support", function))?;
+    Ok((host.data, vtable))
+}
+
+pub(crate) fn context_bind_alias(
+    ctx: *mut HostContext,
+    alias: &str,
+    value: FieldValue,
+    function: &str,
+) -> Result<(), String> {
+    let (data, vtable) = context_parts(ctx, function)?;
+    let cname = CString::new(alias)
+        .map_err(|_| format!("{} alias must not contain null bytes", function))?;
+    let success = unsafe { (vtable.bind_alias)(data, cname.as_ptr(), value) };
+    if success {
+        Ok(())
+    } else {
+        Err(take_last_error().unwrap_or_else(|| format!("{}() failed to bind alias", function)))
+    }
+}
+
+pub(crate) fn context_evaluate_expression(
+    ctx: *mut HostContext,
+    handle: ExpressionHandle,
+    function: &str,
+) -> Result<FieldValue, String> {
+    let (data, vtable) = context_parts(ctx, function)?;
+    let mut output = FieldValue::Scalar(Value::Null);
+    let success =
+        unsafe { (vtable.evaluate_expression)(data, handle, &mut output as *mut FieldValue) };
+    if success {
+        Ok(output)
+    } else {
+        Err(take_last_error()
+            .unwrap_or_else(|| format!("{}() failed to evaluate expression", function)))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

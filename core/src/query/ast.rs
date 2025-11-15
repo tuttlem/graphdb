@@ -72,6 +72,7 @@ pub enum Query {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectQuery {
+    pub initial_with: Option<WithClause>,
     pub match_clauses: Vec<SelectMatchClause>,
     pub conditions: Vec<Condition>,
     pub predicates: Vec<PredicateFilter>,
@@ -196,6 +197,10 @@ pub enum ScalarFunction {
         null_on_unsupported: bool,
     },
     ToInteger {
+        expr: Expression,
+        null_on_unsupported: bool,
+    },
+    ToString {
         expr: Expression,
         null_on_unsupported: bool,
     },

@@ -215,12 +215,56 @@ fn parse_with_literal_projection() {
 }
 
 #[test]
+fn parse_query_starting_with_with_clause() {
+    let input = "WITH [1,2,3] AS values RETURN values;";
+    let queries = parse_queries(input).expect("WITH-only query");
+    match &queries[0] {
+        Query::Select(select) => {
+            assert!(select.match_clauses.is_empty());
+            assert!(select.initial_with.is_some());
+            assert!(select.with.is_none());
+            assert_eq!(select.returns.len(), 1);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn parse_initial_with_before_match_clause() {
+    let input = "WITH randomUUID() AS id MATCH (p:Person) RETURN id, p.name;";
+    let queries = parse_queries(input).expect("WITH before MATCH");
+    match &queries[0] {
+        Query::Select(select) => {
+            assert!(select.initial_with.is_some());
+            assert_eq!(select.match_clauses.len(), 1);
+            assert!(select.with.is_none());
+            assert_eq!(select.returns.len(), 2);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn parse_parenthesized_literals_in_with_clause() {
+    let input = "WITH [(1), (2), (3)] AS ids RETURN ids;";
+    let queries = parse_queries(input).expect("parenthesized literals");
+    match &queries[0] {
+        Query::Select(select) => {
+            assert!(select.match_clauses.is_empty());
+            assert!(select.initial_with.is_some());
+            assert!(select.with.is_none());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn parse_scalar_functions() {
-    let input = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN coalesce(a.nickname, a.name) AS display, startNode(r) AS start, endNode(r) AS end, randomUUID() AS uuid;";
+    let input = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN coalesce(a.nickname, a.name) AS display, startNode(r) AS start, endNode(r) AS end, randomUUID() AS uuid, toString(a.id) AS idStr;";
     let queries = parse_queries(input).unwrap();
     match &queries[0] {
         Query::Select(select) => {
-            assert_eq!(select.returns.len(), 4);
+            assert_eq!(select.returns.len(), 5);
             match &select.returns[0].expression {
                 Expression::Function(func) => match func.as_ref() {
                     FunctionExpression::Scalar(ScalarFunction::Coalesce(args)) => {
@@ -235,6 +279,13 @@ fn parse_scalar_functions() {
                     FunctionExpression::Scalar(ScalarFunction::StartNode(field)) => {
                         assert_eq!(field.alias, "r");
                     }
+                    other => panic!("unexpected expression {other:?}"),
+                },
+                other => panic!("unexpected expression {other:?}"),
+            }
+            match &select.returns[4].expression {
+                Expression::Function(func) => match func.as_ref() {
+                    FunctionExpression::Scalar(ScalarFunction::ToString { .. }) => {}
                     other => panic!("unexpected expression {other:?}"),
                 },
                 other => panic!("unexpected expression {other:?}"),
