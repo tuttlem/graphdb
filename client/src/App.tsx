@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
+import type { ReactNode } from 'react';
 import './App.css';
 
 type AttributeValue = string | number | boolean | null | { [key: string]: AttributeValue } | AttributeValue[];
@@ -47,6 +48,194 @@ type QueryError = {
   error: string;
 };
 
+type ResultSectionVariant = 'rows' | 'nodes' | 'procedures' | 'paths' | 'pairs' | 'plan';
+
+type ResultSection = {
+  id: string;
+  title: string;
+  variant: ResultSectionVariant;
+  content: ReactNode;
+};
+
+type ResultEntry = {
+  id: string;
+  query: string;
+  timestamp: number;
+  requestId?: string | null;
+  result: QuerySuccess;
+};
+
+const MAX_FEED_ENTRIES = 10;
+
+const formatCellValue = (value: unknown) => {
+  if (value === null || value === undefined) {
+    return '—';
+  }
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+};
+
+const buildRowsTable = (rows: Record<string, unknown>[]) => {
+  if (!rows.length) {
+    return <p className="muted">No rows returned.</p>;
+  }
+  const columns = Array.from(
+    rows.reduce((acc, row) => {
+      Object.keys(row).forEach((key) => acc.add(key));
+      return acc;
+    }, new Set<string>())
+  );
+
+  return (
+    <div className="table-scroll">
+      <table className="rows-table">
+        <thead>
+          <tr>
+            {columns.map((column) => (
+              <th key={column}>{column}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, idx) => (
+            <tr key={idx}>
+              {columns.map((column) => (
+                <td key={column}>{formatCellValue(row[column])}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
+const renderNodesSection = (nodes: GraphNode[]) => {
+  return (
+    <div className="nodes-container">
+      {nodes.map((node) => (
+        <details key={node.id} className="node-card">
+          <summary>
+            <span className="node-id">{node.id}</span>
+            {node.labels.length > 0 && <span className="node-labels">{node.labels.join(', ')}</span>}
+          </summary>
+          <pre>{JSON.stringify(node.attributes, null, 2)}</pre>
+        </details>
+      ))}
+    </div>
+  );
+};
+
+const renderProceduresSection = (procedures: ProcedureResult[]) => (
+  <div className="procedures-container">
+    {procedures.map((procedure) => (
+      <details key={procedure.name} className="procedure-card" open>
+        <summary>{procedure.name} ({procedure.rows.length} row(s))</summary>
+        {procedure.rows.length === 0 ? (
+          <p className="muted">No rows</p>
+        ) : (
+          <pre>{JSON.stringify(procedure.rows, null, 2)}</pre>
+        )}
+      </details>
+    ))}
+  </div>
+);
+
+const renderPathsSection = (paths: PathResult[]) => (
+  <div className="procedures-container">
+    {paths.map((path) => (
+      <details key={`${path.alias}-${path.edge_ids.join('-')}`} className="procedure-card" open>
+        <summary>
+          {path.alias} – length {path.length}
+        </summary>
+        <pre>{JSON.stringify(path.nodes, null, 2)}</pre>
+      </details>
+    ))}
+  </div>
+);
+
+const renderPairsSection = (pairs: PathPairResult[]) => (
+  <div className="procedures-container">
+    {pairs.map((pair, idx) => (
+      <details key={`${pair.start_alias}-${pair.end_alias}-${idx}`} className="procedure-card" open>
+        <summary>
+          {pair.start_alias} → {pair.end_alias} (length {pair.length})
+        </summary>
+        <pre>{JSON.stringify({ start: pair.start, end: pair.end }, null, 2)}</pre>
+      </details>
+    ))}
+  </div>
+);
+
+const renderPlanSection = (plan: Record<string, unknown>) => (
+  <pre>{JSON.stringify(plan, null, 2)}</pre>
+);
+
+const buildResultSections = (entryId: string, result: QuerySuccess): ResultSection[] => {
+  const sections: ResultSection[] = [];
+  if (result.rows?.length) {
+    sections.push({
+      id: `${entryId}-rows`,
+      title: 'Rows',
+      variant: 'rows',
+      content: buildRowsTable(result.rows),
+    });
+  }
+
+  if (result.selected_nodes?.length) {
+    sections.push({
+      id: `${entryId}-nodes`,
+      title: 'Selected Nodes',
+      variant: 'nodes',
+      content: renderNodesSection(result.selected_nodes),
+    });
+  }
+
+  if (result.procedures?.length) {
+    sections.push({
+      id: `${entryId}-procedures`,
+      title: 'Procedures',
+      variant: 'procedures',
+      content: renderProceduresSection(result.procedures),
+    });
+  }
+
+  if (result.paths?.length) {
+    sections.push({
+      id: `${entryId}-paths`,
+      title: 'Paths',
+      variant: 'paths',
+      content: renderPathsSection(result.paths),
+    });
+  }
+
+  if (result.path_pairs?.length) {
+    sections.push({
+      id: `${entryId}-pairs`,
+      title: 'Node Pairs',
+      variant: 'pairs',
+      content: renderPairsSection(result.path_pairs),
+    });
+  }
+
+  if (result.plan_summary) {
+    sections.push({
+      id: `${entryId}-plan`,
+      title: 'Plan',
+      variant: 'plan',
+      content: renderPlanSection(result.plan_summary),
+    });
+  }
+
+  return sections;
+};
+
 const API_BASE = (import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '');
 const SAMPLE_QUERIES = [
   'MATCH (n:Person) RETURN n;',
@@ -59,8 +248,7 @@ function App() {
   const [query, setQuery] = useState<string>(SAMPLE_QUERIES[0]);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<QuerySuccess | null>(null);
-  const [history, setHistory] = useState<string[]>([]);
+  const [resultFeed, setResultFeed] = useState<ResultEntry[]>([]);
   const [requestId, setRequestId] = useState<string | null>(null);
 
   const handleSubmit = async () => {
@@ -86,66 +274,24 @@ function App() {
         throw new Error('error' in payload ? payload.error : 'Query failed');
       }
 
-      setResult(payload);
-      setHistory((prev) => [query, ...prev.filter((entry) => entry !== query)].slice(0, 5));
+      const entryId = requestIdHeader ?? `result-${Date.now()}`;
+      setResultFeed((prev) => [
+        {
+          id: entryId,
+          query,
+          timestamp: Date.now(),
+          requestId: requestIdHeader,
+          result: payload,
+        },
+        ...prev,
+      ].slice(0, MAX_FEED_ENTRIES));
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
       setError(message);
-      setResult(null);
     } finally {
       setIsRunning(false);
     }
   };
-
-  const renderedNodes = useMemo(() => {
-    if (!result?.selected_nodes?.length) {
-      return (
-        <p className="muted">No nodes returned.</p>
-      );
-    }
-    return result.selected_nodes.map((node) => (
-      <details key={node.id} className="node-card">
-        <summary>
-          <span className="node-id">{node.id}</span>
-          {node.labels.length > 0 && <span className="node-labels">{node.labels.join(', ')}</span>}
-        </summary>
-        <pre>{JSON.stringify(node.attributes, null, 2)}</pre>
-      </details>
-    ));
-  }, [result?.selected_nodes]);
-
-  const renderedRows = useMemo(() => {
-    const directRows = result?.rows ?? [];
-    const procedureRows = result?.procedures?.flatMap((procedure) =>
-      procedure.rows.map((row) => ({ __procedure: procedure.name, ...row }))
-    ) ?? [];
-    const displayRows = directRows.length > 0 ? directRows : procedureRows;
-
-    if (!displayRows.length) {
-      return (
-        <p className="muted">No rows returned. (Procedure output is shown below when available.)</p>
-      );
-    }
-
-    return (
-      <ul className="messages">
-        {displayRows.map((row, idx) => (
-          <li key={idx}>
-            <pre>{JSON.stringify(row, null, 2)}</pre>
-          </li>
-        ))}
-      </ul>
-    );
-  }, [result?.rows, result?.procedures]);
-
-  const renderedPlan = useMemo(() => {
-    if (!result?.plan_summary) {
-      return null;
-    }
-    return (
-      <pre>{JSON.stringify(result.plan_summary, null, 2)}</pre>
-    );
-  }, [result?.plan_summary]);
 
   return (
     <div className="page">
@@ -190,127 +336,76 @@ function App() {
           spellCheck={false}
         />
         <div className="actions">
-          <button type="button" onClick={handleSubmit} disabled={isRunning}>
+          <button type="button" className="primary-button" onClick={handleSubmit} disabled={isRunning}>
             {isRunning ? 'Running…' : 'Run Query'}
           </button>
           {error && <span className="error-text">{error}</span>}
         </div>
       </section>
 
-      <section className="results">
-        <div className="panel">
+      <div className="workspace">
+        <section className="panel result-panel">
           <div className="panel-header">
-            <h2>Messages</h2>
+            <h2>Results</h2>
           </div>
-          {result?.messages?.length ? (
-            <ul className="messages">
-              {result.messages.map((message, idx) => (
-                <li key={`${message}-${idx}`}>{message}</li>
-              ))}
-            </ul>
-          ) : (
-            <p className="muted">No messages yet.</p>
-          )}
-        </div>
-
-        <div className="panel">
-          <div className="panel-header">
-            <h2>Selected Nodes</h2>
+          <div className="result-body">
+            {resultFeed.length === 0 ? (
+              <p className="muted">Run a query to see results here.</p>
+            ) : (
+              resultFeed.map((entry) => {
+                const sections = buildResultSections(entry.id, entry.result);
+                const executedAt = new Date(entry.timestamp);
+                return (
+                  <article key={entry.id} className="result-entry">
+                    <header className="result-entry-header">
+                      <div>
+                        <button
+                          type="button"
+                          className="result-entry-query"
+                          onClick={() => setQuery(entry.query)}
+                          title="Click to re-run this query"
+                        >
+                          <code>{entry.query}</code>
+                        </button>
+                        <div className="result-entry-meta">
+                          <span>Ran at {executedAt.toLocaleString()}</span>
+                          {entry.requestId && (
+                            <span>Request ID: <span className="mono">{entry.requestId}</span></span>
+                          )}
+                        </div>
+                      </div>
+                    </header>
+                    <div className="result-entry-content">
+                      {sections.length ? sections.map((section) => (
+                        <article key={section.id} className={`result-block variant-${section.variant}`}>
+                          <div className="result-block-title">
+                            <h3>{section.title}</h3>
+                          </div>
+                          <div className="result-block-content">{section.content}</div>
+                        </article>
+                      )) : (
+                        <p className="muted">No structured output returned.</p>
+                      )}
+                    </div>
+                    <footer className="result-entry-footer">
+                      {entry.result.messages?.length ? (
+                        <div className="result-entry-messages">
+                          <span className="messages-label">Messages:</span>
+                          {entry.result.messages.map((message, idx) => (
+                            <span key={`${entry.id}-message-${idx}`} className="message-pill">{message}</span>
+                          ))}
+                        </div>
+                      ) : (
+                        <span className="muted">No messages returned</span>
+                      )}
+                    </footer>
+                  </article>
+                );
+              })
+            )}
           </div>
-          <div className="nodes-container">{renderedNodes}</div>
-        </div>
-
-        <div className="panel">
-          <div className="panel-header">
-            <h2>Rows</h2>
-          </div>
-          {renderedRows}
-        </div>
-
-        {renderedPlan && (
-          <div className="panel">
-            <div className="panel-header">
-              <h2>Plan</h2>
-            </div>
-            {renderedPlan}
-          </div>
-        )}
-
-        <div className="panel">
-          <div className="panel-header">
-            <h2>Procedures</h2>
-          </div>
-          {result?.procedures?.length ? (
-            result.procedures.map((procedure) => (
-              <details key={procedure.name} className="procedure-card" open>
-                <summary>{procedure.name} ({procedure.rows.length} row(s))</summary>
-                {procedure.rows.length === 0 ? (
-                  <p className="muted">No rows</p>
-                ) : (
-                  <pre>{JSON.stringify(procedure.rows, null, 2)}</pre>
-                )}
-              </details>
-            ))
-          ) : (
-            <p className="muted">No procedure output</p>
-          )}
-        </div>
-
-        <div className="panel">
-          <div className="panel-header">
-            <h2>Paths</h2>
-          </div>
-          {result?.paths?.length ? (
-            result.paths.map((path) => (
-              <details key={`${path.alias}-${path.edge_ids.join('-')}`} className="procedure-card" open>
-                <summary>
-                  {path.alias} – length {path.length}
-                </summary>
-                <pre>{JSON.stringify(path.nodes, null, 2)}</pre>
-              </details>
-            ))
-          ) : (
-            <p className="muted">No path output</p>
-          )}
-        </div>
-
-        <div className="panel">
-          <div className="panel-header">
-            <h2>Node Pairs</h2>
-          </div>
-          {result?.path_pairs?.length ? (
-            result.path_pairs.map((pair, idx) => (
-              <details key={`${pair.start_alias}-${pair.end_alias}-${idx}`} className="procedure-card" open>
-                <summary>
-                  {pair.start_alias} → {pair.end_alias} (length {pair.length})
-                </summary>
-                <pre>{JSON.stringify({ start: pair.start, end: pair.end }, null, 2)}</pre>
-              </details>
-            ))
-          ) : (
-            <p className="muted">No node pairs</p>
-          )}
-        </div>
-
-        <div className="panel">
-          <div className="panel-header">
-            <h2>History</h2>
-          </div>
-          {history.length ? (
-            <ul className="history">
-              {history.map((entry, idx) => (
-                <li key={`${entry}-${idx}`}>
-                  <button type="button" onClick={() => setQuery(entry)}>
-                    {entry}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="muted">Run a query to populate history</p>
-          )}
-        </div>
-      </section>
+        </section>
+      </div>
     </div>
   );
 }
