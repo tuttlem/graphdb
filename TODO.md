@@ -5,7 +5,16 @@
 * [x] Improve HTTP request logging with trace IDs & correlation across client/daemon
 * [x] Further CYPHER coverage (MATCH/WHERE/WITH/RETURN chaining, aggregates)
 * [x] Remove SELECT from the parser (there is no SELECT in Cypher)
-* [ ] Add path algorithms: weighted shortest path, A*, Yen's k-shortest
+* [ ] Path algorithm: Dijkstra shortest path
+* [ ] Path algorithm: A* heuristic shortest path
+* [ ] Path algorithm: Yen's k-shortest simple paths
+* [ ] Path algorithm: Delta-stepping single-source shortest path
+* [ ] Path algorithm: Single-source shortest path (unweighted)
+* [ ] Path algorithm: All-pairs shortest path
+* [ ] Path algorithm: Breadth-first search
+* [ ] Path algorithm: Depth-first search
+* [ ] Path algorithm: Random walk
+* [ ] Path algorithm: Minimum weight spanning tree
 * [ ] Implement query planner + execution engine beyond naive scans
 * [ ] Introduce transactions + ACID semantics for storage backends
 * [ ] Dense filesystem backend + pluggable key-value storage adapters
