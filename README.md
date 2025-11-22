@@ -68,6 +68,101 @@ Responses follow the structure:
 Errors return HTTP 4xx/5xx responses with a JSON body of `{ "status": "error",
 "error": "…" }`.
 
+## Query Examples
+
+
+The snippets below can be pasted directly into the web client or POSTed to
+`/query`. They progress from trivial reads through multi-stage pipelines.
+
+### Simple patterns
+
+```cypher
+// Create two nodes and a relationship in a single statement
+CREATE (:Person { name: 'Ada', city: 'Zurich' })-[:KNOWS]->(:Person { name: 'Grace' });
+
+// Return every Person with their properties
+MATCH (p:Person)
+RETURN p;
+
+// Basic filtering and projection
+MATCH (p:Person { city: 'Zurich' })
+RETURN p.name AS name, p.city AS city;
+```
+
+### Aggregation and ordering
+
+```cypher
+MATCH (p:Person)
+RETURN p.city AS city, count(*) AS residents
+ORDER BY residents DESC
+LIMIT 5;
+
+// Compute the average age per city, defaulting null ages via coalesce
+MATCH (p:Person)
+WITH p.city AS city, coalesce(p.age, 0) AS age
+RETURN city, avg(age) AS averageAge;
+```
+
+### Variable-length paths
+
+```cypher
+// Find friends-of-friends and expose the intermediate hop count
+MATCH path = (a:Person { name: 'Ada' })-[:KNOWS*1..3]->(b:Person)
+WHERE a <> b
+RETURN a.name AS source, b.name AS target, length(path) AS hops;
+
+// Materialise the paths for later inspection
+MATCH path = (start:Person { name: 'Ada' })-[:KNOWS*..5]-(end:Person)
+RETURN path;
+```
+
+### Procedures and built-in helpers
+
+```cypher
+// Use the stdfunc.lines procedure to explode text into rows
+CALL std.lines('rust rocks\nneo who?') YIELD word
+RETURN word;
+
+// Discover schema metadata
+CALL graphdb.nodeClasses() YIELD name, properties
+RETURN name, properties;
+```
+
+### Shortest-path services
+
+```cypher
+// Declarative shortestPath() inside MATCH
+MATCH path = shortestPath((a:Airport { code: 'SFO' })-[:ROUTE*..5]->(z:Airport { code: 'LHR' }))
+RETURN nodes(path) AS stops, relationships(path) AS flights;
+
+// Dijkstra with weights and directionality
+CALL path.dijkstra({
+    sourceNode: '00000000-0000-0000-0000-000000000001',
+    targetNode: '00000000-0000-0000-0000-00000000000A',
+    relationshipTypes: ['ROUTE'],
+    relationshipWeightProperty: 'durationMinutes',
+    direction: 'OUTGOING'
+}) YIELD totalCost, nodeIds
+RETURN nodeIds AS path, totalCost;
+```
+
+### Multi-stage analytical query
+
+```cypher
+// Rank cities by betweenness-like score: paths that start in a city but end elsewhere
+MATCH (start:Person)-[:KNOWS*2..4]->(end:Person)
+WITH start.city AS city, end.city AS endCity
+WHERE city <> endCity
+WITH city, count(*) AS influence
+MATCH (cityNode:City { name: city })
+RETURN city, influence, cityNode.population
+ORDER BY influence DESC, cityNode.population DESC
+LIMIT 10;
+```
+
+Adapt the patterns to your schema—labels, properties, and relationships can be
+changed without modifying the structure of the queries themselves.
+
 ### Docker
 
 You can run the daemon and the built React client in a single container. Build

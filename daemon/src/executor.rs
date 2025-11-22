@@ -1,5 +1,5 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::f64::consts::{E as E_CONST, PI};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,8 +10,8 @@ use graphdb_core::query::{
     AggregateExpression, AggregateFunction, BinaryOperator, ComparisonOperator, CreatePattern,
     CreateRelationship, ExistsFunction, Expression, FieldReference, FunctionExpression,
     GraphDbProcedure, ListExpression, ListPredicate, ListPredicateFunction, ListPredicateKind,
-    MatchPattern, NodePattern, PathFilter, PathLength, PathMatchQuery, PathPattern, PathQueryMode,
-    PathReturn, PredicateFilter, Procedure, Projection, Properties, Query, RelationshipDirection,
+    MatchPattern, NodePattern, PathLength, PathMatchQuery, PathPattern, PathQueryMode, PathReturn,
+    PredicateFilter, Procedure, Projection, Properties, Query, RelationshipDirection,
     RelationshipMatch, RelationshipPattern, ScalarFunction, SelectMatchClause, SelectQuery,
     UserProcedureCall, Value, ValueOperand, WithClause, parse_queries,
 };
@@ -23,6 +23,10 @@ use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::DaemonError;
+use crate::path::{
+    dijkstra,
+    traversal::{self, edge_matches_pattern, PathState},
+};
 use function_api::{
     self as functions, ExpressionHandle, FunctionContext, FunctionError, ProcedureContext,
 };
@@ -572,7 +576,10 @@ fn select_nodes<B: StorageBackend>(
     Ok(matches)
 }
 
-fn node_matches_pattern(node: &Arc<Node>, pattern: &graphdb_core::query::NodePattern) -> bool {
+pub(crate) fn node_matches_pattern(
+    node: &Arc<Node>,
+    pattern: &graphdb_core::query::NodePattern,
+) -> bool {
     if let Some(label) = &pattern.label {
         if !node.labels().iter().any(|l| l == label) {
             return false;
@@ -639,7 +646,7 @@ fn node_satisfies_condition(node: &Arc<Node>, condition: &graphdb_core::query::C
     }
 }
 
-fn value_equals_attribute(value: &Value, attribute: &AttributeValue) -> bool {
+pub(crate) fn value_equals_attribute(value: &Value, attribute: &AttributeValue) -> bool {
     match (value, attribute) {
         (Value::String(a), AttributeValue::String(b)) => a == b,
         (Value::Integer(a), AttributeValue::Integer(b)) => *a == *b,
@@ -1257,7 +1264,7 @@ fn resolve_field(row: &QueryRow, field: &FieldReference) -> Result<FieldValue, D
     }
 }
 
-fn field_value_to_scalar(value: FieldValue) -> Result<Value, DaemonError> {
+pub(crate) fn field_value_to_scalar(value: FieldValue) -> Result<Value, DaemonError> {
     match value {
         FieldValue::Scalar(val) => Ok(val),
         FieldValue::Node(_) => Err(DaemonError::Query(
@@ -2681,9 +2688,9 @@ fn enumerate_path_states_for_nodes<B: StorageBackend>(
     }
     let start_arcs: Vec<_> = starts.iter().cloned().map(Arc::new).collect();
     let start_ids: HashSet<NodeId> = start_arcs.iter().map(|node| node.id()).collect();
-    let bounds = length_bounds(&relationship.length);
+    let bounds = traversal::length_bounds(&relationship.length);
     match mode {
-        PathQueryMode::Shortest => shortest_path(
+        PathQueryMode::Shortest => traversal::shortest_path(
             db,
             &start_arcs,
             &start_ids,
@@ -2693,7 +2700,7 @@ fn enumerate_path_states_for_nodes<B: StorageBackend>(
             None,
             "",
         ),
-        PathQueryMode::All => enumerate_paths(
+        PathQueryMode::All => traversal::enumerate_paths(
             db,
             &start_arcs,
             &start_ids,
@@ -2750,7 +2757,7 @@ fn reachable_nodes_from<B: StorageBackend>(
     target_pattern: &NodePattern,
     target_conditions: &[graphdb_core::query::Condition],
 ) -> Result<Vec<Node>, DaemonError> {
-    let (min_hops, max_hops) = length_bounds(&relationship.length);
+    let (min_hops, max_hops) = traversal::length_bounds(&relationship.length);
     let mut results = Vec::new();
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
@@ -2789,7 +2796,7 @@ fn relationship_path_exists_between<B: StorageBackend>(
     target: NodeId,
     pattern: &RelationshipPattern,
 ) -> Result<bool, DaemonError> {
-    let (min_hops, max_hops) = length_bounds(&pattern.length);
+    let (min_hops, max_hops) = traversal::length_bounds(&pattern.length);
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
     queue.push_back((start, 0u32));
@@ -3222,8 +3229,8 @@ fn execute_path_dijkstra<B: StorageBackend>(
     args: Vec<FieldValue>,
     call: &UserProcedureCall,
 ) -> Result<ProcedureResult, DaemonError> {
-    let config = parse_dijkstra_config(args)?;
-    let rows = run_dijkstra(db, &config)?;
+    let config = dijkstra::parse_dijkstra_config(args)?;
+    let rows = dijkstra::run_dijkstra(db, &config)?;
     let available_columns = vec![
         "index".to_string(),
         "sourceNode".to_string(),
@@ -3238,377 +3245,6 @@ fn execute_path_dijkstra<B: StorageBackend>(
         rows,
         call.yield_items.clone(),
     )
-}
-
-fn parse_dijkstra_config(args: Vec<FieldValue>) -> Result<DijkstraConfig, DaemonError> {
-    if args.is_empty() {
-        return Err(DaemonError::Query(
-            "path.dijkstra expects at least a configuration argument".into(),
-        ));
-    }
-
-    let config_field = match args.len() {
-        1 => args.into_iter().next().unwrap(),
-        2 => args.into_iter().nth(1).unwrap(),
-        _ => {
-            return Err(DaemonError::Query(
-                "path.dijkstra expects one or two arguments".into(),
-            ));
-        }
-    };
-
-    let config_value = field_value_to_scalar(config_field)?;
-    let map = match config_value {
-        Value::Map(map) => map,
-        _ => {
-            return Err(DaemonError::Query(
-                "path.dijkstra configuration must be a map".into(),
-            ));
-        }
-    };
-
-    let source_value = map
-        .get("sourceNode")
-        .ok_or_else(|| DaemonError::Query("path.dijkstra requires sourceNode".into()))?;
-    let source = parse_node_id(source_value)?;
-
-    let target = if let Some(value) = map.get("targetNode") {
-        Some(parse_node_id(value)?)
-    } else {
-        None
-    };
-
-    let weight_property = map
-        .get("relationshipWeightProperty")
-        .map(|value| match value {
-            Value::String(s) => Ok(s.clone()),
-            Value::Null => Ok(String::new()),
-            _ => Err(DaemonError::Query(
-                "relationshipWeightProperty must be STRING".into(),
-            )),
-        })
-        .transpose()?;
-    let weight_property = weight_property.filter(|s| !s.is_empty());
-
-    let relationship_types = map
-        .get("relationshipTypes")
-        .map(|value| match value {
-            Value::List(values) => {
-                let mut types = HashSet::new();
-                for entry in values {
-                    match entry {
-                        Value::String(name) => {
-                            types.insert(name.clone());
-                        }
-                        _ => {
-                            return Err(DaemonError::Query(
-                                "relationshipTypes must be list of STRING".into(),
-                            ));
-                        }
-                    }
-                }
-                Ok(types)
-            }
-            _ => Err(DaemonError::Query(
-                "relationshipTypes must be a list".into(),
-            )),
-        })
-        .transpose()?;
-
-    let direction = if let Some(value) = map.get("direction") {
-        match value {
-            Value::String(s) => match s.to_ascii_uppercase().as_str() {
-                "OUTGOING" => Ok(DijkstraDirection::Outgoing),
-                "INCOMING" => Ok(DijkstraDirection::Incoming),
-                "BOTH" => Ok(DijkstraDirection::Both),
-                _ => Err(DaemonError::Query(
-                    "direction must be OUTGOING, INCOMING, or BOTH".into(),
-                )),
-            },
-            _ => Err(DaemonError::Query("direction must be STRING".into())),
-        }?
-    } else {
-        DijkstraDirection::Outgoing
-    };
-
-    Ok(DijkstraConfig {
-        source,
-        target,
-        weight_property,
-        relationship_types,
-        direction,
-    })
-}
-
-fn run_dijkstra<B: StorageBackend>(
-    db: &Database<B>,
-    config: &DijkstraConfig,
-) -> Result<Vec<HashMap<String, FieldValue>>, DaemonError> {
-    let mut distances = HashMap::new();
-    distances.insert(config.source, 0.0);
-    let mut predecessors: HashMap<NodeId, NodeId> = HashMap::new();
-    let mut heap = BinaryHeap::new();
-    heap.push(QueueEntry {
-        node: config.source,
-        cost: 0.0,
-    });
-    let mut visited = HashSet::new();
-    let mut order = Vec::new();
-
-    while let Some(entry) = heap.pop() {
-        if visited.contains(&entry.node) {
-            continue;
-        }
-        visited.insert(entry.node);
-        order.push(entry.node);
-
-        if config.target == Some(entry.node) {
-            break;
-        }
-
-        let neighbors = neighbors_for_node(db, entry.node, config)?;
-        for neighbor in neighbors {
-            let next_cost = entry.cost + neighbor.weight;
-            if next_cost.is_nan() || next_cost.is_infinite() || next_cost < 0.0 {
-                return Err(DaemonError::Query(
-                    "path.dijkstra encountered invalid relationship weights".into(),
-                ));
-            }
-            let current_best = distances
-                .get(&neighbor.node)
-                .copied()
-                .unwrap_or(f64::INFINITY);
-            if next_cost < current_best - f64::EPSILON {
-                distances.insert(neighbor.node, next_cost);
-                predecessors.insert(neighbor.node, entry.node);
-                heap.push(QueueEntry {
-                    node: neighbor.node,
-                    cost: next_cost,
-                });
-            }
-        }
-    }
-
-    let targets: Vec<NodeId> = if let Some(target) = config.target {
-        if distances.contains_key(&target) {
-            vec![target]
-        } else {
-            Vec::new()
-        }
-    } else {
-        order
-            .into_iter()
-            .filter(|node| *node != config.source && distances.contains_key(node))
-            .collect()
-    };
-
-    let mut rows = Vec::with_capacity(targets.len());
-    for (index, node_id) in targets.into_iter().enumerate() {
-        let (path_nodes, path_costs) =
-            reconstruct_path(node_id, config.source, &predecessors, &distances)?;
-        let mut row = HashMap::new();
-        row.insert(
-            "index".into(),
-            FieldValue::Scalar(Value::Integer(index as i64)),
-        );
-        row.insert(
-            "sourceNode".into(),
-            FieldValue::Scalar(Value::String(config.source.to_string())),
-        );
-        row.insert(
-            "targetNode".into(),
-            FieldValue::Scalar(Value::String(node_id.to_string())),
-        );
-        row.insert(
-            "totalCost".into(),
-            FieldValue::Scalar(Value::Float(*distances.get(&node_id).unwrap_or(&0.0))),
-        );
-        let node_values = path_nodes
-            .iter()
-            .map(|id| Value::String(id.to_string()))
-            .collect();
-        row.insert(
-            "nodeIds".into(),
-            FieldValue::Scalar(Value::List(node_values)),
-        );
-        let cost_values = path_costs.iter().map(|cost| Value::Float(*cost)).collect();
-        row.insert("costs".into(), FieldValue::Scalar(Value::List(cost_values)));
-        rows.push(row);
-    }
-
-    Ok(rows)
-}
-
-fn neighbors_for_node<B: StorageBackend>(
-    db: &Database<B>,
-    node_id: NodeId,
-    config: &DijkstraConfig,
-) -> Result<Vec<NeighborInfo>, DaemonError> {
-    let edges = db.edges_for_node(node_id)?;
-    let mut neighbors = Vec::new();
-    for edge in edges {
-        match config.direction {
-            DijkstraDirection::Outgoing => {
-                if edge.source() == node_id {
-                    if relationship_allowed(&edge, &config.relationship_types) {
-                        let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push(NeighborInfo {
-                            node: edge.target(),
-                            weight,
-                        });
-                    }
-                }
-            }
-            DijkstraDirection::Incoming => {
-                if edge.target() == node_id {
-                    if relationship_allowed(&edge, &config.relationship_types) {
-                        let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push(NeighborInfo {
-                            node: edge.source(),
-                            weight,
-                        });
-                    }
-                }
-            }
-            DijkstraDirection::Both => {
-                if edge.source() == node_id {
-                    if relationship_allowed(&edge, &config.relationship_types) {
-                        let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push(NeighborInfo {
-                            node: edge.target(),
-                            weight,
-                        });
-                    }
-                }
-                if edge.target() == node_id {
-                    if relationship_allowed(&edge, &config.relationship_types) {
-                        let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push(NeighborInfo {
-                            node: edge.source(),
-                            weight,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    Ok(neighbors)
-}
-
-fn relationship_allowed(edge: &Edge, allowed_types: &Option<HashSet<String>>) -> bool {
-    if let Some(types) = allowed_types {
-        let label = edge.attribute("__label").and_then(|value| match value {
-            AttributeValue::String(s) => Some(s.as_str()),
-            _ => None,
-        });
-        if let Some(label) = label {
-            types.contains(label)
-        } else {
-            false
-        }
-    } else {
-        true
-    }
-}
-
-fn edge_weight(edge: &Edge, property: Option<&str>) -> Result<f64, DaemonError> {
-    if let Some(prop) = property {
-        match edge.attribute(prop) {
-            Some(AttributeValue::Float(value)) => Ok(*value),
-            Some(AttributeValue::Integer(value)) => Ok(*value as f64),
-            Some(AttributeValue::String(value)) => value
-                .parse::<f64>()
-                .map_err(|_| DaemonError::Query("relationship weight must be numeric".into())),
-            Some(_) => Err(DaemonError::Query(
-                "relationship weight must be numeric".into(),
-            )),
-            None => Err(DaemonError::Query(format!(
-                "relationship is missing property '{}'",
-                prop
-            ))),
-        }
-    } else {
-        Ok(1.0)
-    }
-}
-
-fn reconstruct_path(
-    target: NodeId,
-    source: NodeId,
-    predecessors: &HashMap<NodeId, NodeId>,
-    distances: &HashMap<NodeId, f64>,
-) -> Result<(Vec<NodeId>, Vec<f64>), DaemonError> {
-    let mut nodes = Vec::new();
-    let mut current = target;
-    nodes.push(current);
-    while current != source {
-        current = *predecessors
-            .get(&current)
-            .ok_or_else(|| DaemonError::Query("failed to reconstruct shortest path".into()))?;
-        nodes.push(current);
-    }
-    nodes.reverse();
-
-    let mut costs = Vec::with_capacity(nodes.len());
-    for node in &nodes {
-        let cost = if *node == source {
-            0.0
-        } else {
-            *distances
-                .get(node)
-                .ok_or_else(|| DaemonError::Query("missing cost for path node".into()))?
-        };
-        costs.push(cost);
-    }
-
-    Ok((nodes, costs))
-}
-
-#[derive(Clone, Copy)]
-struct NeighborInfo {
-    node: NodeId,
-    weight: f64,
-}
-
-#[derive(Clone, Copy)]
-struct QueueEntry {
-    node: NodeId,
-    cost: f64,
-}
-
-impl PartialEq for QueueEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.node == other.node && (self.cost - other.cost).abs() < f64::EPSILON
-    }
-}
-
-impl Eq for QueueEntry {}
-
-impl PartialOrd for QueueEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for QueueEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.cost.total_cmp(&self.cost)
-    }
-}
-
-struct DijkstraConfig {
-    source: NodeId,
-    target: Option<NodeId>,
-    weight_property: Option<String>,
-    relationship_types: Option<HashSet<String>>,
-    direction: DijkstraDirection,
-}
-
-#[derive(Clone, Copy)]
-enum DijkstraDirection {
-    Outgoing,
-    Incoming,
-    Both,
 }
 
 fn percentile_values(
@@ -4009,7 +3645,7 @@ fn extract_node_id(
     parse_node_id(value)
 }
 
-fn parse_node_id(value: &Value) -> Result<NodeId, DaemonError> {
+pub(crate) fn parse_node_id(value: &Value) -> Result<NodeId, DaemonError> {
     match value {
         Value::Integer(i) => Ok(NodeId::from_u128(*i as u128)),
         Value::String(s) => {
@@ -4061,10 +3697,6 @@ fn value_to_attribute(value: &Value) -> AttributeValue {
     }
 }
 
-const DEFAULT_MAX_HOPS: u32 = 10;
-const MAX_RETURNED_PATHS: usize = 64;
-const EDGE_LABEL_KEY: &str = "__label";
-
 fn execute_path_query<B: StorageBackend>(
     db: &Database<B>,
     query: PathMatchQuery,
@@ -4080,11 +3712,11 @@ fn execute_path_query<B: StorageBackend>(
 
     let end_set: HashSet<NodeId> = end_nodes.iter().map(|node| node.id()).collect();
     let start_ids: HashSet<NodeId> = start_nodes.iter().map(|node| node.id()).collect();
-    let length_bounds = length_bounds(&query.relationship.length);
+    let length_bounds = traversal::length_bounds(&query.relationship.length);
     let filter = query.filter.clone();
 
     let paths = match query.mode {
-        PathQueryMode::Shortest => shortest_path(
+        PathQueryMode::Shortest => traversal::shortest_path(
             db,
             &start_nodes,
             &start_ids,
@@ -4094,7 +3726,7 @@ fn execute_path_query<B: StorageBackend>(
             filter.as_ref(),
             &query.start_alias,
         )?,
-        PathQueryMode::All => enumerate_paths(
+        PathQueryMode::All => traversal::enumerate_paths(
             db,
             &start_nodes,
             &start_ids,
@@ -4181,272 +3813,6 @@ fn find_matching_nodes<B: StorageBackend>(
         }
     }
     Ok(matches)
-}
-
-#[derive(Clone)]
-struct PathState {
-    nodes: Vec<NodeId>,
-    edges: Vec<EdgeId>,
-}
-
-fn length_bounds(spec: &PathLength) -> (u32, u32) {
-    match spec {
-        PathLength::Exact(v) => (*v, *v),
-        PathLength::Range { min, max } => {
-            let upper = max.unwrap_or(DEFAULT_MAX_HOPS);
-            (*min, upper)
-        }
-    }
-}
-
-fn shortest_path<B: StorageBackend>(
-    db: &Database<B>,
-    starts: &[std::sync::Arc<Node>],
-    start_ids: &HashSet<NodeId>,
-    end_set: &HashSet<NodeId>,
-    relationship: &RelationshipPattern,
-    (min_hops, max_hops): (u32, u32),
-    filter: Option<&PathFilter>,
-    start_alias: &str,
-) -> Result<Vec<PathState>, DaemonError> {
-    let mut queue = VecDeque::new();
-    let mut visited: HashSet<NodeId> = HashSet::new();
-    for node in starts {
-        queue.push_back(PathState {
-            nodes: vec![node.id()],
-            edges: Vec::new(),
-        });
-        visited.insert(node.id());
-    }
-
-    while let Some(state) = queue.pop_front() {
-        let depth = state.edges.len() as u32;
-        let current = *state.nodes.last().unwrap();
-        if depth >= min_hops && end_set.contains(&current) {
-            return Ok(vec![state]);
-        }
-        if depth >= max_hops {
-            continue;
-        }
-        for (edge, next) in
-            relationship_neighbors(db, current, relationship, start_ids, filter, start_alias)?
-        {
-            if state.nodes.contains(&next) {
-                continue;
-            }
-            if !visited.insert(next) {
-                continue;
-            }
-            let mut next_state = PathState {
-                nodes: state.nodes.clone(),
-                edges: state.edges.clone(),
-            };
-            next_state.nodes.push(next);
-            next_state.edges.push(edge.id());
-            queue.push_back(next_state);
-        }
-    }
-
-    Ok(Vec::new())
-}
-
-fn enumerate_paths<B: StorageBackend>(
-    db: &Database<B>,
-    starts: &[std::sync::Arc<Node>],
-    start_ids: &HashSet<NodeId>,
-    end_set: &HashSet<NodeId>,
-    relationship: &RelationshipPattern,
-    (min_hops, max_hops): (u32, u32),
-    filter: Option<&PathFilter>,
-    start_alias: &str,
-) -> Result<Vec<PathState>, DaemonError> {
-    let mut results = Vec::new();
-    for node in starts {
-        let mut state = PathState {
-            nodes: vec![node.id()],
-            edges: Vec::new(),
-        };
-        dfs_paths(
-            db,
-            &mut state,
-            start_ids,
-            end_set,
-            relationship,
-            min_hops,
-            max_hops,
-            &mut results,
-            filter,
-            start_alias,
-        )?;
-        if results.len() >= MAX_RETURNED_PATHS {
-            break;
-        }
-    }
-    Ok(results)
-}
-
-fn dfs_paths<B: StorageBackend>(
-    db: &Database<B>,
-    state: &mut PathState,
-    start_ids: &HashSet<NodeId>,
-    end_set: &HashSet<NodeId>,
-    relationship: &RelationshipPattern,
-    min_hops: u32,
-    max_hops: u32,
-    results: &mut Vec<PathState>,
-    filter: Option<&PathFilter>,
-    start_alias: &str,
-) -> Result<(), DaemonError> {
-    let depth = state.edges.len() as u32;
-    let current = *state.nodes.last().unwrap();
-    if depth >= min_hops && end_set.contains(&current) {
-        results.push(state.clone());
-    }
-    if depth >= max_hops || results.len() >= MAX_RETURNED_PATHS {
-        return Ok(());
-    }
-    for (edge, next) in
-        relationship_neighbors(db, current, relationship, start_ids, filter, start_alias)?
-    {
-        if state.nodes.contains(&next) {
-            continue;
-        }
-        state.nodes.push(next);
-        state.edges.push(edge.id());
-        dfs_paths(
-            db,
-            state,
-            start_ids,
-            end_set,
-            relationship,
-            min_hops,
-            max_hops,
-            results,
-            filter,
-            start_alias,
-        )?;
-        state.nodes.pop();
-        state.edges.pop();
-        if results.len() >= MAX_RETURNED_PATHS {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn relationship_neighbors<B: StorageBackend>(
-    db: &Database<B>,
-    node_id: NodeId,
-    pattern: &RelationshipPattern,
-    start_ids: &HashSet<NodeId>,
-    filter: Option<&PathFilter>,
-    start_alias: &str,
-) -> Result<Vec<(std::sync::Arc<Edge>, NodeId)>, DaemonError> {
-    let edges = db.edges_for_node(node_id)?;
-    let mut matches = Vec::new();
-    for edge in edges {
-        match pattern.direction {
-            RelationshipDirection::Outbound => {
-                if edge.source() != node_id {
-                    continue;
-                }
-                if !edge_matches_pattern(&edge, pattern) {
-                    continue;
-                }
-                if should_skip_edge(
-                    db,
-                    node_id,
-                    edge.target(),
-                    &edge,
-                    start_ids,
-                    filter,
-                    start_alias,
-                )? {
-                    continue;
-                }
-                matches.push((edge.clone(), edge.target()));
-            }
-            RelationshipDirection::Inbound => {
-                if edge.target() != node_id {
-                    continue;
-                }
-                if !edge_matches_pattern(&edge, pattern) {
-                    continue;
-                }
-                if should_skip_edge(
-                    db,
-                    node_id,
-                    edge.source(),
-                    &edge,
-                    start_ids,
-                    filter,
-                    start_alias,
-                )? {
-                    continue;
-                }
-                matches.push((edge.clone(), edge.source()));
-            }
-            RelationshipDirection::Undirected => {
-                if edge_matches_pattern(&edge, pattern) {
-                    let next = if edge.source() == node_id {
-                        edge.target()
-                    } else {
-                        edge.source()
-                    };
-                    if should_skip_edge(db, node_id, next, &edge, start_ids, filter, start_alias)? {
-                        continue;
-                    }
-                    matches.push((edge.clone(), next));
-                }
-            }
-        }
-    }
-    Ok(matches)
-}
-
-fn edge_matches_pattern(edge: &Edge, pattern: &RelationshipPattern) -> bool {
-    if let Some(label) = &pattern.label {
-        match edge.attributes().get(EDGE_LABEL_KEY) {
-            Some(AttributeValue::String(value)) if value == label => {}
-            Some(AttributeValue::String(_)) => return false,
-            _ => return false,
-        }
-    }
-    for (key, value) in pattern.properties.0.iter() {
-        match edge.attributes().get(key) {
-            Some(attr) if value_equals_attribute(value, attr) => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn should_skip_edge<B: StorageBackend>(
-    db: &Database<B>,
-    current: NodeId,
-    next: NodeId,
-    edge: &Edge,
-    start_ids: &HashSet<NodeId>,
-    filter: Option<&PathFilter>,
-    start_alias: &str,
-) -> Result<bool, DaemonError> {
-    if let Some(PathFilter::ExcludeRelationship {
-        from_alias,
-        relationship,
-        to_pattern,
-    }) = filter
-    {
-        if from_alias == start_alias && start_ids.contains(&current) {
-            if edge_matches_pattern(edge, relationship) {
-                if let Some(neighbor) = db.get_node(next)? {
-                    if node_matches_pattern(&neighbor, to_pattern) {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-    }
-    Ok(false)
 }
 
 fn load_nodes_by_ids<B: StorageBackend>(

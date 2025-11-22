@@ -4,6 +4,7 @@ mod database;
 mod error;
 mod executor;
 mod logging;
+mod path;
 mod plugins;
 mod server;
 mod signals;

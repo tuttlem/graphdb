@@ -446,8 +446,7 @@ fn parse_call_procedure() {
 
 #[test]
 fn parse_call_path_procedure_with_map_literal() {
-    let input =
-        "CALL path.dijkstra({ sourceNode: \"00000000-0000-0000-0000-000000000001\" }) YIELD totalCost;";
+    let input = "CALL path.dijkstra({ sourceNode: \"00000000-0000-0000-0000-000000000001\" }) YIELD totalCost;";
     let queries = parse_queries(input).expect("path procedure");
     match &queries[0] {
         Query::CallProcedure { procedure } => match procedure {
