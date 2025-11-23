@@ -8,13 +8,13 @@
 * [x] Path algorithm: Dijkstra shortest path
 * [x] Path algorithm: A* heuristic shortest path
 * [x] Path algorithm: Yen's k-shortest simple paths
-* [ ] Path algorithm: Delta-stepping single-source shortest path
+* [x] Path algorithm: Delta-stepping single-source shortest path
 * [ ] Path algorithm: Single-source shortest path (unweighted)
-* [ ] Path algorithm: All-pairs shortest path
+* [x] Path algorithm: All-pairs shortest path
 * [x] Path algorithm: Breadth-first search
 * [x] Path algorithm: Depth-first search
-* [ ] Path algorithm: Random walk
-* [ ] Path algorithm: Minimum weight spanning tree
+* [x] Path algorithm: Random walk
+* [x] Path algorithm: Minimum weight spanning tree
 * [ ] Implement query planner + execution engine beyond naive scans
 * [ ] Introduce transactions + ACID semantics for storage backends
 * [ ] Dense filesystem backend + pluggable key-value storage adapters

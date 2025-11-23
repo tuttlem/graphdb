@@ -41,8 +41,6 @@ pub(crate) struct PathDetail {
     pub(crate) costs: Vec<f64>,
 }
 
-impl PathDetail {}
-
 #[derive(Clone, Copy)]
 pub(crate) enum DijkstraDirection {
     Outgoing,
@@ -434,7 +432,7 @@ fn should_skip_neighbor(
     false
 }
 
-fn relationship_allowed(edge: &Edge, allowed_types: &Option<HashSet<String>>) -> bool {
+pub(crate) fn relationship_allowed(edge: &Edge, allowed_types: &Option<HashSet<String>>) -> bool {
     if let Some(types) = allowed_types {
         let label = edge.attribute("__label").and_then(|value| match value {
             AttributeValue::String(s) => Some(s.as_str()),
@@ -450,7 +448,7 @@ fn relationship_allowed(edge: &Edge, allowed_types: &Option<HashSet<String>>) ->
     }
 }
 
-fn edge_weight(edge: &Edge, property: Option<&str>) -> Result<f64, DaemonError> {
+pub(crate) fn edge_weight(edge: &Edge, property: Option<&str>) -> Result<f64, DaemonError> {
     if let Some(prop) = property {
         match edge.attribute(prop) {
             Some(&AttributeValue::Float(value)) => Ok(value),

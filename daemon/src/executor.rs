@@ -24,7 +24,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::error::DaemonError;
 use crate::path::{
-    astar, dijkstra,
+    all_pairs, astar, delta, dijkstra, mst, random_walk,
     traversal::{self, PathState, edge_matches_pattern},
     yen,
 };
@@ -3006,6 +3006,18 @@ fn execute_procedure<B: StorageBackend>(
             } else if call.name.eq_ignore_ascii_case("path.yen") {
                 let args = evaluate_procedure_arguments(db, &call)?;
                 execute_path_yen(db, args, &call)
+            } else if call.name.eq_ignore_ascii_case("path.deltaStepping") {
+                let args = evaluate_procedure_arguments(db, &call)?;
+                execute_path_delta(db, args, &call)
+            } else if call.name.eq_ignore_ascii_case("path.allPairs") {
+                let args = evaluate_procedure_arguments(db, &call)?;
+                execute_path_all_pairs(db, args, &call)
+            } else if call.name.eq_ignore_ascii_case("path.randomWalk") {
+                let args = evaluate_procedure_arguments(db, &call)?;
+                execute_path_random_walk(db, args, &call)
+            } else if call.name.eq_ignore_ascii_case("path.spanningTree") {
+                let args = evaluate_procedure_arguments(db, &call)?;
+                execute_path_spanning_tree(db, args, &call)
             } else {
                 execute_user_procedure(db, call)
             }
@@ -3291,6 +3303,94 @@ fn execute_path_yen<B: StorageBackend>(
         "totalCost".to_string(),
         "nodeIds".to_string(),
         "costs".to_string(),
+    ];
+    procedure_rows_to_result(
+        call.name.clone(),
+        available_columns,
+        rows,
+        call.yield_items.clone(),
+    )
+}
+
+fn execute_path_delta<B: StorageBackend>(
+    db: &Database<B>,
+    args: Vec<FieldValue>,
+    call: &UserProcedureCall,
+) -> Result<ProcedureResult, DaemonError> {
+    let config = delta::parse_delta_config(args)?;
+    let rows = delta::run_delta(db, &config)?;
+    let available_columns = vec![
+        "index".to_string(),
+        "sourceNode".to_string(),
+        "targetNode".to_string(),
+        "totalCost".to_string(),
+        "nodeIds".to_string(),
+        "costs".to_string(),
+    ];
+    procedure_rows_to_result(
+        call.name.clone(),
+        available_columns,
+        rows,
+        call.yield_items.clone(),
+    )
+}
+
+fn execute_path_all_pairs<B: StorageBackend>(
+    db: &Database<B>,
+    args: Vec<FieldValue>,
+    call: &UserProcedureCall,
+) -> Result<ProcedureResult, DaemonError> {
+    let config = all_pairs::parse_all_pairs_config(args)?;
+    let rows = all_pairs::run_all_pairs(db, &config)?;
+    let available_columns = vec![
+        "index".to_string(),
+        "sourceNode".to_string(),
+        "targetNode".to_string(),
+        "totalCost".to_string(),
+        "nodeIds".to_string(),
+        "costs".to_string(),
+    ];
+    procedure_rows_to_result(
+        call.name.clone(),
+        available_columns,
+        rows,
+        call.yield_items.clone(),
+    )
+}
+
+fn execute_path_random_walk<B: StorageBackend>(
+    db: &Database<B>,
+    args: Vec<FieldValue>,
+    call: &UserProcedureCall,
+) -> Result<ProcedureResult, DaemonError> {
+    let config = random_walk::parse_random_walk_config(args)?;
+    let rows = random_walk::run_random_walk(db, &config)?;
+    let available_columns = vec![
+        "index".to_string(),
+        "nodeIds".to_string(),
+        "length".to_string(),
+    ];
+    procedure_rows_to_result(
+        call.name.clone(),
+        available_columns,
+        rows,
+        call.yield_items.clone(),
+    )
+}
+
+fn execute_path_spanning_tree<B: StorageBackend>(
+    db: &Database<B>,
+    args: Vec<FieldValue>,
+    call: &UserProcedureCall,
+) -> Result<ProcedureResult, DaemonError> {
+    let config = mst::parse_spanning_tree_config(args)?;
+    let rows = mst::run_spanning_tree(db, &config)?;
+    let available_columns = vec![
+        "index".to_string(),
+        "sourceNode".to_string(),
+        "targetNode".to_string(),
+        "edgeId".to_string(),
+        "weight".to_string(),
     ];
     procedure_rows_to_result(
         call.name.clone(),
@@ -5015,6 +5115,95 @@ mod scalar_function_tests {
                 "00000000-0000-0000-0000-000000000003",
             ]
         );
+    }
+
+    #[test]
+    fn call_path_delta_procedure() {
+        crate::executor::tests::ensure_standard_functions_registered();
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"CALL path.deltaStepping({
+                    sourceNode: "00000000-0000-0000-0000-000000000001",
+                    delta: 1.0
+                }) YIELD nodeIds, totalCost;"#,
+        );
+        let procedure = report
+            .procedures
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("path.deltaStepping"))
+            .expect("deltaStepping result");
+        assert!(!procedure.rows.is_empty());
+    }
+
+    #[test]
+    fn call_path_all_pairs_procedure() {
+        crate::executor::tests::ensure_standard_functions_registered();
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"CALL path.allPairs({
+                    sourceNodes: [
+                        "00000000-0000-0000-0000-000000000001",
+                        "00000000-0000-0000-0000-000000000002"
+                    ]
+                }) YIELD sourceNode, targetNode, totalCost;"#,
+        );
+        let procedure = report
+            .procedures
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("path.allPairs"))
+            .expect("allPairs result");
+        assert!(procedure.rows.len() >= 2);
+    }
+
+    #[test]
+    fn call_path_random_walk_procedure() {
+        crate::executor::tests::ensure_standard_functions_registered();
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"CALL path.randomWalk({
+                    sourceNode: "00000000-0000-0000-0000-000000000001",
+                    steps: 2,
+                    seed: 42
+                }) YIELD nodeIds, length;"#,
+        );
+        let procedure = report
+            .procedures
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("path.randomWalk"))
+            .expect("randomWalk result");
+        let row = &procedure.rows[0];
+        let nodes: Vec<_> = row
+            .get("nodeIds")
+            .and_then(|value| value.as_array())
+            .expect("walk nodes")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(nodes.len() >= 1);
+    }
+
+    #[test]
+    fn call_path_spanning_tree_procedure() {
+        crate::executor::tests::ensure_standard_functions_registered();
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"CALL path.spanningTree({ relationshipTypes: ["KNOWS"] })
+                YIELD sourceNode, targetNode, weight;"#,
+        );
+        let procedure = report
+            .procedures
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("path.spanningTree"))
+            .expect("spanning tree result");
+        assert!(!procedure.rows.is_empty());
     }
 
     #[test]

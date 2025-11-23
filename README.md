@@ -154,6 +154,28 @@ CALL path.yen({
     direction: 'OUTGOING',
     k: 3
 }) YIELD nodeIds, totalCost;
+
+// Delta-stepping single-source results
+CALL path.deltaStepping({
+    sourceNode: '00000000-0000-0000-0000-000000000001',
+    delta: 1.0
+}) YIELD targetNode, totalCost;
+
+// All-pairs shortest paths from a subset of sources
+CALL path.allPairs({
+    sourceNodes: [
+        '00000000-0000-0000-0000-000000000001',
+        '00000000-0000-0000-0000-000000000002'
+    ]
+}) YIELD sourceNode, targetNode, totalCost;
+
+// Random walk anchored at a specific node
+CALL path.randomWalk({ sourceNode: '00000000-0000-0000-0000-000000000001', steps: 5 })
+    YIELD nodeIds, length;
+
+// Minimum spanning tree for the KNOWS graph
+CALL path.spanningTree({ relationshipTypes: ['KNOWS'] })
+    YIELD sourceNode, targetNode, weight;
 ```
 
 ### Multi-stage analytical query
