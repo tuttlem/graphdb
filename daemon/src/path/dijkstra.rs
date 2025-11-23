@@ -35,6 +35,14 @@ impl Ord for QueueEntry {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct PathDetail {
+    pub(crate) nodes: Vec<NodeId>,
+    pub(crate) costs: Vec<f64>,
+}
+
+impl PathDetail {}
+
 #[derive(Clone, Copy)]
 pub(crate) enum DijkstraDirection {
     Outgoing,
@@ -42,6 +50,7 @@ pub(crate) enum DijkstraDirection {
     Both,
 }
 
+#[derive(Clone)]
 pub(crate) struct DijkstraConfig {
     pub(crate) source: NodeId,
     pub(crate) target: Option<NodeId>,
@@ -52,35 +61,49 @@ pub(crate) struct DijkstraConfig {
 }
 
 pub(crate) fn parse_dijkstra_config(args: Vec<FieldValue>) -> Result<DijkstraConfig, DaemonError> {
+    let map = config_map_from_args(args, "path.dijkstra")?;
+    parse_dijkstra_config_from_map(&map, "path.dijkstra")
+}
+
+pub(crate) fn config_map_from_args(
+    args: Vec<FieldValue>,
+    procedure: &str,
+) -> Result<HashMap<String, Value>, DaemonError> {
     if args.is_empty() {
-        return Err(DaemonError::Query(
-            "path.dijkstra expects at least a configuration argument".into(),
-        ));
+        return Err(DaemonError::Query(format!(
+            "{} expects at least a configuration argument",
+            procedure
+        )));
     }
 
     let config_field = match args.len() {
         1 => args.into_iter().next().unwrap(),
         2 => args.into_iter().nth(1).unwrap(),
         _ => {
-            return Err(DaemonError::Query(
-                "path.dijkstra expects one or two arguments".into(),
-            ));
+            return Err(DaemonError::Query(format!(
+                "{} expects one or two arguments",
+                procedure
+            )));
         }
     };
 
     let config_value = field_value_to_scalar(config_field)?;
-    let map = match config_value {
-        Value::Map(map) => map,
-        _ => {
-            return Err(DaemonError::Query(
-                "path.dijkstra configuration must be a map".into(),
-            ));
-        }
-    };
+    match config_value {
+        Value::Map(map) => Ok(map),
+        _ => Err(DaemonError::Query(format!(
+            "{} configuration must be a map",
+            procedure
+        ))),
+    }
+}
 
+pub(crate) fn parse_dijkstra_config_from_map(
+    map: &HashMap<String, Value>,
+    procedure: &str,
+) -> Result<DijkstraConfig, DaemonError> {
     let source_value = map
         .get("sourceNode")
-        .ok_or_else(|| DaemonError::Query("path.dijkstra requires sourceNode".into()))?;
+        .ok_or_else(|| DaemonError::Query(format!("{} requires sourceNode", procedure)))?;
     let source = parse_node_id(source_value)?;
 
     let target = if let Some(value) = map.get("targetNode") {
@@ -190,7 +213,7 @@ pub(crate) fn run_dijkstra<B: StorageBackend>(
             break;
         }
 
-        let neighbors = neighbors_for_node(db, entry.node, config)?;
+        let neighbors = neighbors_for_node(db, entry.node, config, None, None)?;
         for (neighbor_id, weight) in neighbors {
             let next_cost = entry.cost + weight;
             if next_cost.is_nan() || next_cost.is_infinite() || next_cost < 0.0 {
@@ -263,10 +286,79 @@ pub(crate) fn run_dijkstra<B: StorageBackend>(
     Ok(rows)
 }
 
+pub(crate) fn shortest_path_detail<B: StorageBackend>(
+    db: &Database<B>,
+    config: &DijkstraConfig,
+    target: NodeId,
+    banned_nodes: Option<&HashSet<NodeId>>,
+    banned_edges: Option<&HashSet<(NodeId, NodeId)>>,
+) -> Result<Option<PathDetail>, DaemonError> {
+    if banned_nodes
+        .map(|set| set.contains(&config.source))
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let mut distances = HashMap::new();
+    distances.insert(config.source, 0.0);
+    let mut predecessors: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    heap.push(QueueEntry {
+        node: config.source,
+        cost: 0.0,
+    });
+    let mut visited = HashSet::new();
+
+    while let Some(entry) = heap.pop() {
+        if visited.contains(&entry.node) {
+            continue;
+        }
+        if let Some(set) = banned_nodes {
+            if set.contains(&entry.node) && entry.node != config.source {
+                continue;
+            }
+        }
+        visited.insert(entry.node);
+
+        if entry.node == target {
+            let (nodes, costs) =
+                reconstruct_path(target, config.source, &predecessors, &distances)?;
+            return Ok(Some(PathDetail { nodes, costs }));
+        }
+
+        let neighbors = neighbors_for_node(db, entry.node, config, banned_nodes, banned_edges)?;
+        for (neighbor_id, weight) in neighbors {
+            let next_cost = entry.cost + weight;
+            if next_cost.is_nan() || next_cost.is_infinite() || next_cost < 0.0 {
+                return Err(DaemonError::Query(
+                    "path.dijkstra encountered invalid relationship weights".into(),
+                ));
+            }
+            let current_best = distances
+                .get(&neighbor_id)
+                .copied()
+                .unwrap_or(f64::INFINITY);
+            if next_cost < current_best - f64::EPSILON {
+                distances.insert(neighbor_id, next_cost);
+                predecessors.insert(neighbor_id, entry.node);
+                heap.push(QueueEntry {
+                    node: neighbor_id,
+                    cost: next_cost,
+                });
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 pub(crate) fn neighbors_for_node<B: StorageBackend>(
     db: &Database<B>,
     node_id: NodeId,
     config: &DijkstraConfig,
+    banned_nodes: Option<&HashSet<NodeId>>,
+    banned_edges: Option<&HashSet<(NodeId, NodeId)>>,
 ) -> Result<Vec<(NodeId, f64)>, DaemonError> {
     let edges = db.edges_for_node(node_id)?;
     let mut neighbors = Vec::new();
@@ -276,7 +368,11 @@ pub(crate) fn neighbors_for_node<B: StorageBackend>(
                 if edge.source() == node_id {
                     if relationship_allowed(&edge, &config.relationship_types) {
                         let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push((edge.target(), weight));
+                        let target = edge.target();
+                        if should_skip_neighbor(target, node_id, banned_nodes, banned_edges) {
+                            continue;
+                        }
+                        neighbors.push((target, weight));
                     }
                 }
             }
@@ -284,7 +380,11 @@ pub(crate) fn neighbors_for_node<B: StorageBackend>(
                 if edge.target() == node_id {
                     if relationship_allowed(&edge, &config.relationship_types) {
                         let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push((edge.source(), weight));
+                        let next = edge.source();
+                        if should_skip_neighbor(next, node_id, banned_nodes, banned_edges) {
+                            continue;
+                        }
+                        neighbors.push((next, weight));
                     }
                 }
             }
@@ -292,19 +392,46 @@ pub(crate) fn neighbors_for_node<B: StorageBackend>(
                 if edge.source() == node_id {
                     if relationship_allowed(&edge, &config.relationship_types) {
                         let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push((edge.target(), weight));
+                        let next = edge.target();
+                        if should_skip_neighbor(next, node_id, banned_nodes, banned_edges) {
+                            continue;
+                        }
+                        neighbors.push((next, weight));
                     }
                 }
                 if edge.target() == node_id {
                     if relationship_allowed(&edge, &config.relationship_types) {
                         let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push((edge.source(), weight));
+                        let next = edge.source();
+                        if should_skip_neighbor(next, node_id, banned_nodes, banned_edges) {
+                            continue;
+                        }
+                        neighbors.push((next, weight));
                     }
                 }
             }
         }
     }
     Ok(neighbors)
+}
+
+fn should_skip_neighbor(
+    neighbor: NodeId,
+    current: NodeId,
+    banned_nodes: Option<&HashSet<NodeId>>,
+    banned_edges: Option<&HashSet<(NodeId, NodeId)>>,
+) -> bool {
+    if let Some(edges) = banned_edges {
+        if edges.contains(&(current, neighbor)) {
+            return true;
+        }
+    }
+    if let Some(nodes) = banned_nodes {
+        if nodes.contains(&neighbor) {
+            return true;
+        }
+    }
+    false
 }
 
 fn relationship_allowed(edge: &Edge, allowed_types: &Option<HashSet<String>>) -> bool {

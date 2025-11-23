@@ -70,7 +70,7 @@ pub(crate) fn run_astar<B: StorageBackend>(
             continue;
         }
 
-        let neighbors = dijkstra::neighbors_for_node(db, entry.node, &config.base)?;
+        let neighbors = dijkstra::neighbors_for_node(db, entry.node, &config.base, None, None)?;
         for (neighbor, weight) in neighbors {
             let tentative_g = current_best + weight;
             if tentative_g.is_nan() || tentative_g.is_infinite() || tentative_g < 0.0 {

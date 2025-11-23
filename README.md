@@ -144,6 +144,16 @@ CALL path.dijkstra({
     direction: 'OUTGOING'
 }) YIELD totalCost, nodeIds
 RETURN nodeIds AS path, totalCost;
+
+// Yen's k-shortest simple paths (k = 3)
+CALL path.yen({
+    sourceNode: '00000000-0000-0000-0000-000000000001',
+    targetNode: '00000000-0000-0000-0000-00000000000A',
+    relationshipTypes: ['ROUTE'],
+    relationshipWeightProperty: 'durationMinutes',
+    direction: 'OUTGOING',
+    k: 3
+}) YIELD nodeIds, totalCost;
 ```
 
 ### Multi-stage analytical query

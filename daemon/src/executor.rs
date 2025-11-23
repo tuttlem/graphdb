@@ -26,6 +26,7 @@ use crate::error::DaemonError;
 use crate::path::{
     astar, dijkstra,
     traversal::{self, PathState, edge_matches_pattern},
+    yen,
 };
 use function_api::{
     self as functions, ExpressionHandle, FunctionContext, FunctionError, ProcedureContext,
@@ -3002,6 +3003,9 @@ fn execute_procedure<B: StorageBackend>(
             } else if call.name.eq_ignore_ascii_case("path.astar") {
                 let args = evaluate_procedure_arguments(db, &call)?;
                 execute_path_astar(db, args, &call)
+            } else if call.name.eq_ignore_ascii_case("path.yen") {
+                let args = evaluate_procedure_arguments(db, &call)?;
+                execute_path_yen(db, args, &call)
             } else {
                 execute_user_procedure(db, call)
             }
@@ -3257,6 +3261,29 @@ fn execute_path_astar<B: StorageBackend>(
 ) -> Result<ProcedureResult, DaemonError> {
     let config = astar::parse_astar_config(args)?;
     let rows = astar::run_astar(db, &config)?;
+    let available_columns = vec![
+        "index".to_string(),
+        "sourceNode".to_string(),
+        "targetNode".to_string(),
+        "totalCost".to_string(),
+        "nodeIds".to_string(),
+        "costs".to_string(),
+    ];
+    procedure_rows_to_result(
+        call.name.clone(),
+        available_columns,
+        rows,
+        call.yield_items.clone(),
+    )
+}
+
+fn execute_path_yen<B: StorageBackend>(
+    db: &Database<B>,
+    args: Vec<FieldValue>,
+    call: &UserProcedureCall,
+) -> Result<ProcedureResult, DaemonError> {
+    let config = yen::parse_yen_config(args)?;
+    let rows = yen::run_yen(db, &config)?;
     let available_columns = vec![
         "index".to_string(),
         "sourceNode".to_string(),
@@ -4142,6 +4169,10 @@ fn seed_basic_graph(db: &Database<InMemoryBackend>) {
             "00000000-0000-0000-0000-000000000002",
             "00000000-0000-0000-0000-000000000005",
         ),
+        (
+            "00000000-0000-0000-0000-000000000005",
+            "00000000-0000-0000-0000-000000000003",
+        ),
     ];
     for (idx, (src, dst)) in edges.iter().enumerate() {
         insert_edge(
@@ -4400,7 +4431,10 @@ RETURN p.name AS name;
             })
             .collect();
         names.sort();
-        assert_eq!(names, vec!["Kevin Bacon", "Meg Ryan", "Tom Hanks"]);
+        assert_eq!(
+            names,
+            vec!["Kevin Bacon", "Meg Ryan", "Nora Ephron", "Tom Hanks"]
+        );
     }
 
     #[test]
@@ -4926,6 +4960,61 @@ mod scalar_function_tests {
             .and_then(|value| value.as_f64())
             .expect("total cost");
         assert!((total_cost - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn call_path_yen_procedure() {
+        crate::executor::tests::ensure_standard_functions_registered();
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"CALL path.yen({
+                    sourceNode: "00000000-0000-0000-0000-000000000001",
+                    targetNode: "00000000-0000-0000-0000-000000000003",
+                    relationshipTypes: ["KNOWS"],
+                    k: 2
+                }) YIELD nodeIds, totalCost;"#,
+        );
+        let procedure = report
+            .procedures
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("path.yen"))
+            .expect("yen result");
+        assert_eq!(procedure.rows.len(), 2);
+        let first = &procedure.rows[0];
+        let first_ids: Vec<_> = first
+            .get("nodeIds")
+            .and_then(|value| value.as_array())
+            .expect("first path nodes")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(
+            first_ids,
+            vec![
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000002",
+                "00000000-0000-0000-0000-000000000003",
+            ]
+        );
+        let second = &procedure.rows[1];
+        let second_ids: Vec<_> = second
+            .get("nodeIds")
+            .and_then(|value| value.as_array())
+            .expect("second path nodes")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(
+            second_ids,
+            vec![
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000002",
+                "00000000-0000-0000-0000-000000000005",
+                "00000000-0000-0000-0000-000000000003",
+            ]
+        );
     }
 
     #[test]

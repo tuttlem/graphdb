@@ -7,7 +7,7 @@
 * [x] Remove SELECT from the parser (there is no SELECT in Cypher)
 * [x] Path algorithm: Dijkstra shortest path
 * [x] Path algorithm: A* heuristic shortest path
-* [ ] Path algorithm: Yen's k-shortest simple paths
+* [x] Path algorithm: Yen's k-shortest simple paths
 * [ ] Path algorithm: Delta-stepping single-source shortest path
 * [ ] Path algorithm: Single-source shortest path (unweighted)
 * [ ] Path algorithm: All-pairs shortest path
