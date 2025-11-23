@@ -10,12 +10,6 @@ use crate::error::DaemonError;
 use crate::executor::{field_value_to_scalar, parse_node_id};
 
 #[derive(Clone, Copy)]
-struct NeighborInfo {
-    node: NodeId,
-    weight: f64,
-}
-
-#[derive(Clone, Copy)]
 struct QueueEntry {
     node: NodeId,
     cost: f64,
@@ -54,6 +48,7 @@ pub(crate) struct DijkstraConfig {
     pub(crate) weight_property: Option<String>,
     pub(crate) relationship_types: Option<HashSet<String>>,
     pub(crate) direction: DijkstraDirection,
+    pub(crate) heuristic_property: Option<String>,
 }
 
 pub(crate) fn parse_dijkstra_config(args: Vec<FieldValue>) -> Result<DijkstraConfig, DaemonError> {
@@ -147,12 +142,25 @@ pub(crate) fn parse_dijkstra_config(args: Vec<FieldValue>) -> Result<DijkstraCon
         DijkstraDirection::Outgoing
     };
 
+    let heuristic_property = map
+        .get("heuristicProperty")
+        .map(|value| match value {
+            Value::String(s) => Ok(s.clone()),
+            Value::Null => Ok(String::new()),
+            _ => Err(DaemonError::Query(
+                "heuristicProperty must be STRING".into(),
+            )),
+        })
+        .transpose()?;
+    let heuristic_property = heuristic_property.filter(|s| !s.is_empty());
+
     Ok(DijkstraConfig {
         source,
         target,
         weight_property,
         relationship_types,
         direction,
+        heuristic_property,
     })
 }
 
@@ -183,22 +191,22 @@ pub(crate) fn run_dijkstra<B: StorageBackend>(
         }
 
         let neighbors = neighbors_for_node(db, entry.node, config)?;
-        for neighbor in neighbors {
-            let next_cost = entry.cost + neighbor.weight;
+        for (neighbor_id, weight) in neighbors {
+            let next_cost = entry.cost + weight;
             if next_cost.is_nan() || next_cost.is_infinite() || next_cost < 0.0 {
                 return Err(DaemonError::Query(
                     "path.dijkstra encountered invalid relationship weights".into(),
                 ));
             }
             let current_best = distances
-                .get(&neighbor.node)
+                .get(&neighbor_id)
                 .copied()
                 .unwrap_or(f64::INFINITY);
             if next_cost < current_best - f64::EPSILON {
-                distances.insert(neighbor.node, next_cost);
-                predecessors.insert(neighbor.node, entry.node);
+                distances.insert(neighbor_id, next_cost);
+                predecessors.insert(neighbor_id, entry.node);
                 heap.push(QueueEntry {
-                    node: neighbor.node,
+                    node: neighbor_id,
                     cost: next_cost,
                 });
             }
@@ -255,11 +263,11 @@ pub(crate) fn run_dijkstra<B: StorageBackend>(
     Ok(rows)
 }
 
-fn neighbors_for_node<B: StorageBackend>(
+pub(crate) fn neighbors_for_node<B: StorageBackend>(
     db: &Database<B>,
     node_id: NodeId,
     config: &DijkstraConfig,
-) -> Result<Vec<NeighborInfo>, DaemonError> {
+) -> Result<Vec<(NodeId, f64)>, DaemonError> {
     let edges = db.edges_for_node(node_id)?;
     let mut neighbors = Vec::new();
     for edge in edges {
@@ -268,10 +276,7 @@ fn neighbors_for_node<B: StorageBackend>(
                 if edge.source() == node_id {
                     if relationship_allowed(&edge, &config.relationship_types) {
                         let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push(NeighborInfo {
-                            node: edge.target(),
-                            weight,
-                        });
+                        neighbors.push((edge.target(), weight));
                     }
                 }
             }
@@ -279,10 +284,7 @@ fn neighbors_for_node<B: StorageBackend>(
                 if edge.target() == node_id {
                     if relationship_allowed(&edge, &config.relationship_types) {
                         let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push(NeighborInfo {
-                            node: edge.source(),
-                            weight,
-                        });
+                        neighbors.push((edge.source(), weight));
                     }
                 }
             }
@@ -290,19 +292,13 @@ fn neighbors_for_node<B: StorageBackend>(
                 if edge.source() == node_id {
                     if relationship_allowed(&edge, &config.relationship_types) {
                         let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push(NeighborInfo {
-                            node: edge.target(),
-                            weight,
-                        });
+                        neighbors.push((edge.target(), weight));
                     }
                 }
                 if edge.target() == node_id {
                     if relationship_allowed(&edge, &config.relationship_types) {
                         let weight = edge_weight(&edge, config.weight_property.as_deref())?;
-                        neighbors.push(NeighborInfo {
-                            node: edge.source(),
-                            weight,
-                        });
+                        neighbors.push((edge.source(), weight));
                     }
                 }
             }
@@ -348,7 +344,7 @@ fn edge_weight(edge: &Edge, property: Option<&str>) -> Result<f64, DaemonError> 
     }
 }
 
-fn reconstruct_path(
+pub(crate) fn reconstruct_path(
     target: NodeId,
     source: NodeId,
     predecessors: &HashMap<NodeId, NodeId>,

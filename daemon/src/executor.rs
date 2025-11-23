@@ -24,8 +24,8 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::error::DaemonError;
 use crate::path::{
-    dijkstra,
-    traversal::{self, edge_matches_pattern, PathState},
+    astar, dijkstra,
+    traversal::{self, PathState, edge_matches_pattern},
 };
 use function_api::{
     self as functions, ExpressionHandle, FunctionContext, FunctionError, ProcedureContext,
@@ -2999,6 +2999,9 @@ fn execute_procedure<B: StorageBackend>(
             if call.name.eq_ignore_ascii_case("path.dijkstra") {
                 let args = evaluate_procedure_arguments(db, &call)?;
                 execute_path_dijkstra(db, args, &call)
+            } else if call.name.eq_ignore_ascii_case("path.astar") {
+                let args = evaluate_procedure_arguments(db, &call)?;
+                execute_path_astar(db, args, &call)
             } else {
                 execute_user_procedure(db, call)
             }
@@ -3231,6 +3234,29 @@ fn execute_path_dijkstra<B: StorageBackend>(
 ) -> Result<ProcedureResult, DaemonError> {
     let config = dijkstra::parse_dijkstra_config(args)?;
     let rows = dijkstra::run_dijkstra(db, &config)?;
+    let available_columns = vec![
+        "index".to_string(),
+        "sourceNode".to_string(),
+        "targetNode".to_string(),
+        "totalCost".to_string(),
+        "nodeIds".to_string(),
+        "costs".to_string(),
+    ];
+    procedure_rows_to_result(
+        call.name.clone(),
+        available_columns,
+        rows,
+        call.yield_items.clone(),
+    )
+}
+
+fn execute_path_astar<B: StorageBackend>(
+    db: &Database<B>,
+    args: Vec<FieldValue>,
+    call: &UserProcedureCall,
+) -> Result<ProcedureResult, DaemonError> {
+    let config = astar::parse_astar_config(args)?;
+    let rows = astar::run_astar(db, &config)?;
     let available_columns = vec![
         "index".to_string(),
         "sourceNode".to_string(),
@@ -4073,16 +4099,27 @@ fn seed_basic_graph(db: &Database<InMemoryBackend>) {
         ("Carrie Fisher", "00000000-0000-0000-0000-000000000004"),
         ("Nora Ephron", "00000000-0000-0000-0000-000000000005"),
     ];
+    let heuristic_steps = HashMap::from([
+        ("00000000-0000-0000-0000-000000000001", 2),
+        ("00000000-0000-0000-0000-000000000002", 1),
+        ("00000000-0000-0000-0000-000000000003", 0),
+        ("00000000-0000-0000-0000-000000000004", 1),
+        ("00000000-0000-0000-0000-000000000005", 3),
+    ]);
     for (name, id) in people.iter() {
+        let mut props = HashMap::from([
+            ("id".into(), Value::String(id.to_string())),
+            ("name".into(), Value::String(name.to_string())),
+        ]);
+        if let Some(estimate) = heuristic_steps.get(id) {
+            props.insert("heuristic_to_kevin".into(), Value::Integer(*estimate));
+        }
         insert_node(
             db,
             graphdb_core::query::NodePattern {
                 alias: Some(name.split_whitespace().next().unwrap().to_lowercase()),
                 label: Some("Person".into()),
-                properties: Properties::new(HashMap::from([
-                    ("id".into(), Value::String(id.to_string())),
-                    ("name".into(), Value::String(name.to_string())),
-                ])),
+                properties: Properties::new(props),
             },
         )
         .unwrap();
@@ -4847,6 +4884,48 @@ mod scalar_function_tests {
             .filter_map(|row| row.get("word").and_then(|v| v.as_str()))
             .collect();
         assert_eq!(words, vec!["hello", "world", "from", "graphdb"]);
+    }
+
+    #[test]
+    fn call_path_astar_procedure() {
+        crate::executor::tests::ensure_standard_functions_registered();
+        let db = Database::new(InMemoryBackend::new());
+        seed_basic_graph(&db);
+        let report = execute_script_for_test(
+            &db,
+            r#"CALL path.astar({
+                    sourceNode: "00000000-0000-0000-0000-000000000001",
+                    targetNode: "00000000-0000-0000-0000-000000000003",
+                    heuristicProperty: "heuristic_to_kevin"
+                }) YIELD nodeIds, totalCost;"#,
+        );
+        let procedure = report
+            .procedures
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("path.astar"))
+            .expect("astar result");
+        assert_eq!(procedure.rows.len(), 1);
+        let row = &procedure.rows[0];
+        let node_ids: Vec<_> = row
+            .get("nodeIds")
+            .and_then(|value| value.as_array())
+            .expect("node ids")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(
+            node_ids,
+            vec![
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000002",
+                "00000000-0000-0000-0000-000000000003",
+            ]
+        );
+        let total_cost = row
+            .get("totalCost")
+            .and_then(|value| value.as_f64())
+            .expect("total cost");
+        assert!((total_cost - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
