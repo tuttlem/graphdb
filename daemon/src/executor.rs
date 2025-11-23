@@ -16,8 +16,8 @@ use graphdb_core::query::{
     UserProcedureCall, Value, ValueOperand, WithClause, parse_queries,
 };
 use graphdb_core::{
-    AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, Node, NodeClassEntry,
-    NodeId, RoleEntry, SimpleStorage, StorageBackend, UserEntry,
+    AuthMethod, Database, Edge, EdgeClassEntry, EdgeId, InMemoryBackend, MonolithStorage, Node,
+    NodeClassEntry, NodeId, RoleEntry, SimpleStorage, StorageBackend, UserEntry,
 };
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
@@ -114,6 +114,13 @@ pub fn execute_script_with_memory(
 
 pub fn execute_script_with_simple(
     db: &Database<SimpleStorage>,
+    script: &str,
+) -> Result<ExecutionReport, DaemonError> {
+    execute_script(db, script)
+}
+
+pub fn execute_script_with_monolith(
+    db: &Database<MonolithStorage>,
     script: &str,
 ) -> Result<ExecutionReport, DaemonError> {
     execute_script(db, script)

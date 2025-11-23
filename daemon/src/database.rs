@@ -5,13 +5,16 @@ use std::sync::Arc;
 
 use graphdb_core::{
     CatalogError, CatalogResult, CatalogSnapshot, CatalogSnapshotSink, Database, EdgeId,
-    InMemoryBackend, NodeId, SimpleStorage, SystemCatalog,
+    InMemoryBackend, MonolithStorage, NodeId, SimpleStorage, SystemCatalog,
 };
 use serde_json;
 
 use crate::config::{DaemonConfig, StorageBackendKind};
 use crate::error::{DaemonError, Result};
-use crate::executor::{ExecutionReport, execute_script_with_memory, execute_script_with_simple};
+use crate::executor::{
+    ExecutionReport, execute_script_with_memory, execute_script_with_monolith,
+    execute_script_with_simple,
+};
 
 pub type DatabaseHandle = Arc<GraphDatabase>;
 
@@ -22,6 +25,7 @@ pub struct GraphDatabase {
 enum GraphDatabaseInner {
     InMemory(Database<InMemoryBackend>),
     Simple(Database<SimpleStorage>),
+    Monolith(Database<MonolithStorage>),
 }
 
 impl GraphDatabase {
@@ -59,6 +63,32 @@ impl GraphDatabase {
                 hydrate_simple_backend(&database, &directory)?;
                 GraphDatabaseInner::Simple(database)
             }
+            StorageBackendKind::Monolith => {
+                let file = config
+                    .storage()
+                    .file
+                    .as_ref()
+                    .ok_or_else(|| {
+                        DaemonError::Config("storage.file must be set for monolith backend".into())
+                    })?
+                    .clone();
+                tracing::info!(
+                    event = "database.init",
+                    backend = "monolith",
+                    path = %file.display(),
+                    "initialising backend"
+                );
+                let backend = MonolithStorage::new(&file)?;
+                let catalog_dir = file
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let catalog_path = catalog_file_path(&catalog_dir);
+                let catalog = load_or_bootstrap_catalog(&catalog_path)?;
+                let database = Database::with_catalog(backend, catalog);
+                hydrate_monolith_backend(&database)?;
+                GraphDatabaseInner::Monolith(database)
+            }
         };
 
         Ok(Self { inner })
@@ -68,6 +98,7 @@ impl GraphDatabase {
         match &self.inner {
             GraphDatabaseInner::InMemory(db) => execute_script_with_memory(db, script),
             GraphDatabaseInner::Simple(db) => execute_script_with_simple(db, script),
+            GraphDatabaseInner::Monolith(db) => execute_script_with_monolith(db, script),
         }
     }
 }
@@ -204,6 +235,40 @@ fn preload_edges(database: &Database<SimpleStorage>, dir: &Path) -> Result<()> {
                     "unable to parse edge file name as UUID"
                 );
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn hydrate_monolith_backend(database: &Database<MonolithStorage>) -> Result<()> {
+    let node_ids = database
+        .storage()
+        .node_ids()
+        .map_err(DaemonError::from)?;
+    for id in node_ids {
+        if let Err(err) = database.get_node(id) {
+            tracing::warn!(
+                event = "database.hydrate_node_failed",
+                node_id = %id,
+                error = %err,
+                "failed to hydrate node from monolith"
+            );
+        }
+    }
+
+    let edge_ids = database
+        .storage()
+        .edge_ids()
+        .map_err(DaemonError::from)?;
+    for id in edge_ids {
+        if let Err(err) = database.get_edge(id) {
+            tracing::warn!(
+                event = "database.hydrate_edge_failed",
+                edge_id = %id,
+                error = %err,
+                "failed to hydrate edge from monolith"
+            );
         }
     }
 

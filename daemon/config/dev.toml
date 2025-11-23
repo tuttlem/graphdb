@@ -7,8 +7,8 @@ log_level = "debug"
 plugin_dir = "../../lib"
 
 [storage]
-backend = "simple"
-directory = "/home/michael/src/db/graphdb/target/data"
+backend = "monolith"
+file = "/home/michael/src/db/graphdb/target/data/graph.monolith"
 
 [server]
 bind_address = "127.0.0.1"

@@ -6,9 +6,11 @@ use common::edge::{Edge, EdgeId};
 use common::node::{Node, NodeId};
 
 pub mod memory;
+pub mod monolith;
 pub mod simple;
 
 pub use memory::InMemoryBackend;
+pub use monolith::MonolithStorage;
 pub use simple::SimpleStorage;
 
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -54,6 +56,13 @@ pub enum StorageError {
         op: StorageOp,
         #[source]
         source: serde_json::Error,
+    },
+
+    #[error("{op} binary serialization error: {source}")]
+    Binary {
+        op: StorageOp,
+        #[source]
+        source: bincode::Error,
     },
 
     #[error("{op} lock poisoned: {lock}")]

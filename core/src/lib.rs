@@ -10,7 +10,8 @@ pub use db::catalog::{
 };
 pub use db::database::{Database, DatabaseError, DatabaseResult};
 pub use storage::{
-    InMemoryBackend, SimpleStorage, StorageBackend, StorageError, StorageOp, StorageResult,
+    InMemoryBackend, MonolithStorage, SimpleStorage, StorageBackend, StorageError, StorageOp,
+    StorageResult,
 };
 
 pub use common::edge::{Edge, EdgeId};

@@ -69,12 +69,22 @@ impl DaemonConfig {
             ));
         }
 
-        if let StorageBackendKind::Simple = config.storage.backend {
-            if config.storage.directory.is_none() {
-                return Err(DaemonError::Config(
-                    "storage.directory must be set when using simple backend".into(),
-                ));
+        match config.storage.backend {
+            StorageBackendKind::Simple => {
+                if config.storage.directory.is_none() {
+                    return Err(DaemonError::Config(
+                        "storage.directory must be set when using simple backend".into(),
+                    ));
+                }
             }
+            StorageBackendKind::Monolith => {
+                if config.storage.file.is_none() {
+                    return Err(DaemonError::Config(
+                        "storage.file must be set when using monolith backend".into(),
+                    ));
+                }
+            }
+            StorageBackendKind::Memory => {}
         }
 
         if let Some(limit) = config.server.concurrency_limit {
@@ -200,6 +210,7 @@ fn normalize_optional_path(target: &mut Option<PathBuf>, base: &Path) {
 pub enum StorageBackendKind {
     Memory,
     Simple,
+    Monolith,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +218,7 @@ pub enum StorageBackendKind {
 pub struct StorageSettings {
     pub backend: StorageBackendKind,
     pub directory: Option<PathBuf>,
+    pub file: Option<PathBuf>,
 }
 
 impl Default for StorageSettings {
@@ -214,6 +226,7 @@ impl Default for StorageSettings {
         Self {
             backend: StorageBackendKind::Memory,
             directory: None,
+            file: None,
         }
     }
 }
@@ -221,6 +234,7 @@ impl Default for StorageSettings {
 impl StorageSettings {
     fn normalize(&mut self, base: &Path) {
         normalize_optional_path(&mut self.directory, base);
+        normalize_optional_path(&mut self.file, base);
     }
 }
 
